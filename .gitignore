@@ -8,7 +8,7 @@ dist
 .ipynb_checkpoints/
 
 # files from script downloads
-data
+data/
 openfold/resources/
 tests/test_data/
 cutlass/
