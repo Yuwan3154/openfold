@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import importlib
-from typing import Any, Tuple, List, Callable, Optional
+from typing import Any, Tuple, List, Callable, Optional, Dict
 
 deepspeed_is_installed = importlib.util.find_spec("deepspeed") is not None
 if(deepspeed_is_installed):
@@ -44,6 +44,8 @@ def checkpoint_blocks(
     blocks: List[Callable],
     args: BLOCK_ARGS,
     blocks_per_ckpt: Optional[int],
+    outputs: Optional[Dict[str, Any]] = None,
+    cycle_no: Optional[int] = None,
 ) -> BLOCK_ARGS:
     """
     Chunk a list of blocks and run each chunk with activation
@@ -68,8 +70,10 @@ def checkpoint_blocks(
         return (a,) if type(a) is not tuple else a
 
     def exec(b, a):
-        for block in b:
+        for i, block in enumerate(b):
             a = wrap(block(*a))
+            if outputs is not None:
+                outputs[f"recycle_{cycle_no}_block_{i}"] = a
         return a
 
     def chunker(s, e):
@@ -90,7 +94,7 @@ def checkpoint_blocks(
 
     for s in range(0, len(blocks), blocks_per_ckpt):
         e = s + blocks_per_ckpt
-        args = checkpoint(chunker(s, e), *args)
+        args = checkpoint(chunker(s, e), *args, use_reentrant=False)
         args = wrap(args)
 
     return args

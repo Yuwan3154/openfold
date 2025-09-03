@@ -553,6 +553,7 @@ def _extract_template_features(
     template_chain_id: str,
     kalign_binary_path: str,
     _zero_center_positions: bool = True,
+    rm_template_sequence: bool = False,
 ) -> Tuple[Dict[str, Any], Optional[str]]:
     """Parses atom positions in the target structure and aligns with the query.
 
@@ -604,6 +605,8 @@ def _extract_template_features(
             template_sequence=template_sequence,
             mmcif_object=mmcif_object,
         )
+        if rm_template_sequence:
+            seqres = "-" * len(seqres)
     except SequenceNotInTemplateError:
         # If PDB70 contains a different version of the template, we use the sequence
         # from the mmcif_object.
@@ -951,7 +954,8 @@ def get_custom_template_features(
         query_sequence: str,
         pdb_id: str,
         chain_id: str,
-        kalign_binary_path: str):
+        kalign_binary_path: str,
+        rm_template_sequence: bool = False):
 
     with open(mmcif_path, "r") as mmcif_path:
         cif_string = mmcif_path.read()
@@ -973,7 +977,8 @@ def get_custom_template_features(
         query_sequence=query_sequence,
         template_chain_id=chain_id,
         kalign_binary_path=kalign_binary_path,
-        _zero_center_positions=True
+        _zero_center_positions=True,
+        rm_template_sequence=rm_template_sequence
     )
     features["template_sum_probs"] = [1.0]
 

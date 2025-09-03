@@ -206,10 +206,7 @@ class AlphaFold(nn.Module):
         diff = torch.sqrt(sq_diff + eps).item()
         return diff <= self.config.recycle_early_stop_tolerance
 
-    def iteration(self, feats, prevs, _recycle=True):
-        # Primary output dictionary
-        outputs = {}
-
+    def iteration(self, feats, prevs, cycle_no, _recycle=True, outputs={}):
         # This needs to be done manually for DeepSpeed's sake
         dtype = next(self.parameters()).dtype
         for k in feats:
@@ -425,6 +422,8 @@ class AlphaFold(nn.Module):
                 z,
                 msa_mask=msa_mask.to(dtype=m.dtype),
                 pair_mask=pair_mask.to(dtype=z.dtype),
+                outputs=outputs,
+                cycle_no=cycle_no,
                 chunk_size=self.globals.chunk_size,
                 use_deepspeed_evo_attention=self.globals.use_deepspeed_evo_attention,
                 use_lma=self.globals.use_lma,
@@ -551,6 +550,7 @@ class AlphaFold(nn.Module):
         num_iters = batch["aatype"].shape[-1]
         early_stop = False
         num_recycles = 0
+        outputs = {}
         for cycle_no in range(num_iters):
             # Select the features for the current recycling cycle
             fetch_cur_batch = lambda t: t[..., cycle_no]
@@ -568,13 +568,14 @@ class AlphaFold(nn.Module):
                 outputs, m_1_prev, z_prev, x_prev, early_stop = self.iteration(
                     feats,
                     prevs,
-                    _recycle=(num_iters > 1)
+                    cycle_no=cycle_no,
+                    _recycle=(num_iters > 1),
+                    outputs=outputs,
                 )
 
                 num_recycles += 1
 
                 if not is_final_iter:
-                    del outputs
                     prevs = [m_1_prev, z_prev, x_prev]
                     del m_1_prev, z_prev, x_prev
                 else:

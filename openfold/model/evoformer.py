@@ -16,7 +16,7 @@ import math
 import sys
 import torch
 import torch.nn as nn
-from typing import Tuple, Sequence, Optional
+from typing import Tuple, Sequence, Optional, Dict, Any
 from functools import partial
 from abc import ABC, abstractmethod
 
@@ -960,6 +960,8 @@ class EvoformerStack(nn.Module):
         z: torch.Tensor,
         msa_mask: torch.Tensor,
         pair_mask: torch.Tensor,
+        outputs: Dict[str, Any],
+        cycle_no: int,
         chunk_size: int,
         use_deepspeed_evo_attention: bool = False,
         use_lma: bool = False,
@@ -1018,6 +1020,8 @@ class EvoformerStack(nn.Module):
             blocks,
             args=(m, z),
             blocks_per_ckpt=blocks_per_ckpt,
+            outputs=outputs,
+            cycle_no=cycle_no,
         )
 
         s = self.linear(m[..., 0, :, :])
