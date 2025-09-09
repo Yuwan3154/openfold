@@ -40,14 +40,24 @@ from openfold.utils.import_weights import (
     import_openfold_weights_
 )
 from openfold.utils.logger import PerformanceLoggingCallback
+from custom_evoformer_replacement import (
+    replace_evoformer_block, 
+    freeze_all_except_replaced_block
+)
 
 
 class OpenFoldWrapper(pl.LightningModule):
-    def __init__(self, config):
+    def __init__(self, config, replace_block_index=None, replacement_hidden_dim=None):
         super(OpenFoldWrapper, self).__init__()
         self.config = config
         self.model = AlphaFold(config)
         self.is_multimer = self.config.globals.is_multimer
+        self.replace_block_index = replace_block_index
+        self.replacement_hidden_dim = replacement_hidden_dim
+
+        # Apply block replacement if specified
+        if replace_block_index is not None:
+            self._apply_block_replacement()
 
         self.loss = AlphaFoldLoss(config.loss)
 
@@ -58,6 +68,32 @@ class OpenFoldWrapper(pl.LightningModule):
         self.cached_weights = None
         self.last_lr_step = -1
         self.save_hyperparameters()
+    
+    def _apply_block_replacement(self):
+        """Apply the custom block replacement and freezing logic"""
+        if self.replace_block_index is None:
+            return
+            
+        # Get dimensions from config
+        c_m = self.config.model.evoformer.c_m
+        c_z = self.config.model.evoformer.c_z
+        
+        # Replace the specified block
+        self.model = replace_evoformer_block(
+            self.model, 
+            self.replace_block_index, 
+            c_m, 
+            c_z, 
+            self.replacement_hidden_dim
+        )
+        
+        # Freeze all parameters except the replaced block
+        trainable_params = freeze_all_except_replaced_block(
+            self.model, 
+            self.replace_block_index
+        )
+        
+        print(f"Applied block replacement and freezing. Trainable parameters: {trainable_params:,}")
 
     def forward(self, batch):
         return self.model(batch)
@@ -298,7 +334,24 @@ def main(args):
             custom_config_dict = json.load(f)
         config.update_from_flattened_dict(custom_config_dict)
 
-    model_module = OpenFoldWrapper(config)
+    # Configure for single sequence mode if requested
+    if args.enable_single_seq_mode:
+        print("Enabling single sequence mode - reducing MSA and template requirements")
+        # Reduce MSA requirements for single sequence training
+        config.data.common.max_extra_msa = 1
+        config.data.common.max_msa_clusters = 1
+        config.data.train.max_extra_msa = 1
+        config.data.train.max_msa_clusters = 1
+        # Disable templates
+        config.model.template.enabled = False
+        # Reduce some computational requirements
+        config.data.train.crop_size = min(config.data.train.crop_size, 256)
+
+    model_module = OpenFoldWrapper(
+        config, 
+        replace_block_index=getattr(args, 'replace_block_index', None),
+        replacement_hidden_dim=getattr(args, 'replacement_hidden_dim', None)
+    )
 
     if args.resume_from_ckpt:
         if args.resume_model_weights_only:
@@ -657,6 +710,38 @@ if __name__ == "__main__":
     )
     parser.add_argument("--mpi_plugin", action="store_true", default=False,
                         help="Whether to use MPI for parallele processing")
+    
+    # Custom block replacement arguments
+    parser.add_argument(
+        "--replace_block_index", type=int, default=None,
+        help="Index of evoformer block to replace with simple architecture (not first/last block)"
+    )
+    parser.add_argument(
+        "--replacement_hidden_dim", type=int, default=None,
+        help="Hidden dimension for replacement block (defaults to max(c_m, c_z))"
+    )
+    parser.add_argument(
+        "--enable_single_seq_mode", action="store_true", default=False,
+        help="Enable single sequence mode (no MSA/templates required)"
+    )
+    
+    # Enhanced data loading arguments
+    parser.add_argument(
+        "--train_chain_list_path", type=str, default=None,
+        help="Path to text file containing training chains (e.g., '1abc_A' per line)"
+    )
+    parser.add_argument(
+        "--distillation_chain_list_path", type=str, default=None,
+        help="Path to text file containing distillation chains"
+    )
+    parser.add_argument(
+        "--val_chain_list_path", type=str, default=None,
+        help="Path to text file containing validation chains"
+    )
+    parser.add_argument(
+        "--enable_recursive_search", action="store_true", default=True,
+        help="Enable recursive search for structure files in subdirectories"
+    )
 
     trainer_group = parser.add_argument_group(
         'Arguments to pass to PyTorch Lightning Trainer')
@@ -699,5 +784,21 @@ if __name__ == "__main__":
     if (args.resume_from_jax_params is not None and args.resume_from_ckpt is not None):
         raise ValueError(
             "Choose between loading pretrained Jax-weights and a checkpoint-path")
+
+    # Validate block replacement arguments
+    if args.replace_block_index is not None:
+        if args.replace_block_index <= 0:
+            raise ValueError("replace_block_index must be greater than 0 (not first block)")
+        if args.config_preset == "initial_training":
+            # Default OpenFold has 48 blocks
+            max_block_index = 47  # Not the last block (47)
+        else:
+            max_block_index = 47  # Conservative estimate
+        if args.replace_block_index >= max_block_index:
+            raise ValueError(f"replace_block_index must be less than {max_block_index} (not last block)")
+        
+        print(f"Will replace evoformer block {args.replace_block_index} with simple architecture")
+        if args.replacement_hidden_dim:
+            print(f"Using replacement hidden dimension: {args.replacement_hidden_dim}")
 
     main(args)
