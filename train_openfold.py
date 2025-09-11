@@ -47,13 +47,14 @@ from custom_evoformer_replacement import (
 
 
 class OpenFoldWrapper(pl.LightningModule):
-    def __init__(self, config, replace_block_index=None, replacement_hidden_dim=None):
+    def __init__(self, config, replace_block_index=None, replacement_hidden_dim=None, learning_rate=1e-3):
         super(OpenFoldWrapper, self).__init__()
         self.config = config
         self.model = AlphaFold(config)
         self.is_multimer = self.config.globals.is_multimer
         self.replace_block_index = replace_block_index
         self.replacement_hidden_dim = replacement_hidden_dim
+        self.learning_rate = learning_rate
 
         # Apply block replacement if specified
         if replace_block_index is not None:
@@ -67,6 +68,7 @@ class OpenFoldWrapper(pl.LightningModule):
 
         self.cached_weights = None
         self.last_lr_step = -1
+        self._is_distributed = None  # Cache for distributed detection
         self.save_hyperparameters()
     
     def _apply_block_replacement(self):
@@ -75,8 +77,8 @@ class OpenFoldWrapper(pl.LightningModule):
             return
             
         # Get dimensions from config
-        c_m = self.config.model.evoformer.c_m
-        c_z = self.config.model.evoformer.c_z
+        c_m = self.config.model.evoformer_stack.c_m
+        c_z = self.config.model.evoformer_stack.c_z
         
         # Replace the specified block
         self.model = replace_evoformer_block(
@@ -100,19 +102,33 @@ class OpenFoldWrapper(pl.LightningModule):
 
     def _log(self, loss_breakdown, batch, outputs, train=True):
         phase = "train" if train else "val"
+        
+        # Detect if we're in a distributed setting (cache for efficiency)
+        if self._is_distributed is None:
+            self._is_distributed = hasattr(self, 'trainer') and self.trainer and self.trainer.world_size > 1
+        
+        sync_epoch_metrics = self._is_distributed
+        
         for loss_name, indiv_loss in loss_breakdown.items():
+            # Determine if this will be epoch-level logging
+            is_epoch_level = (not train)  # Validation logs are epoch-level
+            sync_for_this_call = sync_epoch_metrics if is_epoch_level else False
+            
             self.log(
                 f"{phase}/{loss_name}", 
                 indiv_loss, 
                 prog_bar=(loss_name == 'loss'),
-                on_step=train, on_epoch=(not train), logger=True, sync_dist=False,
+                on_step=train, on_epoch=(not train), logger=True, 
+                sync_dist=sync_for_this_call,  # Sync for epoch-level (including validation)
             )
 
             if (train):
+                # Additional epoch-level logging for training (sync in distributed settings)
                 self.log(
                     f"{phase}/{loss_name}_epoch",
                     indiv_loss,
-                    on_step=False, on_epoch=True, logger=True, sync_dist=False,
+                    on_step=False, on_epoch=True, logger=True, 
+                    sync_dist=sync_epoch_metrics,  # Sync for epoch-level in distributed
                 )
 
         with torch.no_grad():
@@ -123,11 +139,13 @@ class OpenFoldWrapper(pl.LightningModule):
             )
 
         for k, v in other_metrics.items():
+            # Epoch-level validation metrics (sync in distributed settings)
             self.log(
                 f"{phase}/{k}",
                 torch.mean(v),
                 prog_bar = (k == 'loss'),
-                on_step=False, on_epoch=True, logger=True, sync_dist=False,
+                on_step=False, on_epoch=True, logger=True, 
+                sync_dist=sync_epoch_metrics,  # Sync for epoch-level in distributed
             )
 
     def training_step(self, batch, batch_idx):
@@ -251,9 +269,12 @@ class OpenFoldWrapper(pl.LightningModule):
         return metrics
 
     def configure_optimizers(self, 
-        learning_rate: float = 1e-3,
+        learning_rate: float = None,
         eps: float = 1e-5,
     ) -> torch.optim.Adam:
+        # Use learning rate from args if provided, otherwise use default
+        if learning_rate is None:
+            learning_rate = getattr(self, 'learning_rate', 1e-3)
         # Ignored as long as a DeepSpeed optimizer is configured
         optimizer = torch.optim.Adam(
             self.model.parameters(),
@@ -318,8 +339,11 @@ def get_model_state_dict_from_ds_checkpoint(checkpoint_dir):
     return torch.load(state_file)
 
 def main(args):
+    # Set float32 matmul precision for Tensor Cores
+    torch.set_float32_matmul_precision("medium")
+    
     if(args.seed is not None):
-        seed_everything(args.seed, workers=True) 
+        seed_everything(args.seed, workers=True)
 
     is_low_precision = args.precision in [
         "bf16-mixed", "16", "bf16", "16-true", "16-mixed", "bf16-mixed"]
@@ -328,7 +352,7 @@ def main(args):
         args.config_preset, 
         train=True, 
         low_prec=is_low_precision,
-    ) 
+    )
     if args.experiment_config_json: 
         with open(args.experiment_config_json, 'r') as f:
             custom_config_dict = json.load(f)
@@ -342,15 +366,25 @@ def main(args):
         config.data.common.max_msa_clusters = 1
         config.data.train.max_extra_msa = 1
         config.data.train.max_msa_clusters = 1
-        # Disable templates
-        config.model.template.enabled = False
+        # Keep template MODEL enabled if using a ptm checkpoint (for weight compatibility)
+        # But disable template DATA usage for single sequence mode
+        if args.resume_from_ckpt and "ptm" in args.resume_from_ckpt:
+            print("Keeping template model enabled due to ptm checkpoint usage")
+            config.model.template.enabled = True
+            # But disable template data usage for single sequence mode
+            config.data.common.use_templates = False
+            config.data.common.use_template_torsion_angles = False
+            print("Disabled template data usage for single sequence mode")
+        else:
+            config.model.template.enabled = False
         # Reduce some computational requirements
         config.data.train.crop_size = min(config.data.train.crop_size, 256)
 
     model_module = OpenFoldWrapper(
         config, 
         replace_block_index=getattr(args, 'replace_block_index', None),
-        replacement_hidden_dim=getattr(args, 'replacement_hidden_dim', None)
+        replacement_hidden_dim=getattr(args, 'replacement_hidden_dim', None),
+        learning_rate=getattr(args, 'learning_rate', 1e-3)
     )
 
     if args.resume_from_ckpt:
@@ -362,16 +396,20 @@ def main(args):
             else:
                 sd = torch.load(args.resume_from_ckpt)
             # Process the state dict
+            # Use strict=False if we're doing block replacement (model structure changed)
+            strict_loading = not (hasattr(args, 'replace_block_index') and args.replace_block_index is not None)
+            if not strict_loading:
+                print(f"Using strict=False for weight loading due to block replacement at index {args.replace_block_index}")
             if 'module' in sd:
                 sd = {k[len('module.'):]: v for k, v in sd['module'].items()}
-                import_openfold_weights_(model=model_module, state_dict=sd)
+                import_openfold_weights_(model=model_module, state_dict=sd, strict=strict_loading)
             elif 'state_dict' in sd:
                 import_openfold_weights_(
-                    model=model_module, state_dict=sd['state_dict'])
+                    model=model_module, state_dict=sd['state_dict'], strict=strict_loading)
             else:
                 # Loading from pre-trained model
                 sd = {'model.'+k: v for k, v in sd.items()}
-                import_openfold_weights_(model=model_module, state_dict=sd)
+                import_openfold_weights_(model=model_module, state_dict=sd, strict=strict_loading)
             logging.info("Successfully loaded model weights...")
 
         else:  # Loads a checkpoint to start from a specific time step
@@ -409,17 +447,45 @@ def main(args):
     data_module.setup()
 
     callbacks = []
-    if (args.checkpoint_every_epoch):
-        mc = ModelCheckpoint(
-            every_n_epochs=1,
-            auto_insert_metric_name=False,
-            save_top_k=-1,
-        )
-        callbacks.append(mc)
+    
+    # Enhanced checkpoint saving configuration
+    checkpoint_config = {}
+    if hasattr(args, 'checkpoint_save_top_k') and args.checkpoint_save_top_k is not None:
+        checkpoint_config['save_top_k'] = args.checkpoint_save_top_k
+    else:
+        checkpoint_config['save_top_k'] = -1 if args.checkpoint_every_epoch else 1
+    
+    if hasattr(args, 'checkpoint_monitor') and args.checkpoint_monitor:
+        checkpoint_config['monitor'] = args.checkpoint_monitor
+    elif not args.checkpoint_every_epoch:
+        # Use validation loss for best checkpoint when not saving every epoch
+        checkpoint_config['monitor'] = 'val/loss' if hasattr(args, 'val_data_dir') and args.val_data_dir else 'train/loss'
+        checkpoint_config['mode'] = 'min'
+    
+    if args.checkpoint_every_epoch:
+        checkpoint_config['every_n_epochs'] = 1
+        checkpoint_config['auto_insert_metric_name'] = False
+    elif hasattr(args, 'checkpoint_every_n_steps') and args.checkpoint_every_n_steps:
+        checkpoint_config['every_n_train_steps'] = args.checkpoint_every_n_steps
+        checkpoint_config['auto_insert_metric_name'] = False
+    elif hasattr(args, 'checkpoint_every_n_epochs') and args.checkpoint_every_n_epochs:
+        checkpoint_config['every_n_epochs'] = args.checkpoint_every_n_epochs
+        checkpoint_config['auto_insert_metric_name'] = False
+    
+    # Always create a checkpoint callback
+    mc = ModelCheckpoint(**checkpoint_config)
+    callbacks.append(mc)
 
     if (args.early_stopping):
+        # Use training metric for early stopping if no validation data is available
+        early_stopping_metric = getattr(args, 'early_stopping_metric', 'val/lddt_ca')
+        if args.enable_single_seq_mode:
+            # In single sequence mode, we typically don't have validation data
+            early_stopping_metric = 'train/lddt_ca'
+            print(f"Using training metric for early stopping: {early_stopping_metric}")
+        
         es = EarlyStoppingVerbose(
-            monitor="val/lddt_ca",
+            monitor=early_stopping_metric,
             min_delta=args.min_delta,
             patience=args.patience,
             verbose=False,
@@ -475,10 +541,12 @@ def main(args):
             wdb_logger.experiment.save(args.deepspeed_config_path)
             wdb_logger.experiment.save("openfold/config.py")
     elif (args.gpus is not None and args.gpus > 1) or args.num_nodes > 1:
+        print(f"Using distributed training with {args.distributed_backend} backend")
         strategy = DDPStrategy(find_unused_parameters=False,
-                               cluster_environment=cluster_environment)
+                               cluster_environment=cluster_environment,
+                               process_group_backend=args.distributed_backend)
     else:
-        strategy = None
+        strategy = "auto"  # Use "auto" instead of None for newer PyTorch Lightning
  
     if(args.wandb and is_rank_zero):
         freeze_path = f"{wdb_logger.experiment.dir}/package_versions.txt"
@@ -612,6 +680,22 @@ if __name__ == "__main__":
         help="""Whether to checkpoint at the end of every training epoch"""
     )
     parser.add_argument(
+        "--checkpoint_every_n_steps", type=int, default=None,
+        help="Save checkpoint every N training steps (overrides epoch-based saving)"
+    )
+    parser.add_argument(
+        "--checkpoint_every_n_epochs", type=int, default=None,
+        help="Save checkpoint every N epochs (alternative to every_epoch)"
+    )
+    parser.add_argument(
+        "--checkpoint_save_top_k", type=int, default=None,
+        help="Number of best checkpoints to keep (-1 for all, 1 for best only)"
+    )
+    parser.add_argument(
+        "--checkpoint_monitor", type=str, default=None,
+        help="Metric to monitor for best checkpoint (e.g., 'val/loss', 'train/lddt_ca')"
+    )
+    parser.add_argument(
         "--early_stopping", type=bool_type, default=False,
         help="Whether to stop training when validation loss fails to decrease"
     )
@@ -710,6 +794,10 @@ if __name__ == "__main__":
     )
     parser.add_argument("--mpi_plugin", action="store_true", default=False,
                         help="Whether to use MPI for parallele processing")
+    parser.add_argument(
+        "--distributed_backend", type=str, default="gloo", choices=["nccl", "gloo", "mpi"],
+        help="Distributed backend for DDP training (gloo for CPU/compatibility, nccl for GPU performance)"
+    )
     
     # Custom block replacement arguments
     parser.add_argument(
@@ -723,6 +811,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--enable_single_seq_mode", action="store_true", default=False,
         help="Enable single sequence mode (no MSA/templates required)"
+    )
+    parser.add_argument(
+        "--learning_rate", type=float, default=1e-3,
+        help="Learning rate for training (default: 1e-3)"
     )
     
     # Enhanced data loading arguments

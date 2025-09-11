@@ -186,18 +186,21 @@ class OpenFoldSingleDataset(torch.utils.data.Dataset):
             chain: i for i, chain in enumerate(self._chain_ids)
         }
 
-        # If it's running template search for a monomer, then use hhsearch
-        # as demonstrated in AlphaFold's run_alphafold.py code
-        # https://github.com/deepmind/alphafold/blob/6c4d833fbd1c6b8e7c9a21dae5d4ada2ce777e10/run_alphafold.py#L462C1-L477
-        template_featurizer = templates.HhsearchHitFeaturizer(
-            mmcif_dir=template_mmcif_dir,
-            max_template_date=max_template_date,
-            max_hits=max_template_hits,
-            kalign_binary_path=kalign_binary_path,
-            release_dates_path=template_release_dates_cache_path,
-            obsolete_pdbs_path=obsolete_pdbs_file_path,
-            _shuffle_top_k_prefiltered=shuffle_top_k_prefiltered,
-        )
+        # Create template featurizer only if templates are enabled
+        template_featurizer = None
+        if config.common.use_templates:
+            # If it's running template search for a monomer, then use hhsearch
+            # as demonstrated in AlphaFold's run_alphafold.py code
+            # https://github.com/deepmind/alphafold/blob/6c4d833fbd1c6b8e7c9a21dae5d4ada2ce777e10/run_alphafold.py#L462C1-L477
+            template_featurizer = templates.HhsearchHitFeaturizer(
+                mmcif_dir=template_mmcif_dir,
+                max_template_date=max_template_date,
+                max_hits=max_template_hits,
+                kalign_binary_path=kalign_binary_path,
+                release_dates_path=template_release_dates_cache_path,
+                obsolete_pdbs_path=obsolete_pdbs_file_path,
+                _shuffle_top_k_prefiltered=shuffle_top_k_prefiltered,
+            )
 
         self.data_pipeline = data_pipeline.DataPipeline(
             template_featurizer=template_featurizer,
@@ -659,15 +662,22 @@ class OpenFoldDataset(torch.utils.data.Dataset):
             for _ in range(max_cache_len):
                 candidate_idx = next(idx_iter)
                 chain_id = dataset.idx_to_chain_id(candidate_idx)
-                chain_data_cache_entry = chain_data_cache[chain_id]
-                if not self.deterministic_train_filter(chain_data_cache_entry):
-                    continue
+                
+                # Handle case where chain_data_cache is None (e.g., single sequence training)
+                if chain_data_cache is None:
+                    # Skip filtering when no cache is available
+                    weights.append([0., 1.])  # Always include (probability 1.0)
+                    idx.append(candidate_idx)
+                else:
+                    chain_data_cache_entry = chain_data_cache[chain_id]
+                    if not self.deterministic_train_filter(chain_data_cache_entry):
+                        continue
 
-                p = self.get_stochastic_train_filter_prob(
-                    chain_data_cache_entry,
-                )
-                weights.append([1. - p, p])
-                idx.append(candidate_idx)
+                    p = self.get_stochastic_train_filter_prob(
+                        chain_data_cache_entry,
+                    )
+                    weights.append([1. - p, p])
+                    idx.append(candidate_idx)
 
             samples = torch.multinomial(
                 torch.tensor(weights),

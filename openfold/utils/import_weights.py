@@ -707,7 +707,7 @@ def import_openfold_weights_(model, state_dict, strict=True):
     to match the refactored model code.
     """
     try:
-        model.load_state_dict(state_dict, strict=strict)
+        model.load_state_dict(state_dict, strict=True)
     except RuntimeError:
         converted_state_dict = convert_deprecated_v1_keys(state_dict)
         model.load_state_dict(converted_state_dict, strict=strict)

@@ -744,6 +744,10 @@ class DataPipeline:
 
             fp.close()
         else:
+            # Handle case where alignment directory doesn't exist (e.g., single sequence mode)
+            if not os.path.exists(alignment_dir):
+                return msa_data  # Return empty dict
+                
             for f in os.listdir(alignment_dir):
                 path = os.path.join(alignment_dir, f)
                 filename, ext = os.path.splitext(f)
@@ -792,6 +796,10 @@ class DataPipeline:
 
             fp.close()
         else:
+            # Handle case where alignment directory doesn't exist (e.g., single sequence mode)
+            if not os.path.exists(alignment_dir):
+                return all_hits  # Return empty dict
+                
             for f in os.listdir(alignment_dir):
                 path = os.path.join(alignment_dir, f)
                 ext = os.path.splitext(f)[-1]
@@ -850,6 +858,11 @@ class DataPipeline:
         alignment_dir: str,
     ) -> Mapping[str, Any]:
         seqemb_features = {}
+        
+        # Handle case where alignment directory doesn't exist (e.g., single sequence mode)
+        if not os.path.exists(alignment_dir):
+            return seqemb_features  # Return empty dict
+            
         for f in os.listdir(alignment_dir):
             path = os.path.join(alignment_dir, f)
             ext = os.path.splitext(f)[-1]
