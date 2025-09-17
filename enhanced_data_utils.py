@@ -150,6 +150,8 @@ class EnhancedStructureFinder:
         
         # Build file mapping for faster lookups
         self.structure_files = get_structure_files_recursive(data_dir, supported_exts)
+        # For backward compatibility, alias structure_map to structure_files
+        self.structure_map = self.structure_files
         
         # Load chain mapping if provided
         self.chain_mapping = {}
