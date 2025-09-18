@@ -21,19 +21,14 @@ import sys
 import json
 import subprocess
 import shutil
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
 import numpy as np
 import pandas as pd
-# Optional plotting imports
-try:
-    import matplotlib.pyplot as plt
-    import seaborn as sns
-    from scipy.stats import pearsonr, spearmanr
-    PLOTTING_AVAILABLE = True
-except ImportError as e:
-    print(f"Warning: Plotting libraries not available ({e}). Analysis will continue without plots.")
-    PLOTTING_AVAILABLE = False
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import pearsonr, spearmanr
 import torch
 import torch.nn as nn
 from tqdm import tqdm
@@ -41,7 +36,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # Add openfold to path
-sys.path.append('/home/jupyter-chenxi/openfold')
+sys.path.append(str(Path.home() / 'openfold'))
 
 from openfold.config import model_config
 from openfold.model.model import AlphaFold
@@ -113,18 +108,11 @@ class ModelArchitectureEvaluator:
 
     def _setup_data_pipeline(self):
         """Setup the data and feature processing pipelines like official OpenFold"""
+        # Create config - use model_2_ptm to enable pTM head
+        config = model_config("model_2_ptm", train=False, low_prec=False)
         
-        # Import required modules
-        from openfold.data import data_pipeline, templates, feature_pipeline
-        
-        # Create config
-        config = model_config("finetuning", train=False, low_prec=False)
-        
-        # Set up template featurizer (create a temporary dummy directory with a CIF file)
-        import tempfile
-        import os
-        
-        # Create a temporary directory with a dummy CIF file for the template featurizer
+        # Set up template featurizer with no templates (for single sequence mode)
+        # Create a dummy template directory with a minimal CIF file
         temp_template_dir = tempfile.mkdtemp()
         dummy_cif_path = os.path.join(temp_template_dir, "dummy.cif")
         
@@ -152,11 +140,10 @@ _atom_site.auth_comp_id ALA
 _atom_site.auth_asym_id A
 _atom_site.auth_atom_id CA
 _atom_site.pdbx_PDB_model_num 1
-ATOM 1 CA ALA A 1 ? 0.000 0.000 0.000 1.00 50.00 ? ? ? ?
 """)
         
         template_featurizer = templates.HhsearchHitFeaturizer(
-            mmcif_dir=temp_template_dir,
+            mmcif_dir=temp_template_dir,  # Provide valid path even though max_hits=0
             max_template_date="2025-01-01",
             max_hits=0,  # No templates for single sequence mode
             kalign_binary_path="/usr/bin/kalign",
@@ -223,8 +210,8 @@ ATOM 1 CA ALA A 1 ? 0.000 0.000 0.000 1.00 50.00 ? ? ? ?
     def _create_model_configs(self) -> Dict[str, Dict]:
         """Create configurations for the three model architectures"""
         
-        # Use finetuning config to match the checkpoint
-        base_config = model_config("finetuning", train=False, low_prec=False)
+        # Use model_2_ptm config to enable pTM head
+        base_config = model_config("model_2_ptm", train=False, low_prec=False)
         
         configs = {
             "original": {
@@ -358,52 +345,39 @@ ATOM 1 CA ALA A 1 ? 0.000 0.000 0.000 1.00 50.00 ? ? ? ?
             None
         )
         
-        try:
-            # Get structure path
-            structure_path, file_id, chain_id_only, ext = structure_finder.find_structure_path(chain_id)
-            
-            # Extract sequence from structure
-            from evaluation_features_utils import extract_sequence_from_structure
-            sequence = extract_sequence_from_structure(structure_path, chain_id_only)
-            
-        except Exception as e:
-            # Fallback to a dummy sequence for demonstration
-            print(f"    Warning: Could not extract sequence for {chain_id}, using dummy sequence")
-            sequence = "MKLLISGLATLLLAHCEQ"  # Short dummy sequence
+        # Get structure path
+        structure_path, file_id, chain_id_only, ext = structure_finder.find_structure_path(chain_id)
         
-        # Create temporary fasta file
-        import tempfile
-        import os
+        # Extract sequence from structure
+        from evaluation_features_utils import extract_sequence_from_structure
+        sequence = extract_sequence_from_structure(structure_path, chain_id_only)
+                
+        tmp_fasta_path = os.path.join(os.getcwd(), f"tmp_{os.getpid()}_{chain_id}.fasta")
+        with open(tmp_fasta_path, "w") as fp:
+            fp.write(f">{chain_id}\n{sequence}")
         
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.fasta', delete=False) as f:
+        # Create local alignment directory (following official pattern)
+        temp_alignment_dir = tempfile.mkdtemp()
+        local_alignment_dir = os.path.join(temp_alignment_dir, chain_id)
+        os.makedirs(local_alignment_dir, exist_ok=True)
+        
+        # Create minimal MSA file (for seqemb mode)
+        msa_path = os.path.join(local_alignment_dir, "output.a3m")
+        with open(msa_path, 'w') as f:
             f.write(f">{chain_id}\n{sequence}\n")
-            fasta_path = f.name
         
-        try:
-            # Create temporary alignment directory with minimal MSA
-            with tempfile.TemporaryDirectory() as temp_alignment_dir:
-                # Create subdirectory for this chain
-                chain_alignment_dir = os.path.join(temp_alignment_dir, chain_id)
-                os.makedirs(chain_alignment_dir, exist_ok=True)
-                
-                # Create minimal MSA file
-                msa_path = os.path.join(chain_alignment_dir, "output.a3m")
-                with open(msa_path, 'w') as f:
-                    f.write(f">{chain_id}\n{sequence}\n")
-                
-                # Use official OpenFold data pipeline
-                feature_dict = self.data_processor.process_fasta(
-                    fasta_path=fasta_path,
-                    alignment_dir=chain_alignment_dir,
-                    seqemb_mode=True  # Single sequence mode
-                )
-                
-                return feature_dict
+        # Use official OpenFold data pipeline with seqemb_mode=True
+        feature_dict = self.data_processor.process_fasta(
+            fasta_path=tmp_fasta_path,
+            alignment_dir=local_alignment_dir,
+            seqemb_mode=True  # Single sequence mode like official script
+        )
         
-        finally:
-            # Clean up temp fasta file
-            if os.path.exists(fasta_path):
-                os.unlink(fasta_path)
+        # Cleanup
+        os.remove(tmp_fasta_path)
+        shutil.rmtree(temp_alignment_dir)
+        
+        return feature_dict
 
     def _run_inference(self, model: AlphaFold, feature_dict: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
         """Run inference on a single protein following official OpenFold pattern"""
@@ -428,11 +402,7 @@ ATOM 1 CA ALA A 1 ? 0.000 0.000 0.000 1.00 50.00 ? ? ? ?
     def _save_structure(self, outputs: Dict[str, torch.Tensor], chain_id: str, output_path: Path):
         """Save predicted structure as PDB file"""
         
-        # Extract final atom positions and confidence
-        print(f"    Output keys: {list(outputs.keys())}")
-        
         final_atom_positions = outputs["final_atom_positions"].cpu().numpy()
-        print(f"    final_atom_positions original shape: {final_atom_positions.shape}")
         
         # Remove batch dimension if present
         if final_atom_positions.ndim == 4:  # [batch, N_res, 37, 3]
@@ -442,8 +412,6 @@ ATOM 1 CA ALA A 1 ? 0.000 0.000 0.000 1.00 50.00 ? ? ? ?
         else:
             print(f"    Warning: Unexpected final_atom_positions shape: {final_atom_positions.shape}")
         
-        print(f"    final_atom_positions final shape: {final_atom_positions.shape}")
-        
         final_atom_mask = outputs.get("final_atom_mask", None)
         if final_atom_mask is not None:
             final_atom_mask = final_atom_mask.cpu().numpy()
@@ -452,7 +420,6 @@ ATOM 1 CA ALA A 1 ? 0.000 0.000 0.000 1.00 50.00 ? ? ? ?
         
         # Get confidence scores
         plddt = outputs["plddt"].cpu().numpy()
-        print(f"    plddt shape: {plddt.shape}")
         if plddt.ndim > 1:
             plddt = plddt[0]  # Remove batch dim
         
@@ -510,38 +477,43 @@ ATOM 1 CA ALA A 1 ? 0.000 0.000 0.000 1.00 50.00 ? ? ? ?
     def _extract_ptm_score(self, outputs: Dict[str, torch.Tensor]) -> float:
         """Extract pTM score from model outputs"""
         
-        if "ptm" in outputs:
+        if "ptm_score" in outputs:
+            ptm_tensor = outputs["ptm_score"]
+            if ptm_tensor.numel() == 1:
+                return ptm_tensor.item()
+            elif ptm_tensor.numel() > 1:
+                # Take mean if multiple values
+                return ptm_tensor.mean().item()
+        elif "ptm" in outputs:
             return outputs["ptm"].item()
         elif "predicted_tm" in outputs:
             return outputs["predicted_tm"].item()
         else:
-            # Calculate from logits if available
-            return 0.0  # Placeholder
+            return 0.0  # Placeholder if no pTM found
 
     def _calculate_tm_score(self, pred_pdb: Path, true_pdb: Path) -> float:
         """Calculate TM-score using USalign"""
         
-        try:
-            # Run USalign
-            cmd = ["USalign", str(pred_pdb), str(true_pdb)]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-            
-            if result.returncode != 0:
-                print(f"USalign failed for {pred_pdb.name}: {result.stderr}")
-                return 0.0
-            
-            # Parse TM-score from output
-            for line in result.stdout.split('\n'):
-                if "TM-score=" in line and "Chain_1" in line:
-                    # Extract TM-score (format: TM-score= 0.xxxxx)
+        # Run USalign
+        cmd = ["USalign", str(pred_pdb), str(true_pdb)]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        
+        if result.returncode != 0:
+            print(f"USalign failed for {pred_pdb.name}: {result.stderr}")
+            return 0.0
+        
+        # Parse TM-score from output
+        # Look for lines like: "TM-score= 0.53210 (normalized by length of Structure_1: L=105, d0=3.76)"
+        for line in result.stdout.split('\n'):
+            if "TM-score=" in line and "normalized by length of Structure_1" in line:
+                # Extract TM-score (format: TM-score= 0.xxxxx)
+                try:
                     tm_score = float(line.split("TM-score=")[1].split()[0])
                     return tm_score
-            
-            return 0.0
-            
-        except Exception as e:
-            print(f"Error calculating TM-score for {pred_pdb.name}: {e}")
-            return 0.0
+                except (IndexError, ValueError) as e:
+                    continue
+        
+        return 0.0
 
     def evaluate_models(self):
         """Main evaluation function"""
@@ -586,8 +558,6 @@ ATOM 1 CA ALA A 1 ? 0.000 0.000 0.000 1.00 50.00 ? ? ? ?
             
             # Run inference for each model
             for model_name, model in self.models.items():
-                print(f"  Running {model_name}...")
-                
                 # Clear GPU cache before inference
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -610,7 +580,6 @@ ATOM 1 CA ALA A 1 ? 0.000 0.000 0.000 1.00 50.00 ? ? ? ?
                 self.results[model_name]["ptm_scores"][chain_id] = ptm_score
                 self.results[model_name]["tm_scores"][chain_id] = tm_score
                 
-                print(f"    pTM: {ptm_score:.3f}, TM: {tm_score:.3f}")
         
         print("\nEvaluation completed!")
         
@@ -647,7 +616,7 @@ ATOM 1 CA ALA A 1 ? 0.000 0.000 0.000 1.00 50.00 ? ? ? ?
             }
             
             # Correlation between pTM and TM-score
-            if len(ptm_scores) > 1 and PLOTTING_AVAILABLE:
+            if len(ptm_scores) > 1:
                 pearson_r, pearson_p = pearsonr(ptm_scores, tm_scores)
                 spearman_r, spearman_p = spearmanr(ptm_scores, tm_scores)
                 
@@ -672,10 +641,6 @@ ATOM 1 CA ALA A 1 ? 0.000 0.000 0.000 1.00 50.00 ? ? ? ?
 
     def _create_plots(self):
         """Create comprehensive analysis plots"""
-        
-        if not PLOTTING_AVAILABLE:
-            print("\nSkipping plots (matplotlib/seaborn not available)")
-            return
             
         print("\nGenerating plots...")
         
@@ -754,17 +719,21 @@ ATOM 1 CA ALA A 1 ? 0.000 0.000 0.000 1.00 50.00 ? ? ? ?
             # Scatter plot
             ax.scatter(ptm_scores, tm_scores, alpha=0.6, s=50)
             
-            # Fit line
-            if len(ptm_scores) > 1:
-                z = np.polyfit(ptm_scores, tm_scores, 1)
-                p = np.poly1d(z)
-                x_line = np.linspace(min(ptm_scores), max(ptm_scores), 100)
-                ax.plot(x_line, p(x_line), "r--", alpha=0.8, linewidth=2)
+            # Fit line (only if we have variation in the data)
+            if len(ptm_scores) > 1 and np.std(ptm_scores) > 1e-10 and np.std(tm_scores) > 1e-10:
+                try:
+                    z = np.polyfit(ptm_scores, tm_scores, 1)
+                    p = np.poly1d(z)
+                    x_line = np.linspace(min(ptm_scores), max(ptm_scores), 100)
+                    ax.plot(x_line, p(x_line), "r--", alpha=0.8, linewidth=2)
+                except np.linalg.LinAlgError:
+                    pass  # Skip fitting if numerical issues
                 
                 # Add correlation info
                 pearson_r = self.analysis[model_name].get("pearson_r", 0)
-                ax.text(0.05, 0.95, f"r = {pearson_r:.3f}", transform=ax.transAxes, 
-                       bbox=dict(boxstyle="round", facecolor='white', alpha=0.8))
+                if not np.isnan(pearson_r):
+                    ax.text(0.05, 0.95, f"r = {pearson_r:.3f}", transform=ax.transAxes, 
+                           bbox=dict(boxstyle="round", facecolor='white', alpha=0.8))
             
             ax.set_xlabel("pTM Score")
             ax.set_ylabel("TM-Score")
