@@ -3,6 +3,7 @@ Custom Evoformer Block Replacement for Training Experiments
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Tuple, Optional, Sequence
 
 
@@ -12,32 +13,56 @@ class SimpleEvoformerReplacement(nn.Module):
     Maintains the same input/output signature as the original EvoformerBlock
     """
     
-    def __init__(self, c_m: int, c_z: int, hidden_dim: Optional[int] = None):
+    def __init__(self, c_m: int, c_z: int, m_hidden_dim: Optional[int] = None, z_hidden_dim: Optional[int] = None, linear_type: str = "full", gating: bool = True, residual: bool = True):
         """
         Args:
             c_m: MSA representation dimension
             c_z: Pair representation dimension  
-            hidden_dim: Hidden dimension for the linear layers (defaults to max(c_m, c_z))
+            m_hidden_dim: Hidden dimension for the MSA linear layers (defaults to max(c_m, c_z))
+            z_hidden_dim: Hidden dimension for the pair linear layers (defaults to max(c_m, c_z))
+            linear_type: Type of linear layer to use (defaults to "full")
+            gating: Whether to use gating mechanism (defaults to True)
+            residual: Whether to use residual connections (defaults to True)
         """
         super(SimpleEvoformerReplacement, self).__init__()
         
         self.c_m = c_m
         self.c_z = c_z
-        
-        if hidden_dim is None:
-            hidden_dim = max(c_m, c_z)
+        self.residual = residual
+        self.gating = gating
+        self.linear_type = linear_type
+
+        if m_hidden_dim is None:
+            m_hidden_dim = c_m
+        if z_hidden_dim is None:
+            z_hidden_dim = c_z
+
+        if linear_type == "full":
+            linear_class = nn.Linear
+        elif linear_type == "diagonal":
+            assert m_hidden_dim == c_m and z_hidden_dim == c_z, "Diagonal linear requires input_dim and hidden_dim to be the same"
+            linear_class = DiagonalLinear
+        elif linear_type == "affine":
+            assert m_hidden_dim == c_m and z_hidden_dim == c_z, "Affine linear requires input_dim and hidden_dim to be the same"
+            linear_class = AffineLinear
+        else:
+            raise ValueError(f"Invalid linear type: {linear_type}")
+
+        if gating:
+            self.m_gating_linear = linear_class(c_m, c_m)
+            self.z_gating_linear = linear_class(c_z, c_z)
         
         # MSA processing layers
         self.msa_layer_norm = nn.LayerNorm(c_m)
-        self.msa_linear1 = nn.Linear(c_m, hidden_dim)
+        self.msa_linear1 = linear_class(c_m, m_hidden_dim)
         self.msa_relu = nn.ReLU()
-        self.msa_linear2 = nn.Linear(hidden_dim, c_m)
+        self.msa_linear2 = linear_class(m_hidden_dim, c_m)
         
         # Pair processing layers
         self.pair_layer_norm = nn.LayerNorm(c_z)
-        self.pair_linear1 = nn.Linear(c_z, hidden_dim)
+        self.pair_linear1 = linear_class(c_z, z_hidden_dim)
         self.pair_relu = nn.ReLU()
-        self.pair_linear2 = nn.Linear(hidden_dim, c_z)
+        self.pair_linear2 = linear_class(z_hidden_dim, c_z)
         
         # Initialize weights
         self._init_weights()
@@ -83,32 +108,63 @@ class SimpleEvoformerReplacement(nn.Module):
             # Apply residual connection: m = m + f(LayerNorm(m))
             m_normalized = self.msa_layer_norm(m)
             m_transformed = self.msa_linear2(self.msa_relu(self.msa_linear1(m_normalized)))
+            if self.gating:
+                gating_output = F.sigmoid(self.m_gating_linear(m))
+                m_transformed = m_transformed * gating_output
+            if self.residual:
+                m = m + m_transformed
+            else:
+                m = m_transformed
             
             # Apply mask if provided
             if msa_mask is not None and _mask_trans:
                 # Expand mask to match tensor dimensions
                 mask_expanded = msa_mask.unsqueeze(-1)  # [batch, n_seq, n_res, 1]
                 m_transformed = m_transformed * mask_expanded
-            
-            m = m + m_transformed
         
         if z is not None:
             # Apply residual connection: z = z + f(LayerNorm(z))
             z_normalized = self.pair_layer_norm(z)
             z_transformed = self.pair_linear2(self.pair_relu(self.pair_linear1(z_normalized)))
+            if self.gating:
+                gating_output = F.sigmoid(self.z_gating_linear(z))
+                z_transformed = z_transformed * gating_output
+            if self.residual:
+                z = z + z_transformed
+            else:
+                z = z_transformed
             
             # Apply mask if provided
             if pair_mask is not None and _mask_trans:
                 # Expand mask to match tensor dimensions
                 mask_expanded = pair_mask.unsqueeze(-1)  # [batch, n_res, n_res, 1]
                 z_transformed = z_transformed * mask_expanded
-            
-            z = z + z_transformed
         
         return m, z
 
 
-def replace_evoformer_block(model, block_index: int, c_m: int, c_z: int, hidden_dim: Optional[int] = None):
+class DiagonalLinear(nn.Module):
+    def __init__(self, num_features):
+        super(DiagonalLinear, self).__init__()
+        # Only need a vector for the diagonal elements
+        self.diag_weight = nn.Parameter(torch.randn(num_features))
+        self.bias = nn.Parameter(torch.zeros(num_features))
+
+    def forward(self, x):
+        return F.linear(x, self.diag_weight, self.bias)
+
+
+class AffineLinear(nn.Module):
+    def __init__(self, num_features):
+        super(AffineLinear, self).__init__()
+        self.weight = nn.Parameter(torch.zeros(1))
+        self.bias = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        return self.weight * x + self.bias
+
+
+def replace_evoformer_block(model, block_index: int, c_m: int, c_z: int, m_hidden_dim: Optional[int] = None, z_hidden_dim: Optional[int] = None, linear_type: str = "full", gating: bool = True, residual: bool = True):
     """
     Replace a specific EvoformerBlock with SimpleEvoformerReplacement
     
@@ -117,7 +173,11 @@ def replace_evoformer_block(model, block_index: int, c_m: int, c_z: int, hidden_
         block_index: Index of the block to replace (not first or last)
         c_m: MSA representation dimension
         c_z: Pair representation dimension
-        hidden_dim: Hidden dimension for replacement block
+        m_hidden_dim: Hidden dimension for the MSA linear layers (defaults to max(c_m, c_z))
+        z_hidden_dim: Hidden dimension for the pair linear layers (defaults to max(c_m, c_z))
+        linear_type: Type of linear layer to use (defaults to "full")
+        gating: Whether to use gating mechanism (defaults to True)
+        residual: Whether to use residual connections (defaults to True)
     
     Returns:
         The model with the replaced block
@@ -129,7 +189,7 @@ def replace_evoformer_block(model, block_index: int, c_m: int, c_z: int, hidden_
         raise ValueError(f"Block index {block_index} must be between 1 and {total_blocks-2} (not first or last)")
     
     # Create the replacement block
-    replacement_block = SimpleEvoformerReplacement(c_m, c_z, hidden_dim)
+    replacement_block = SimpleEvoformerReplacement(c_m, c_z, m_hidden_dim, z_hidden_dim, linear_type, gating, residual)
     
     # Replace the block
     model.evoformer.blocks[block_index] = replacement_block
