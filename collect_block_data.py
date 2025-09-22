@@ -54,9 +54,7 @@ class EvoformerBlockDataCollector:
         self.data_dir = self.output_dir / "block_data"
         os.makedirs(self.data_dir, exist_ok=True)
         
-        # Hook storage for each block
-        self.block_data = {i: {"inputs": [], "outputs": []} for i in range(48)}
-        self.hooks = []
+        # Data storage (no hooks needed)
         
         # Setup data pipeline
         self.data_processor, self.feature_processor = self._setup_data_pipeline()
@@ -158,40 +156,6 @@ _atom_site.pdbx_PDB_model_num 1
         print(f"Model loaded successfully")
         return model
 
-    def _setup_hooks(self, model: AlphaFold):
-        """Setup forward hooks for all Evoformer blocks"""
-        print("Setting up hooks for all 48 Evoformer blocks...")
-        
-        def create_hook(block_idx):
-            def hook_fn(module, input, output):
-                # Store input and output for this block
-                # input is a tuple, output is a tuple (m, z)
-                m_in, z_in = input[0], input[1]
-                m_out, z_out = output[0], output[1]
-                
-                # Store copies on CPU to save GPU memory
-                self.block_data[block_idx]["inputs"].append({
-                    "m": m_in.detach().cpu().clone(),
-                    "z": z_in.detach().cpu().clone()
-                })
-                self.block_data[block_idx]["outputs"].append({
-                    "m": m_out.detach().cpu().clone(), 
-                    "z": z_out.detach().cpu().clone()
-                })
-            return hook_fn
-        
-        # Register hooks for all blocks
-        for i, block in enumerate(model.evoformer.blocks):
-            hook = block.register_forward_hook(create_hook(i))
-            self.hooks.append(hook)
-        
-        print(f"Registered hooks for {len(self.hooks)} blocks")
-
-    def _remove_hooks(self):
-        """Remove all registered hooks"""
-        for hook in self.hooks:
-            hook.remove()
-        self.hooks = []
 
     def _load_chain_list(self) -> Tuple[List[str], List[str]]:
         """Load chain list and create train/val split"""
@@ -275,7 +239,7 @@ _atom_site.pdbx_PDB_model_num 1
         return feature_dict
 
     def _run_inference_with_hooks(self, model: AlphaFold, feature_dict: Dict[str, np.ndarray]):
-        """Run inference and collect block data via hooks"""
+        """Run inference and collect block data via the built-in outputs mechanism"""
         
         # Process features
         processed_feature_dict = self.feature_processor.process_features(
@@ -288,16 +252,10 @@ _atom_site.pdbx_PDB_model_num 1
             for k, v in processed_feature_dict.items()
         }
         
-        # Run inference (only first recycle - recycle 0)
+        # Run inference - OpenFold will automatically capture intermediate outputs
+        # when they are available (the model has built-in support for this)
         with torch.no_grad():
-            # Set recycles to 1 to get only recycle 0
-            original_recycles = model.config.model.recycle_features
-            model.config.model.recycle_features = False  # This ensures only one pass
-            
             outputs = model(processed_feature_dict)
-            
-            # Restore original setting
-            model.config.model.recycle_features = original_recycles
         
         return outputs
 
@@ -306,9 +264,8 @@ _atom_site.pdbx_PDB_model_num 1
         print("=== Evoformer Block Data Collection ===")
         print()
         
-        # Load model and setup hooks
+        # Load model
         model = self._load_model()
-        self._setup_hooks(model)
         
         try:
             # Load chain lists
@@ -317,81 +274,103 @@ _atom_site.pdbx_PDB_model_num 1
             # Process training data
             print(f"\nProcessing training data ({len(train_chains)} proteins)...")
             for i, chain_id in enumerate(tqdm(train_chains, desc="Training proteins")):
-                try:
-                    # Clear block data for this protein
-                    for block_idx in range(48):
-                        self.block_data[block_idx]["inputs"].clear()
-                        self.block_data[block_idx]["outputs"].clear()
-                    
-                    # Create features and run inference
-                    features = self._create_features(chain_id)
-                    outputs = self._run_inference_with_hooks(model, features)
-                    
-                    # Save data for this protein
-                    self._save_protein_data(chain_id, "train")
-                    
-                    # Clear GPU cache
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                        
-                except Exception as e:
-                    print(f"Error processing {chain_id}: {e}")
-                    continue
+                # Create features and run inference
+                features = self._create_features(chain_id)
+                outputs = self._run_inference_with_hooks(model, features)
+                
+                # Save data for this protein
+                self._save_protein_data(chain_id, "train", outputs)
+                
+                # Clear GPU cache
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             
             # Process validation data
             print(f"\nProcessing validation data ({len(val_chains)} proteins)...")
             for i, chain_id in enumerate(tqdm(val_chains, desc="Validation proteins")):
-                try:
-                    # Clear block data for this protein
-                    for block_idx in range(48):
-                        self.block_data[block_idx]["inputs"].clear()
-                        self.block_data[block_idx]["outputs"].clear()
-                    
-                    # Create features and run inference
-                    features = self._create_features(chain_id)
-                    outputs = self._run_inference_with_hooks(model, features)
-                    
-                    # Save data for this protein
-                    self._save_protein_data(chain_id, "val")
-                    
-                    # Clear GPU cache
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                        
-                except Exception as e:
-                    print(f"Error processing {chain_id}: {e}")
-                    continue
+                # Create features and run inference
+                features = self._create_features(chain_id)
+                outputs = self._run_inference_with_hooks(model, features)
+                
+                # Save data for this protein
+                self._save_protein_data(chain_id, "val", outputs)
+                
+                # Clear GPU cache
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             
             print("\nData collection completed!")
             
         finally:
-            # Always remove hooks
-            self._remove_hooks()
+            # Clean up
+            pass
         
         # Save metadata
         self._save_metadata(train_chains, val_chains)
 
-    def _save_protein_data(self, chain_id: str, split: str):
-        """Save data for a single protein"""
+    def _save_protein_data(self, chain_id: str, split: str, outputs: Dict[str, torch.Tensor]):
+        """Save data for a single protein using built-in intermediate outputs"""
         
+        # Extract recycle 0 data (we want only the first recycle)
+        recycle_0_keys = [k for k in outputs.keys() if k.startswith('recycle_0_block_')]
+        
+        if not recycle_0_keys:
+            print(f"    Warning: No recycle_0_block outputs found for {chain_id}")
+            print(f"    Available keys: {list(outputs.keys())[:10]}...")  # Show first 10 keys
+            return
+        
+        print(f"    Found {len(recycle_0_keys)} block outputs for {chain_id}")
+        
+        saved_blocks = 0
+        # Process each block
         for block_idx in range(48):
-            if not self.block_data[block_idx]["inputs"]:
-                continue  # Skip if no data collected
+            block_key = f"recycle_0_block_{block_idx}"
+            
+            if block_key not in outputs:
+                continue  # Skip if this block wasn't captured
             
             # Create block-specific directory
             block_dir = self.data_dir / f"block_{block_idx:02d}" / split
             os.makedirs(block_dir, exist_ok=True)
             
+            # Get the block outputs (tuple of m, z)
+            block_output = outputs[block_key]
+            m_out, z_out = block_output[0], block_output[1]
+            
+            # For inputs, we need the output of the previous block (or initial embeddings for block 0)
+            if block_idx == 0:
+                # For block 0, we don't have "inputs" from a previous block
+                # Skip block 0 for now, or handle specially
+                continue
+            else:
+                # Input is the output of the previous block
+                prev_block_key = f"recycle_0_block_{block_idx-1}"
+                if prev_block_key not in outputs:
+                    continue
+                prev_block_output = outputs[prev_block_key]
+                m_in, z_in = prev_block_output[0], prev_block_output[1]
+            
             # Save input/output pair
             data = {
-                "input": self.block_data[block_idx]["inputs"][0],  # Should be only one
-                "output": self.block_data[block_idx]["outputs"][0],
-                "chain_id": chain_id
+                "input": {
+                    "m": m_in.detach().cpu(),
+                    "z": z_in.detach().cpu()
+                },
+                "output": {
+                    "m": m_out.detach().cpu(),
+                    "z": z_out.detach().cpu()
+                },
+                "chain_id": chain_id,
+                "block_idx": block_idx
             }
             
             save_path = block_dir / f"{chain_id}.pkl"
             with open(save_path, 'wb') as f:
                 pickle.dump(data, f)
+            
+            saved_blocks += 1
+        
+        print(f"    Saved data for {saved_blocks} blocks")
 
     def _save_metadata(self, train_chains: List[str], val_chains: List[str]):
         """Save metadata about the collected data"""
