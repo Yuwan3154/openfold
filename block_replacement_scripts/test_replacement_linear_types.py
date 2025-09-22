@@ -60,7 +60,7 @@ class LinearTypeComparison:
         
         # Build command
         cmd = [
-            sys.executable, "openfold/train_single_block_replacements.py",
+            sys.executable, "openfold/block_replacement_scripts/train_single_block_replacements.py",
             "--data_dir", str(self.args.data_dir),
             "--output_dir", str(self.args.output_dir),
             "--blocks"] + [str(b) for b in blocks] + [
