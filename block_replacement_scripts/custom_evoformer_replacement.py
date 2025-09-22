@@ -38,32 +38,33 @@ class SimpleEvoformerReplacement(nn.Module):
             z_hidden_dim = c_z
 
         if linear_type == "full":
-            linear_class = nn.Linear
+            self.linear_class = nn.Linear
         elif linear_type == "diagonal":
             assert m_hidden_dim == c_m and z_hidden_dim == c_z, "Diagonal linear requires input_dim and hidden_dim to be the same"
-            linear_class = DiagonalLinear
+            self.linear_class = DiagonalLinear
         elif linear_type == "affine":
             assert m_hidden_dim == c_m and z_hidden_dim == c_z, "Affine linear requires input_dim and hidden_dim to be the same"
-            linear_class = AffineLinear
+            self.linear_class = AffineLinear
         else:
             raise ValueError(f"Invalid linear type: {linear_type}")
 
         if gating:
-            self.m_gating_linear = linear_class(c_m, c_m)
-            self.z_gating_linear = linear_class(c_z, c_z)
-        
-        # MSA processing layers
+            # Gating layers will always be full linear layers
+            self.m_gating_linear = nn.Linear(c_m, c_m)
+            self.z_gating_linear = nn.Linear(c_z, c_z)
+
+        # MSA representation processing layers
         self.msa_layer_norm = nn.LayerNorm(c_m)
-        self.msa_linear1 = linear_class(c_m, m_hidden_dim)
+        self.msa_linear1 = self.linear_class(c_m, m_hidden_dim)
         self.msa_relu = nn.ReLU()
-        self.msa_linear2 = linear_class(m_hidden_dim, c_m)
+        self.msa_linear2 = self.linear_class(m_hidden_dim, c_m)
         
-        # Pair processing layers
+        # Pair representation processing layers
         self.pair_layer_norm = nn.LayerNorm(c_z)
-        self.pair_linear1 = linear_class(c_z, z_hidden_dim)
+        self.pair_linear1 = self.linear_class(c_z, z_hidden_dim)
         self.pair_relu = nn.ReLU()
-        self.pair_linear2 = linear_class(z_hidden_dim, c_z)
-        
+        self.pair_linear2 = self.linear_class(z_hidden_dim, c_z)
+
         # Initialize weights
         self._init_weights()
     

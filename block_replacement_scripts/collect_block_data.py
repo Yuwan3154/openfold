@@ -274,6 +274,11 @@ _atom_site.pdbx_PDB_model_num 1
             # Process training data
             print(f"\nProcessing training data ({len(train_chains)} proteins)...")
             for i, chain_id in enumerate(tqdm(train_chains, desc="Training proteins")):
+                # Check if data already exists for this protein
+                if self._check_protein_data_exists(chain_id, "train"):
+                    print(f"  ✅ Data already exists for {chain_id} - skipping")
+                    continue
+                
                 # Create features and run inference
                 features = self._create_features(chain_id)
                 outputs = self._run_inference_with_hooks(model, features)
@@ -288,6 +293,11 @@ _atom_site.pdbx_PDB_model_num 1
             # Process validation data
             print(f"\nProcessing validation data ({len(val_chains)} proteins)...")
             for i, chain_id in enumerate(tqdm(val_chains, desc="Validation proteins")):
+                # Check if data already exists for this protein
+                if self._check_protein_data_exists(chain_id, "val"):
+                    print(f"  ✅ Data already exists for {chain_id} - skipping")
+                    continue
+                
                 # Create features and run inference
                 features = self._create_features(chain_id)
                 outputs = self._run_inference_with_hooks(model, features)
@@ -307,6 +317,20 @@ _atom_site.pdbx_PDB_model_num 1
         
         # Save metadata
         self._save_metadata(train_chains, val_chains)
+
+    def _check_protein_data_exists(self, chain_id: str, split: str) -> bool:
+        """Check if data has already been collected for this protein"""
+        
+        # Check if at least one block file exists for this protein
+        for block_idx in range(1, 47):  # Skip first and last blocks
+            block_dir = self.output_dir / "block_data" / f"block_{block_idx:02d}" / split
+            pt_file = block_dir / f"{chain_id}.pt"
+            pkl_file = block_dir / f"{chain_id}.pkl"  # Backward compatibility
+            
+            if pt_file.exists() or pkl_file.exists():
+                return True
+        
+        return False
 
     def _save_protein_data(self, chain_id: str, split: str, outputs: Dict[str, torch.Tensor]):
         """Save data for a single protein using built-in intermediate outputs"""
@@ -364,9 +388,8 @@ _atom_site.pdbx_PDB_model_num 1
                 "block_idx": block_idx
             }
             
-            save_path = block_dir / f"{chain_id}.pkl"
-            with open(save_path, 'wb') as f:
-                pickle.dump(data, f)
+            save_path = block_dir / f"{chain_id}.pt"
+            torch.save(data, save_path)
             
             saved_blocks += 1
         

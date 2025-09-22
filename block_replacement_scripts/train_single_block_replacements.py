@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
 """
-Training script for Evoformer replacement blocks.
+Part 1: Single Block Replacement Training Script
 
-This script trains 48 separate replacement blocks (one for each Evoformer block position)
-using the collected input/output data. It compares 3 linear layer types: full, diagonal, affine.
+This script trains individual replacement blocks for specific Evoformer block positions.
+It tests different linear layer types (full, diagonal, affine) to find the best configuration.
+
+Usage:
+    python train_single_block_replacements.py \
+        --data_dir path/to/block_data \
+        --output_dir path/to/output \
+        --blocks 1 2 3 \
+        --linear_types full diagonal affine \
+        --wandb --wandb_project my_project
 """
 
 import argparse
 import os
 import sys
 import json
-import pickle
 import logging
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
@@ -22,7 +29,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
-from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.loggers import TensorBoardLogger, WandbLogger
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -37,14 +44,14 @@ class BlockDataset(Dataset):
     
     def __init__(self, data_dir: Path, block_idx: int, split: str):
         self.data_dir = data_dir / f"block_{block_idx:02d}" / split
-        self.files = list(self.data_dir.glob("*.pkl")) if self.data_dir.exists() else []
+        self.files = list(self.data_dir.glob("*.pt")) if self.data_dir.exists() else []
         
     def __len__(self):
         return len(self.files)
     
     def __getitem__(self, idx):
-        with open(self.files[idx], 'rb') as f:
-            data = pickle.load(f)
+        file_path = self.files[idx]
+        data = torch.load(file_path, map_location='cpu')
         
         # Extract input and output tensors
         m_in = data["input"]["m"]  # MSA representation
@@ -64,7 +71,8 @@ class BlockDataset(Dataset):
 class ReplacementBlockTrainer(pl.LightningModule):
     """PyTorch Lightning module for training replacement blocks"""
     
-    def __init__(self, c_m: int, c_z: int, linear_type: str, hidden_dim: int, 
+    def __init__(self, c_m: int, c_z: int, linear_type: str, 
+                 m_hidden_dim: int, z_hidden_dim: int,
                  learning_rate: float = 1e-3, weight_decay: float = 1e-4):
         super().__init__()
         self.save_hyperparameters()
@@ -72,7 +80,8 @@ class ReplacementBlockTrainer(pl.LightningModule):
         self.c_m = c_m
         self.c_z = c_z
         self.linear_type = linear_type
-        self.hidden_dim = hidden_dim
+        self.m_hidden_dim = m_hidden_dim
+        self.z_hidden_dim = z_hidden_dim
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         
@@ -80,8 +89,8 @@ class ReplacementBlockTrainer(pl.LightningModule):
         self.replacement_block = SimpleEvoformerReplacement(
             c_m=c_m,
             c_z=c_z, 
-            m_hidden_dim=hidden_dim,
-            z_hidden_dim=hidden_dim,
+            m_hidden_dim=m_hidden_dim,
+            z_hidden_dim=z_hidden_dim,
             linear_type=linear_type,
             gating=True,
             residual=True
@@ -186,8 +195,8 @@ class ReplacementBlockTrainer(pl.LightningModule):
         }
 
 
-class ReplacementBlockTrainingPipeline:
-    """Main training pipeline for replacement blocks"""
+class SingleBlockTrainingPipeline:
+    """Training pipeline for single block replacements"""
     
     def __init__(self, args):
         self.args = args
@@ -199,21 +208,24 @@ class ReplacementBlockTrainingPipeline:
         os.makedirs(self.output_dir, exist_ok=True)
         
         # Load metadata
-        with open(self.data_dir / "metadata.json", 'r') as f:
-            self.metadata = json.load(f)
+        metadata_path = self.data_dir / "metadata.json"
+        if metadata_path.exists():
+            with open(metadata_path, 'r') as f:
+                self.metadata = json.load(f)
+        else:
+            print(f"Warning: Metadata file not found at {metadata_path}")
+            self.metadata = {}
         
         # Model dimensions (from OpenFold model_2_ptm config)
         self.c_m = 256  # MSA representation dimension
         self.c_z = 128  # Pair representation dimension
         
-        # Linear layer types to test
-        self.linear_types = ["full", "diagonal", "affine"]
-        
-        print(f"Initialized training pipeline:")
+        print(f"Initialized single block training pipeline:")
         print(f"  Data directory: {self.data_dir}")
         print(f"  Output directory: {self.output_dir}")
         print(f"  Model dimensions: c_m={self.c_m}, c_z={self.c_z}")
-        print(f"  Linear types: {self.linear_types}")
+        print(f"  Blocks to train: {args.blocks}")
+        print(f"  Linear types: {args.linear_types}")
         print()
 
     def create_data_loaders(self, block_idx: int) -> Tuple[DataLoader, DataLoader]:
@@ -243,10 +255,41 @@ class ReplacementBlockTrainingPipeline:
         
         return train_loader, val_loader
 
+    def _check_training_completion(self, block_idx: int, linear_type: str) -> Optional[Dict]:
+        """Check if training for this block and linear type is already completed"""
+        
+        checkpoint_dir = self.output_dir / f"block_{block_idx:02d}" / linear_type
+        
+        # Check for completion markers
+        completion_files = [
+            checkpoint_dir / "training_results.json",
+            checkpoint_dir / "best_model.ckpt"
+        ]
+        
+        all_exist = all(f.exists() for f in completion_files)
+        
+        if all_exist:
+            print(f"  ✅ Training already completed for Block {block_idx:02d} with {linear_type} - skipping")
+            
+            # Load and return existing results
+            try:
+                with open(checkpoint_dir / "training_results.json", 'r') as f:
+                    return json.load(f)
+            except:
+                return {}
+        else:
+            print(f"  🔄 Training needed for Block {block_idx:02d} with {linear_type}")
+            return None
+
     def train_single_block(self, block_idx: int, linear_type: str) -> Dict[str, float]:
         """Train a replacement block for a specific block index and linear type"""
         
         print(f"\nTraining Block {block_idx:02d} with {linear_type} linear layers...")
+        
+        # Check if training is already completed
+        existing_results = self._check_training_completion(block_idx, linear_type)
+        if existing_results is not None:
+            return existing_results
         
         # Create data loaders
         train_loader, val_loader = self.create_data_loaders(block_idx)
@@ -258,12 +301,25 @@ class ReplacementBlockTrainingPipeline:
         print(f"  Train samples: {len(train_loader.dataset)}")
         print(f"  Val samples: {len(val_loader.dataset)}")
         
+        # Set hidden dimensions based on linear type
+        if linear_type in ["diagonal", "affine"]:
+            # These require hidden_dim == input_dim
+            m_hidden_dim = self.c_m  # 256
+            z_hidden_dim = self.c_z  # 128
+        else:
+            # Full linear can use any hidden dimension
+            m_hidden_dim = self.args.hidden_dim
+            z_hidden_dim = self.args.hidden_dim
+        
+        print(f"  Using hidden dimensions: m_hidden={m_hidden_dim}, z_hidden={z_hidden_dim}")
+        
         # Create model
         model = ReplacementBlockTrainer(
             c_m=self.c_m,
             c_z=self.c_z,
             linear_type=linear_type,
-            hidden_dim=self.args.hidden_dim,
+            m_hidden_dim=m_hidden_dim,
+            z_hidden_dim=z_hidden_dim,
             learning_rate=self.args.learning_rate,
             weight_decay=self.args.weight_decay
         )
@@ -290,22 +346,38 @@ class ReplacementBlockTrainingPipeline:
         
         lr_monitor = LearningRateMonitor(logging_interval='epoch')
         
-        # Create logger
-        logger = TensorBoardLogger(
+        # Create loggers
+        loggers = []
+        
+        # TensorBoard logger
+        tb_logger = TensorBoardLogger(
             save_dir=str(self.output_dir / "logs"),
             name=f"block_{block_idx:02d}_{linear_type}"
         )
+        loggers.append(tb_logger)
         
-        # Create trainer
+        # Wandb logger (if enabled)
+        if self.args.wandb:
+            experiment_name = f"{self.args.experiment_name}_block_{block_idx:02d}_{linear_type}"
+            wandb_logger = WandbLogger(
+                project=self.args.wandb_project,
+                name=experiment_name,
+                save_dir=str(self.output_dir / "logs"),
+                entity=self.args.wandb_entity
+            )
+            loggers.append(wandb_logger)
+        
+        # Create trainer with memory-efficient settings
         trainer = pl.Trainer(
             max_epochs=self.args.max_epochs,
             callbacks=[checkpoint_callback, early_stopping, lr_monitor],
-            logger=logger,
+            logger=loggers,
             log_every_n_steps=10,
             val_check_interval=1.0,
             accelerator="auto",
             devices=1,
-            precision="32-true"  # Use full precision for stability
+            precision="16-mixed",  # Use mixed precision to save memory
+            gradient_clip_val=1.0,  # Gradient clipping for stability
         )
         
         # Train
@@ -335,28 +407,17 @@ class ReplacementBlockTrainingPipeline:
         
         return results
 
-    def train_all_blocks(self):
-        """Train replacement blocks for all blocks and linear types"""
+    def train_blocks(self):
+        """Train replacement blocks for specified blocks and linear types"""
         
-        print("=== Training Replacement Blocks for All Evoformer Blocks ===")
+        print("=== Training Single Block Replacements ===")
         print()
         
         all_results = []
         
-        # Determine which blocks to train
-        if self.args.test_blocks:
-            block_indices = self.args.test_blocks
-        else:
-            block_indices = list(range(48))
-        
-        print(f"Training blocks: {block_indices}")
-        print(f"Linear types: {self.linear_types}")
-        print(f"Total combinations: {len(block_indices) * len(self.linear_types)}")
-        print()
-        
         # Train each combination
-        for block_idx in block_indices:
-            for linear_type in self.linear_types:
+        for block_idx in self.args.blocks:
+            for linear_type in self.args.linear_types:
                 try:
                     results = self.train_single_block(block_idx, linear_type)
                     if results:
@@ -388,7 +449,7 @@ class ReplacementBlockTrainingPipeline:
             # Create analysis by linear type
             print("\n=== Training Summary ===")
             
-            for linear_type in self.linear_types:
+            for linear_type in self.args.linear_types:
                 type_results = df[df['linear_type'] == linear_type]
                 if len(type_results) > 0:
                     mean_loss = type_results['best_val_loss'].mean()
@@ -412,52 +473,54 @@ class ReplacementBlockTrainingPipeline:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train replacement blocks for all Evoformer blocks",
+        description="Train single block replacements for Evoformer blocks",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
-    parser.add_argument(
-        "--data_dir", type=str, required=True,
-        help="Directory containing collected block data (relative to home directory)"
-    )
-    parser.add_argument(
-        "--output_dir", type=str, required=True,
-        help="Output directory for trained models (relative to home directory)"
-    )
-    parser.add_argument(
-        "--hidden_dim", type=int, default=256,
-        help="Hidden dimension for replacement blocks"
-    )
-    parser.add_argument(
-        "--batch_size", type=int, default=4,
-        help="Batch size for training"
-    )
-    parser.add_argument(
-        "--max_epochs", type=int, default=50,
-        help="Maximum number of training epochs"
-    )
-    parser.add_argument(
-        "--learning_rate", type=float, default=1e-3,
-        help="Learning rate"
-    )
-    parser.add_argument(
-        "--weight_decay", type=float, default=1e-4,
-        help="Weight decay"
-    )
-    parser.add_argument(
-        "--num_workers", type=int, default=4,
-        help="Number of data loader workers"
-    )
-    parser.add_argument(
-        "--test_blocks", type=int, nargs="+", default=None,
-        help="Specific block indices to train (for testing, default: all 48 blocks)"
-    )
+    # Data and output
+    parser.add_argument("--data_dir", type=str, required=True,
+                       help="Directory containing collected block data (relative to home directory)")
+    parser.add_argument("--output_dir", type=str, required=True,
+                       help="Output directory for trained models (relative to home directory)")
+    
+    # Training configuration
+    parser.add_argument("--blocks", type=int, nargs="+", required=True,
+                       help="Block indices to train (e.g., 1 2 3)")
+    parser.add_argument("--linear_types", type=str, nargs="+", 
+                       default=["full", "diagonal", "affine"],
+                       choices=["full", "diagonal", "affine"],
+                       help="Linear layer types to test")
+    
+    # Training parameters
+    parser.add_argument("--hidden_dim", type=int, default=256,
+                       help="Hidden dimension for replacement blocks")
+    parser.add_argument("--batch_size", type=int, default=4,
+                       help="Batch size for training")
+    parser.add_argument("--max_epochs", type=int, default=50,
+                       help="Maximum number of training epochs")
+    parser.add_argument("--learning_rate", type=float, default=1e-3,
+                       help="Learning rate")
+    parser.add_argument("--weight_decay", type=float, default=1e-4,
+                       help="Weight decay")
+    parser.add_argument("--num_workers", type=int, default=4,
+                       help="Number of data loader workers")
+    
+    # Wandb logging arguments
+    parser.add_argument("--wandb", action="store_true", default=False,
+                       help="Enable Weights & Biases logging")
+    parser.add_argument("--wandb_project", type=str, default="af2distill",
+                       help="Wandb project name")
+    parser.add_argument("--wandb_entity", type=str, 
+                       default="kryst3154-massachusetts-institute-of-technology",
+                       help="Wandb entity (username or team)")
+    parser.add_argument("--experiment_name", type=str, default="single_block_replacement",
+                       help="Base experiment name for wandb logging")
     
     args = parser.parse_args()
     
     # Run training
-    pipeline = ReplacementBlockTrainingPipeline(args)
-    pipeline.train_all_blocks()
+    pipeline = SingleBlockTrainingPipeline(args)
+    pipeline.train_blocks()
 
 
 if __name__ == "__main__":
