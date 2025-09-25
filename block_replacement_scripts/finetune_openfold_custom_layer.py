@@ -254,10 +254,10 @@ def run_openfold_training(args):
     print(f"7. Replacement hidden dimension: {args.replacement_hidden_dim}")
     print(f"8. Learning rate: {args.learning_rate}")
     grad_accum_note = ""
-    if args.accumulate_grad_batches > 1:
-        effective_batch_size = args.gpus * args.accumulate_grad_batches
+    if args.grad_accum_steps > 1:
+        effective_batch_size = args.gpus * args.grad_accum_steps
         grad_accum_note = f" (effective batch size: {effective_batch_size})"
-    print(f"9. Gradient accumulation: {args.accumulate_grad_batches} batches{grad_accum_note}")
+    print(f"9. Gradient accumulation: {args.grad_accum_steps} batches{grad_accum_note}")
     print(f"10. Distributed backend: {args.distributed_backend}")
     
     # Print checkpoint configuration
@@ -317,7 +317,7 @@ def run_openfold_training(args):
         "--resume_model_weights_only", "True",
         
         # Training configuration  
-        "--config_preset", "finetuning",
+        "--config_preset", "finetuning_ptm",
         "--max_epochs", str(args.max_epochs),
         "--train_epoch_len", str(args.train_epoch_len),
         
@@ -358,7 +358,7 @@ def run_openfold_training(args):
         "--distributed_backend", args.distributed_backend,
         
         # Gradient accumulation
-        "--accumulate_grad_batches", str(args.accumulate_grad_batches),
+        "--grad_accum_steps", str(args.grad_accum_steps),
         
         # Logging
         "--log_lr",
@@ -392,7 +392,7 @@ def run_openfold_training(args):
     print("  ✓ Recursive search: Finding PDB files in subdirectories")
     print(f"  ✓ Distributed backend: {args.distributed_backend} (compatible with your setup)")
     print(f"  ✓ Learning rate: {args.learning_rate} (optimized for fine-tuning)")
-    print(f"  ✓ Gradient accumulation: {args.accumulate_grad_batches} batches")
+    print(f"  ✓ Gradient accumulation: {args.grad_accum_steps} batches")
     
     # Validation status
     if val_chains:
@@ -492,7 +492,7 @@ def main():
         help="Learning rate for fine-tuning (default: 1e-4, lower than default training)"
     )
     parser.add_argument(
-        "--accumulate_grad_batches", type=int, default=1,
+        "--grad_accum_steps", type=int, default=1,
         help="Accumulate gradients over k batches before optimizer step (default: 1, no accumulation)"
     )
     parser.add_argument(
@@ -591,8 +591,8 @@ def main():
         raise ValueError("validation_fraction must be between 0.0 and 1.0 (exclusive)")
     
     # Validate gradient accumulation
-    if args.accumulate_grad_batches < 1:
-        raise ValueError("accumulate_grad_batches must be at least 1")
+    if args.grad_accum_steps < 1:
+        raise ValueError("grad_accum_steps must be at least 1")
     
     # Run training
     run_openfold_training(args)

@@ -40,7 +40,7 @@ from openfold.utils.import_weights import (
     import_openfold_weights_
 )
 from openfold.utils.logger import PerformanceLoggingCallback
-from custom_evoformer_replacement import (
+from block_replacement_scripts.custom_evoformer_replacement import (
     replace_evoformer_block, 
     freeze_all_except_replaced_block
 )
@@ -396,10 +396,16 @@ def main(args):
             else:
                 sd = torch.load(args.resume_from_ckpt)
             # Process the state dict
-            # Use strict=False if we're doing block replacement (model structure changed)
-            strict_loading = not (hasattr(args, 'replace_block_index') and args.replace_block_index is not None)
+            # Use strict=False if we're doing block replacement or single sequence mode (model structure changed)
+            strict_loading = not (
+                (hasattr(args, 'replace_block_index') and args.replace_block_index is not None) or
+                (hasattr(args, 'enable_single_seq_mode') and args.enable_single_seq_mode)
+            )
             if not strict_loading:
-                print(f"Using strict=False for weight loading due to block replacement at index {args.replace_block_index}")
+                if hasattr(args, 'replace_block_index') and args.replace_block_index is not None:
+                    print(f"Using strict=False for weight loading due to block replacement at index {args.replace_block_index}")
+                elif hasattr(args, 'enable_single_seq_mode') and args.enable_single_seq_mode:
+                    print(f"Using strict=False for weight loading due to single sequence mode (templates disabled)")
             if 'module' in sd:
                 sd = {k[len('module.'):]: v for k, v in sd['module'].items()}
                 import_openfold_weights_(model=model_module, state_dict=sd, strict=strict_loading)
@@ -509,6 +515,16 @@ def main(args):
 
     loggers = []
     is_rank_zero = args.mpi_plugin and (int(os.environ.get("PMI_RANK")) == 0)
+    
+    # Add TensorBoard logger if log_lr is used but no wandb logger is configured
+    if args.log_lr and not args.wandb:
+        from pytorch_lightning.loggers import TensorBoardLogger
+        tb_logger = TensorBoardLogger(
+            save_dir=args.output_dir,
+            name="lightning_logs"
+        )
+        loggers.append(tb_logger)
+    
     if(args.wandb):
         if args.mpi_plugin and is_rank_zero:
             wandb_init_dict = dict(
@@ -860,7 +876,7 @@ if __name__ == "__main__":
         "--reload_dataloaders_every_n_epochs", type=int, default=1,
     )
     trainer_group.add_argument(
-        "--accumulate_grad_batches", type=int, default=1,
+        "--grad_accum_steps", type=int, default=1,
         help="Accumulate gradients over k batches before next optimizer step.")
 
     args = parser.parse_args()

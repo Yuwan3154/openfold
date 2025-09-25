@@ -100,7 +100,7 @@ def extract_chain_list_from_csv(csv_path, output_path, pdb_dir=None):
     return chain_list
 
 
-def create_minimal_alignment_structure(alignment_dir):
+def create_minimal_alignment_structure(alignment_dir, chain_list=None):
     """Create minimal alignment directory structure for single sequence mode"""
     os.makedirs(alignment_dir, exist_ok=True)
     
@@ -109,6 +109,16 @@ def create_minimal_alignment_structure(alignment_dir):
     if not os.path.exists(dummy_alignment_path):
         with open(dummy_alignment_path, 'w') as f:
             f.write(">dummy\nA\n")
+    
+    # Create alignment files for each chain (required by OpenFold data loader)
+    if chain_list:
+        for chain in chain_list:
+            # Extract PDB ID from chain (e.g., "1tg0_A" -> "1tg0")
+            pdb_id = chain.split('_')[0]
+            alignment_file = os.path.join(alignment_dir, f"{pdb_id}.a3m")
+            if not os.path.exists(alignment_file):
+                with open(alignment_file, 'w') as f:
+                    f.write(f">{chain}\nA\n")  # Single sequence alignment
     
     print(f"Created minimal alignment structure at: {alignment_dir}")
 
@@ -311,7 +321,7 @@ def run_adaptive_training(args):
     # Create minimal alignment structure
     print("3. Setting up minimal alignment structure...")
     alignment_dir = output_dir / "alignments"
-    create_minimal_alignment_structure(alignment_dir)
+    create_minimal_alignment_structure(alignment_dir, all_chains)
     print()
     
     # Verify checkpoint exists
@@ -338,24 +348,94 @@ def run_adaptive_training(args):
 # Auto-generated wrapper script for adaptive training
 import sys
 from pathlib import Path
+import argparse
 
 # Add openfold to path
 sys.path.insert(0, str(Path.home() / "openfold"))
 
 # Import and replace the OpenFoldWrapper with our custom version
-from custom_openfold_wrapper import CustomOpenFoldWrapper
+from block_replacement_scripts.custom_openfold_wrapper import AdaptiveOpenFoldWrapper
 import train_openfold
-train_openfold.OpenFoldWrapper = CustomOpenFoldWrapper
+train_openfold.OpenFoldWrapper = AdaptiveOpenFoldWrapper
 
-# Add adaptive config to args
-class Args:
-    pass
+# Create parser manually (since train_openfold.parser is not accessible)
+def create_parser():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("train_data_dir", type=str, help="Directory containing training mmCIF files")
+    parser.add_argument("train_alignment_dir", type=str, help="Directory containing precomputed training alignments")
+    parser.add_argument("template_mmcif_dir", type=str, help="Directory containing mmCIF files to search for templates")
+    parser.add_argument("output_dir", type=str, help="Directory in which to output checkpoints, logs, etc.")
+    parser.add_argument("max_template_date", type=str, help="Cutoff for all templates")
+    
+    # Add all the arguments that train_openfold.py expects
+    parser.add_argument("--train_mmcif_data_cache_path", type=str, default=None)
+    parser.add_argument("--use_single_seq_mode", type=str, default=False)
+    parser.add_argument("--distillation_data_dir", type=str, default=None)
+    parser.add_argument("--distillation_alignment_dir", type=str, default=None)
+    parser.add_argument("--val_data_dir", type=str, default=None)
+    parser.add_argument("--val_alignment_dir", type=str, default=None)
+    parser.add_argument("--val_mmcif_data_cache_path", type=str, default=None)
+    parser.add_argument("--kalign_binary_path", type=str, default='/usr/bin/kalign')
+    parser.add_argument("--train_filter_path", type=str, default=None)
+    parser.add_argument("--distillation_filter_path", type=str, default=None)
+    parser.add_argument("--obsolete_pdbs_file_path", type=str, default=None)
+    parser.add_argument("--template_release_dates_cache_path", type=str, default=None)
+    parser.add_argument("--use_small_bfd", type=str, default=False)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--deepspeed_config_path", type=str, default=None)
+    parser.add_argument("--checkpoint_every_epoch", action="store_true", default=False)
+    parser.add_argument("--checkpoint_every_n_steps", type=int, default=None)
+    parser.add_argument("--checkpoint_every_n_epochs", type=int, default=None)
+    parser.add_argument("--checkpoint_save_top_k", type=int, default=None)
+    parser.add_argument("--checkpoint_monitor", type=str, default=None)
+    parser.add_argument("--early_stopping", type=str, default=False)
+    parser.add_argument("--min_delta", type=float, default=0)
+    parser.add_argument("--patience", type=int, default=3)
+    parser.add_argument("--resume_from_ckpt", type=str, default=None)
+    parser.add_argument("--resume_model_weights_only", type=str, default=False)
+    parser.add_argument("--resume_from_jax_params", type=str, default=None)
+    parser.add_argument("--log_performance", type=str, default=False)
+    parser.add_argument("--wandb", action="store_true", default=False)
+    parser.add_argument("--experiment_name", type=str, default=None)
+    parser.add_argument("--wandb_id", type=str, default=None)
+    parser.add_argument("--wandb_project", type=str, default=None)
+    parser.add_argument("--wandb_entity", type=str, default=None)
+    parser.add_argument("--script_modules", type=str, default=False)
+    parser.add_argument("--train_chain_data_cache_path", type=str, default=None)
+    parser.add_argument("--distillation_chain_data_cache_path", type=str, default=None)
+    parser.add_argument("--train_epoch_len", type=int, default=10000)
+    parser.add_argument("--log_lr", action="store_true", default=False)
+    parser.add_argument("--config_preset", type=str, default="initial_training")
+    parser.add_argument("--_distillation_structure_index_path", type=str, default=None)
+    parser.add_argument("--alignment_index_path", type=str, default=None)
+    parser.add_argument("--distillation_alignment_index_path", type=str, default=None)
+    parser.add_argument("--experiment_config_json", default="", help="Path to a json file with custom config values")
+    parser.add_argument("--gpus", type=int, default=1)
+    parser.add_argument("--mpi_plugin", action="store_true", default=False)
+    parser.add_argument("--distributed_backend", type=str, default="gloo", choices=["nccl", "gloo", "mpi"])
+    parser.add_argument("--replace_block_index", type=int, default=None)
+    parser.add_argument("--replacement_hidden_dim", type=int, default=None)
+    parser.add_argument("--enable_single_seq_mode", action="store_true", default=False)
+    parser.add_argument("--learning_rate", type=float, default=1e-3)
+    parser.add_argument("--train_chain_list_path", type=str, default=None)
+    parser.add_argument("--distillation_chain_list_path", type=str, default=None)
+    parser.add_argument("--val_chain_list_path", type=str, default=None)
+    parser.add_argument("--enable_recursive_search", action="store_true", default=True)
+    parser.add_argument("--num_nodes", type=int, default=1)
+    parser.add_argument("--precision", type=str, default='bf16')
+    parser.add_argument("--max_epochs", type=int, default=1)
+    parser.add_argument("--log_every_n_steps", type=int, default=25)
+    parser.add_argument("--flush_logs_every_n_steps", type=int, default=5)
+    parser.add_argument("--num_sanity_val_steps", type=int, default=0)
+    parser.add_argument("--reload_dataloaders_every_n_epochs", type=int, default=1)
+    parser.add_argument("--grad_accum_steps", type=int, default=1)
+    return parser
 
 # Run the original training script
 if __name__ == "__main__":
     # Get original args
-    import argparse
-    args = train_openfold.parser.parse_args()
+    parser = create_parser()
+    args = parser.parse_args()
     
     # Add our adaptive config
     args.adaptive_config_path = "{adaptive_cmd_file}"
@@ -393,7 +473,7 @@ if __name__ == "__main__":
         "--resume_model_weights_only", "True",
         
         # Training configuration  
-        "--config_preset", "finetuning",
+        "--config_preset", "finetuning_ptm",
         "--max_epochs", str(config['max_epochs']),
         "--train_epoch_len", str(config.get('train_epoch_len', 1000)),
         "--learning_rate", str(config['learning_rate']),
@@ -405,7 +485,7 @@ if __name__ == "__main__":
         "--distributed_backend", args.distributed_backend,
         
         # Gradient accumulation
-        "--accumulate_grad_batches", str(args.accumulate_grad_batches),
+        "--grad_accum_steps", str(config.get('grad_accum_steps', 1)),
         
         # Logging
         "--log_lr",
@@ -446,9 +526,10 @@ if __name__ == "__main__":
     print(f"  ✓ Weight prediction: sigmoid(linear(mean_pool(m[..., 0, :, :]))) ")
     print(f"  ✓ {len(available_blocks)} replacement blocks loaded from {trained_models_dir}")
     print(f"  ✓ Replace loss scaler: {config['replace_loss_scaler']} (penalizes mean weights)")
-    print("  ✓ Only new parameters trainable: weight predictors")
+    print("  ✓ Trainable parameters: weight predictors + replacement blocks")
     print("  ✓ Single sequence mode: No MSAs or templates required")
-    print(f"  ✓ Learning rate: {config['learning_rate']} (for adaptive weights)")
+    print(f"  ✓ Learning rate: {config['learning_rate']} (for adaptive components)")
+    print(f"  ✓ Gradient accumulation: {config.get('grad_accum_steps', 1)} steps")
     
     if val_chains:
         print(f"  ✓ Validation split: {len(val_chains)}/{len(all_chains)} chains")
@@ -463,16 +544,9 @@ if __name__ == "__main__":
     print("=" * 60)
     
     # Execute the training command
-    try:
-        result = subprocess.run(cmd, check=True)
-        print("Adaptive training completed successfully!")
-        return result
-    except subprocess.CalledProcessError as e:
-        print(f"Training failed with error code {e.returncode}")
-        sys.exit(e.returncode)
-    except KeyboardInterrupt:
-        print("Training interrupted by user")
-        sys.exit(1)
+    result = subprocess.run(cmd, check=True, env=env)
+    print("Adaptive training completed successfully!")
+    return result
 
 
 def create_default_config():
@@ -483,26 +557,27 @@ def create_default_config():
         'pdb_dir': 'data/af2rank_single/pdb',
         'weights_path': 'openfold/openfold/resources/openfold_params/finetuning_ptm_2.pt',
         'trained_models_dir': 'AFdistill/pretrain_full',
-        'output_dir': 'adaptive_training_output',
+        'output_dir': 'AFdistill/adaptive_block_1-46',
         
         # Model configuration
         'linear_type': 'full',  # Should match pre-trained blocks
-        'replace_loss_scaler': 0.1,  # Weight for penalizing mean adaptive weights
+        'replace_loss_scaler': 1.0,  # Weight for penalizing mean adaptive weights
         
         # Training parameters
         'batch_size': 1,
-        'max_epochs': 10,
-        'train_epoch_len': 1000,
-        'learning_rate': 1e-4,
-        'weight_decay': 1e-4,
+        'max_epochs': 1000,
+        'train_epoch_len': 32,
+        'learning_rate': 0.001,
+        'weight_decay': 0.0001,
         'validation_fraction': 0.1,
         'num_workers': 2,
+        'grad_accum_steps': 2,  # Gradient accumulation steps
         
         # Wandb logging
-        'wandb': False,
+        'wandb': True,
         'wandb_project': 'af2distill',
         'wandb_entity': 'kryst3154-massachusetts-institute-of-technology',
-        'experiment_name': 'adaptive_weighting',
+        'experiment_name': 'adaptive_block_1-46',
     }
 
 
@@ -549,8 +624,8 @@ def main():
                        help="Learning rate for adaptive weight training")
     parser.add_argument("--validation_fraction", type=float, default=0.1,
                        help="Fraction of data to use for validation")
-    parser.add_argument("--accumulate_grad_batches", type=int, default=1,
-                       help="Accumulate gradients over k batches")
+    parser.add_argument("--grad_accum_steps", type=int, default=2,
+                       help="Accumulate gradients over k batches (gradient accumulation steps)")
     parser.add_argument("--max_template_date", type=str, default="2025-01-01",
                        help="Cutoff date for templates (YYYY-MM-DD)")
     

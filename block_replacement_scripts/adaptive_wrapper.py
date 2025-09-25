@@ -12,11 +12,8 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple
 import json
 
-# Add block_replacement_scripts to path
-import sys
-sys.path.append(str(Path(__file__).parent / "block_replacement_scripts"))
-
-from adaptive_evoformer_blocks import (
+# Import adaptive evoformer blocks
+from .adaptive_evoformer_blocks import (
     replace_evoformer_blocks_with_adaptive,
     AdaptiveWeightPredictor
 )
@@ -116,9 +113,9 @@ def compute_adaptive_replace_loss(
     return replace_loss * replace_loss_scaler
 
 
-def freeze_model_except_adaptive_weights(model: nn.Module) -> int:
+def freeze_model_except_adaptive_components(model: nn.Module) -> int:
     """
-    Freeze all model parameters except adaptive weight predictors.
+    Freeze all model parameters except adaptive weight predictors and replacement blocks.
     
     Args:
         model: The model to freeze
@@ -130,16 +127,22 @@ def freeze_model_except_adaptive_weights(model: nn.Module) -> int:
     for param in model.parameters():
         param.requires_grad = False
     
-    # Then unfreeze weight predictors
+    # Then unfreeze adaptive components (weight predictors and replacement blocks)
     trainable_params = 0
     for name, module in model.named_modules():
         if isinstance(module, AdaptiveWeightPredictor):
+            # Unfreeze weight predictors
             for param in module.parameters():
+                param.requires_grad = True
+                trainable_params += param.numel()
+        elif hasattr(module, 'replacement_block'):
+            # Unfreeze replacement blocks (already handled in AdaptiveEvoformerBlock.__init__)
+            for param in module.replacement_block.parameters():
                 param.requires_grad = True
                 trainable_params += param.numel()
     
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"Frozen all parameters except adaptive weights")
+    print(f"Frozen all parameters except adaptive components (weight predictors + replacement blocks)")
     print(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({trainable_params/total_params*100:.2f}%)")
     
     return trainable_params

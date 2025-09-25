@@ -18,7 +18,7 @@ import sys
 sys.path.append(str(Path(__file__).parent.parent))
 
 from openfold.model.primitives import Linear
-from custom_evoformer_replacement import SimpleEvoformerReplacement
+from .custom_evoformer_replacement import SimpleEvoformerReplacement
 
 
 class AdaptiveWeightPredictor(nn.Module):
@@ -78,9 +78,9 @@ class AdaptiveEvoformerBlock(nn.Module):
         for param in self.original_block.parameters():
             param.requires_grad = False
             
-        # Freeze replacement block parameters (already trained)
+        # Keep replacement block parameters trainable (we want to fine-tune them)
         for param in self.replacement_block.parameters():
-            param.requires_grad = False
+            param.requires_grad = True
     
     def forward(
         self,

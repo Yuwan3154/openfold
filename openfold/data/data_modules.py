@@ -24,7 +24,7 @@ from openfold.utils.tensor_utils import (
 
 # Import enhanced data utilities for recursive search and chain lists
 try:
-    from enhanced_data_utils import (
+    from block_replacement_scripts.enhanced_data_utils import (
         EnhancedStructureFinder,
         build_chain_ids_from_structures_and_list
     )

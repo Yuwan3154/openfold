@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-Custom OpenFoldWrapper that supports both block replacement and adaptive training.
+Custom OpenFoldWrapper that supports adaptive weighting training.
 
 This extends the standard OpenFoldWrapper to support:
-1. Simple block replacement (from Part 1)
-2. Adaptive weighting training (Part 2)
+1. Loading pre-trained replacement blocks
+2. Creating adaptive weight predictors
+3. Training both weight predictors and replacement blocks
+4. Adding replace loss that penalizes mean adaptive weights
 """
 
 import os
@@ -15,42 +17,33 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 
 # Import base OpenFoldWrapper
-sys.path.append(str(Path(__file__).parent))
+sys.path.append(str(Path(__file__).parent.parent))
 from train_openfold import OpenFoldWrapper
 from openfold.utils.loss import AlphaFoldLoss
 from openfold.model.model import AlphaFold
 from openfold.utils.exponential_moving_average import ExponentialMovingAverage
 
 # Import adaptive training utilities
-from adaptive_wrapper import (
+from .adaptive_wrapper import (
     setup_adaptive_training_model,
     compute_adaptive_replace_loss,
-    freeze_model_except_adaptive_weights
-)
-
-# Import block replacement utilities
-from custom_evoformer_replacement import (
-    replace_evoformer_block,
-    freeze_all_except_replaced_block
+    freeze_model_except_adaptive_components
 )
 
 
-class CustomOpenFoldWrapper(OpenFoldWrapper):
-    """Extended OpenFoldWrapper with block replacement and adaptive training support"""
+class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
+    """Extended OpenFoldWrapper with adaptive weighting training support"""
     
     def __init__(self, config, 
-                 replace_block_index=None,
-                 replacement_hidden_dim=None,
                  adaptive_config_path=None,
-                 learning_rate=1e-3):
+                 learning_rate=1e-3,
+                 **kwargs):
         """
-        Initialize wrapper with optional block replacement or adaptive training.
+        Initialize wrapper with adaptive training support.
         
         Args:
             config: Model configuration
-            replace_block_index: Index of block to replace (for simple replacement)
-            replacement_hidden_dim: Hidden dimension for replacement block
-            adaptive_config_path: Path to adaptive training config (for adaptive training)
+            adaptive_config_path: Path to adaptive training config
             learning_rate: Learning rate for training
         """
         # Don't call super().__init__ yet - we need to handle model creation differently
@@ -59,8 +52,6 @@ class CustomOpenFoldWrapper(OpenFoldWrapper):
         self.config = config
         self.model = AlphaFold(config)
         self.is_multimer = self.config.globals.is_multimer
-        self.replace_block_index = replace_block_index
-        self.replacement_hidden_dim = replacement_hidden_dim
         self.adaptive_config_path = adaptive_config_path
         self.learning_rate = learning_rate
         
@@ -69,13 +60,9 @@ class CustomOpenFoldWrapper(OpenFoldWrapper):
         self.replace_loss_scaler = 0.0
         self.is_adaptive_training = False
         
-        # Apply modifications based on mode
+        # Apply adaptive training if config provided
         if adaptive_config_path and Path(adaptive_config_path).exists():
-            # Adaptive training mode
             self._setup_adaptive_training()
-        elif replace_block_index is not None:
-            # Simple block replacement mode
-            self._apply_block_replacement()
         
         # Initialize loss and EMA
         self.loss = AlphaFoldLoss(config.loss)
@@ -107,8 +94,8 @@ class CustomOpenFoldWrapper(OpenFoldWrapper):
         self.replace_loss_scaler = training_info['replace_loss_scaler']
         self.is_adaptive_training = True
         
-        # Freeze all parameters except adaptive weights
-        freeze_model_except_adaptive_weights(self.model)
+        # Freeze all parameters except adaptive components
+        freeze_model_except_adaptive_components(self.model)
     
     def _compute_adaptive_metrics(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
         """Compute adaptive training metrics for logging"""
@@ -212,26 +199,20 @@ class CustomOpenFoldWrapper(OpenFoldWrapper):
     def configure_optimizers(self, learning_rate: float = None, eps: float = 1e-5):
         """Configure optimizer with special handling for adaptive training"""
         
-        # For adaptive training, only optimize weight predictors
-        if self.is_adaptive_training:
-            # Collect only weight predictor parameters
-            params_to_optimize = []
-            for module in self.model.modules():
-                if hasattr(module, 'weight_predictor') or 'AdaptiveWeightPredictor' in str(type(module)):
-                    params_to_optimize.extend(module.parameters())
-            
-            if not params_to_optimize:
-                # Fallback to all trainable parameters
-                params_to_optimize = [p for p in self.model.parameters() if p.requires_grad]
-            
-            print(f"Optimizing {len(params_to_optimize)} parameter groups for adaptive training")
-        else:
-            # Standard optimization
-            params_to_optimize = self.model.parameters()
-        
         # Use learning rate from args if provided
         if learning_rate is None:
             learning_rate = getattr(self, 'learning_rate', 1e-3)
+        
+        # For adaptive training, optimize both weight predictors and replacement blocks
+        if self.is_adaptive_training:
+            # Collect trainable parameters
+            params_to_optimize = [p for p in self.model.parameters() if p.requires_grad]
+            
+            print(f"Optimizing {len(params_to_optimize)} parameter groups for adaptive training")
+            print(f"Learning rate: {learning_rate}")
+        else:
+            # Standard optimization
+            params_to_optimize = self.model.parameters()
         
         optimizer = torch.optim.Adam(
             params_to_optimize,
