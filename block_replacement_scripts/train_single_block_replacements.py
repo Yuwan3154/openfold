@@ -30,6 +30,7 @@ from torch.utils.data import Dataset, DataLoader
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
 from pytorch_lightning.loggers import TensorBoardLogger, WandbLogger
+from typing import List, Any, Dict
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -37,6 +38,100 @@ warnings.filterwarnings('ignore')
 sys.path.append(str(Path.home() / 'openfold'))
 
 from custom_evoformer_replacement import SimpleEvoformerReplacement
+
+
+class PaddingCollator:
+    """
+    Custom collator for handling variable-length protein sequences by padding.
+    Based on dense_padding_data_loader.py from ProteinFoundation.
+    """
+    
+    def __init__(self, float_padding_value: float = 1e-8, non_float_padding_value: int = -1):
+        self.float_padding_value = float_padding_value
+        self.non_float_padding_value = non_float_padding_value
+    
+    def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Collate a batch of samples with padding for variable-length sequences.
+        
+        Args:
+            batch: List of dictionaries with keys: m_in, z_in, m_out, z_out, chain_id
+        
+        Returns:
+            Dictionary with padded tensors and masks
+        """
+        if len(batch) == 1:
+            # No padding needed for single sample
+            return {
+                'm_in': batch[0]['m_in'].unsqueeze(0),
+                'z_in': batch[0]['z_in'].unsqueeze(0),
+                'm_out': batch[0]['m_out'].unsqueeze(0),
+                'z_out': batch[0]['z_out'].unsqueeze(0),
+                'chain_ids': [batch[0]['chain_id']]
+            }
+        
+        # Find maximum sequence length in batch
+        max_n_res = max(sample['m_in'].shape[1] for sample in batch)
+        batch_size = len(batch)
+        
+        # Get dimensions from first sample
+        seq_len = batch[0]['m_in'].shape[0]  # MSA sequence length (usually 516)
+        c_m = batch[0]['m_in'].shape[2]      # MSA channel dimension (usually 256)
+        c_z = batch[0]['z_in'].shape[2]      # Pair channel dimension (usually 128)
+        
+        # Initialize padded tensors
+        m_in_padded = torch.full(
+            (batch_size, seq_len, max_n_res, c_m), 
+            self.float_padding_value, 
+            dtype=batch[0]['m_in'].dtype
+        )
+        z_in_padded = torch.full(
+            (batch_size, max_n_res, max_n_res, c_z), 
+            self.float_padding_value, 
+            dtype=batch[0]['z_in'].dtype
+        )
+        m_out_padded = torch.full(
+            (batch_size, seq_len, max_n_res, c_m), 
+            self.float_padding_value, 
+            dtype=batch[0]['m_out'].dtype
+        )
+        z_out_padded = torch.full(
+            (batch_size, max_n_res, max_n_res, c_z), 
+            self.float_padding_value, 
+            dtype=batch[0]['z_out'].dtype
+        )
+        
+        # Create masks for valid positions
+        m_mask = torch.zeros((batch_size, seq_len, max_n_res, c_m), dtype=torch.bool)
+        z_mask = torch.zeros((batch_size, max_n_res, max_n_res, c_z), dtype=torch.bool)
+        
+        chain_ids = []
+        
+        # Fill in actual data
+        for i, sample in enumerate(batch):
+            n_res = sample['m_in'].shape[1]
+            
+            # Copy data
+            m_in_padded[i, :, :n_res, :] = sample['m_in']
+            z_in_padded[i, :n_res, :n_res, :] = sample['z_in']
+            m_out_padded[i, :, :n_res, :] = sample['m_out']
+            z_out_padded[i, :n_res, :n_res, :] = sample['z_out']
+            
+            # Set masks for valid positions
+            m_mask[i, :, :n_res, :] = True
+            z_mask[i, :n_res, :n_res, :] = True
+            
+            chain_ids.append(sample['chain_id'])
+        
+        return {
+            'm_in': m_in_padded,
+            'z_in': z_in_padded,
+            'm_out': m_out_padded,
+            'z_out': z_out_padded,
+            'm_mask': m_mask,
+            'z_mask': z_mask,
+            'chain_ids': chain_ids
+        }
 
 
 class BlockDataset(Dataset):
@@ -54,9 +149,9 @@ class BlockDataset(Dataset):
         data = torch.load(file_path, map_location='cpu')
         
         # Extract input and output tensors
-        m_in = data["input"]["m"]  # MSA representation
+        m_in = data["input"]["m"]  # MSA representation (now single sequence)
         z_in = data["input"]["z"]  # Pair representation
-        m_out = data["output"]["m"]  # Target MSA output
+        m_out = data["output"]["m"]  # Target MSA output (now single sequence)
         z_out = data["output"]["z"]  # Target pair output
         
         return {
@@ -119,14 +214,32 @@ class ReplacementBlockTrainer(pl.LightningModule):
         
         return m_pred, z_pred
     
-    def _compute_loss(self, m_pred, z_pred, m_target, z_target):
-        """Compute MSE loss between predictions and targets"""
+    def _compute_loss(self, m_pred, z_pred, m_target, z_target, m_mask=None, z_mask=None):
+        """Compute MSE loss between predictions and targets with optional masking"""
         
-        # MSA loss
-        m_loss = self.mse_loss(m_pred, m_target)
+        if m_mask is not None:
+            # Apply mask to MSA tensors (only compute loss on valid positions)
+            m_pred_masked = m_pred * m_mask
+            m_target_masked = m_target * m_mask
+            
+            # Compute MSE loss only on valid (non-padded) positions
+            m_loss_raw = (m_pred_masked - m_target_masked) ** 2
+            m_loss = m_loss_raw.sum() / m_mask.sum()  # Average over valid positions
+        else:
+            # Standard MSE loss (for backward compatibility)
+            m_loss = self.mse_loss(m_pred, m_target)
         
-        # Pair loss
-        z_loss = self.mse_loss(z_pred, z_target)
+        if z_mask is not None:
+            # Apply mask to pair tensors (only compute loss on valid positions)
+            z_pred_masked = z_pred * z_mask
+            z_target_masked = z_target * z_mask
+            
+            # Compute MSE loss only on valid (non-padded) positions
+            z_loss_raw = (z_pred_masked - z_target_masked) ** 2
+            z_loss = z_loss_raw.sum() / z_mask.sum()  # Average over valid positions
+        else:
+            # Standard MSE loss (for backward compatibility)
+            z_loss = self.mse_loss(z_pred, z_target)
         
         # Combined loss
         total_loss = m_loss + z_loss
@@ -139,11 +252,17 @@ class ReplacementBlockTrainer(pl.LightningModule):
         m_target = batch["m_out"]
         z_target = batch["z_out"]
         
+        # Get masks for padded positions (if available)
+        m_mask = batch.get("m_mask", None)
+        z_mask = batch.get("z_mask", None)
+        
         # Forward pass
         m_pred, z_pred = self.forward(m_in, z_in, batch_size=m_in.shape[0])
         
-        # Compute loss
-        total_loss, m_loss, z_loss = self._compute_loss(m_pred, z_pred, m_target, z_target)
+        # Compute loss with masking
+        total_loss, m_loss, z_loss = self._compute_loss(
+            m_pred, z_pred, m_target, z_target, m_mask, z_mask
+        )
         
         # Log metrics
         self.log('train/total_loss', total_loss, prog_bar=True)
@@ -158,11 +277,17 @@ class ReplacementBlockTrainer(pl.LightningModule):
         m_target = batch["m_out"]
         z_target = batch["z_out"]
         
+        # Get masks for padded positions (if available)
+        m_mask = batch.get("m_mask", None)
+        z_mask = batch.get("z_mask", None)
+        
         # Forward pass
         m_pred, z_pred = self.forward(m_in, z_in, batch_size=m_in.shape[0])
         
-        # Compute loss
-        total_loss, m_loss, z_loss = self._compute_loss(m_pred, z_pred, m_target, z_target)
+        # Compute loss with masking
+        total_loss, m_loss, z_loss = self._compute_loss(
+            m_pred, z_pred, m_target, z_target, m_mask, z_mask
+        )
         
         # Log metrics
         self.log('val/total_loss', total_loss, prog_bar=True)
@@ -201,7 +326,11 @@ class SingleBlockTrainingPipeline:
     def __init__(self, args):
         self.args = args
         self.home_dir = Path.home()
-        self.data_dir = self.home_dir / args.data_dir / "block_data"
+        # Check if data_dir already contains block_data subdirectory
+        if (self.home_dir / args.data_dir / "block_data").exists():
+            self.data_dir = self.home_dir / args.data_dir / "block_data"
+        else:
+            self.data_dir = self.home_dir / args.data_dir
         self.output_dir = self.home_dir / args.output_dir
         
         # Create output directory
@@ -237,12 +366,16 @@ class SingleBlockTrainingPipeline:
         if len(train_dataset) == 0 or len(val_dataset) == 0:
             return None, None
         
+        # Create padding collator for variable-length sequences
+        collator = PaddingCollator()
+        
         train_loader = DataLoader(
             train_dataset,
             batch_size=self.args.batch_size,
             shuffle=True,
             num_workers=self.args.num_workers,
-            pin_memory=True
+            pin_memory=True,
+            collate_fn=collator
         )
         
         val_loader = DataLoader(
@@ -250,7 +383,8 @@ class SingleBlockTrainingPipeline:
             batch_size=self.args.batch_size,
             shuffle=False,
             num_workers=self.args.num_workers,
-            pin_memory=True
+            pin_memory=True,
+            collate_fn=collator
         )
         
         return train_loader, val_loader
@@ -302,7 +436,7 @@ class SingleBlockTrainingPipeline:
         print(f"  Val samples: {len(val_loader.dataset)}")
         
         # Set hidden dimensions based on linear type
-        if linear_type in ["diagonal", "affine"]:
+        if linear_type in ["diagonal", "affine"] or self.args.hidden_dim is None:
             # These require hidden_dim == input_dim
             m_hidden_dim = self.c_m  # 256
             z_hidden_dim = self.c_z  # 128
@@ -324,6 +458,9 @@ class SingleBlockTrainingPipeline:
             weight_decay=self.args.weight_decay
         )
         
+        if self.args.compile:
+            model.replacement_block = torch.compile(model.replacement_block)
+        
         # Create callbacks
         checkpoint_dir = self.output_dir / f"block_{block_idx:02d}" / linear_type
         os.makedirs(checkpoint_dir, exist_ok=True)
@@ -334,7 +471,9 @@ class SingleBlockTrainingPipeline:
             monitor="val/total_loss",
             mode="min",
             save_top_k=1,
-            save_last=True
+            save_last=False,  # Don't save last checkpoint during training
+            every_n_epochs=1,  # Only save best model, not every epoch
+            verbose=True
         )
         
         early_stopping = EarlyStopping(
@@ -367,7 +506,7 @@ class SingleBlockTrainingPipeline:
             )
             loggers.append(wandb_logger)
         
-        # Create trainer with memory-efficient settings
+        # Create trainer with optimized settings
         trainer = pl.Trainer(
             max_epochs=self.args.max_epochs,
             callbacks=[checkpoint_callback, early_stopping, lr_monitor],
@@ -444,7 +583,24 @@ class SingleBlockTrainingPipeline:
         # Create summary DataFrame
         if all_results:
             df = pd.DataFrame(all_results)
-            df.to_csv(self.output_dir / "training_summary.csv", index=False)
+            
+            # Check if CSV already exists and append if needed
+            csv_path = self.output_dir / "training_summary.csv"
+            if csv_path.exists():
+                # Load existing data
+                existing_df = pd.read_csv(csv_path)
+                # Remove duplicate entries (same block_idx and linear_type)
+                mask = ~((existing_df['block_idx'].isin(df['block_idx'])) & 
+                        (existing_df['linear_type'].isin(df['linear_type'])))
+                existing_df = existing_df[mask]
+                # Combine and save
+                combined_df = pd.concat([existing_df, df], ignore_index=True)
+                combined_df.to_csv(csv_path, index=False)
+                print(f"📝 Appended results to existing CSV. Total entries: {len(combined_df)}")
+            else:
+                # Create new file
+                df.to_csv(csv_path, index=False)
+                print(f"📝 Created new CSV with {len(df)} entries")
             
             # Create analysis by linear type
             print("\n=== Training Summary ===")
@@ -492,10 +648,10 @@ def main():
                        help="Linear layer types to test")
     
     # Training parameters
-    parser.add_argument("--hidden_dim", type=int, default=256,
+    parser.add_argument("--hidden_dim", type=int, default=None,
                        help="Hidden dimension for replacement blocks")
-    parser.add_argument("--batch_size", type=int, default=4,
-                       help="Batch size for training")
+    parser.add_argument("--batch_size", type=int, default=8,
+                       help="Batch size for training (increased from 4 due to padding support)")
     parser.add_argument("--max_epochs", type=int, default=50,
                        help="Maximum number of training epochs")
     parser.add_argument("--learning_rate", type=float, default=1e-3,
@@ -504,6 +660,11 @@ def main():
                        help="Weight decay")
     parser.add_argument("--num_workers", type=int, default=4,
                        help="Number of data loader workers")
+    parser.add_argument("--distributed_backend", type=str, default="gloo",
+                       choices=["nccl", "gloo", "mpi"],
+                       help="Distributed training backend (use 'gloo' for nodes without NCCL support)")
+    parser.add_argument("--compile", action="store_true", default=False,
+                       help="Compile the model using torch.compile")
     
     # Wandb logging arguments
     parser.add_argument("--wandb", action="store_true", default=False,

@@ -9,7 +9,7 @@ from typing import Tuple, Optional, Sequence
 
 class SimpleEvoformerReplacement(nn.Module):
     """
-    Simple replacement for EvoformerBlock with LayerNorm -> Linear -> ReLU -> Linear architecture
+    Simple replacement for EvoformerBlock with LayerNorm -> Linear -> GELU -> Linear architecture
     Maintains the same input/output signature as the original EvoformerBlock
     """
     
@@ -37,34 +37,34 @@ class SimpleEvoformerReplacement(nn.Module):
         if z_hidden_dim is None:
             z_hidden_dim = c_z
 
-        if linear_type == "full":
-            self.linear_class = nn.Linear
-        elif linear_type == "diagonal":
-            assert m_hidden_dim == c_m and z_hidden_dim == c_z, "Diagonal linear requires input_dim and hidden_dim to be the same"
-            self.linear_class = DiagonalLinear
-        elif linear_type == "affine":
-            assert m_hidden_dim == c_m and z_hidden_dim == c_z, "Affine linear requires input_dim and hidden_dim to be the same"
-            self.linear_class = AffineLinear
-        else:
-            raise ValueError(f"Invalid linear type: {linear_type}")
-
         if gating:
             # Gating layers will always be full linear layers
             self.m_gating_linear = nn.Linear(c_m, c_m)
             self.z_gating_linear = nn.Linear(c_z, c_z)
 
-        # MSA representation processing layers
         self.msa_layer_norm = nn.LayerNorm(c_m)
-        self.msa_linear1 = self.linear_class(c_m, m_hidden_dim)
-        self.msa_relu = nn.ReLU()
-        self.msa_linear2 = self.linear_class(m_hidden_dim, c_m)
-        
-        # Pair representation processing layers
         self.pair_layer_norm = nn.LayerNorm(c_z)
-        self.pair_linear1 = self.linear_class(c_z, z_hidden_dim)
-        self.pair_relu = nn.ReLU()
-        self.pair_linear2 = self.linear_class(z_hidden_dim, c_z)
 
+        if linear_type == "full":
+            self.msa_linear1 = nn.Linear(c_m, m_hidden_dim)
+            self.msa_linear2 = nn.Linear(m_hidden_dim, c_m)
+            self.pair_linear1 = nn.Linear(c_z, z_hidden_dim)
+            self.pair_linear2 = nn.Linear(z_hidden_dim, c_z)
+        elif linear_type == "diagonal":
+            assert m_hidden_dim == c_m and z_hidden_dim == c_z, "Diagonal linear requires input_dim and hidden_dim to be the same"
+            self.msa_linear1 = DiagonalLinear(c_m)
+            self.msa_linear2 = DiagonalLinear(c_m)
+            self.pair_linear1 = DiagonalLinear(c_z)
+            self.pair_linear2 = DiagonalLinear(c_z)
+        elif linear_type == "affine":
+            assert m_hidden_dim == c_m and z_hidden_dim == c_z, "Affine linear requires input_dim and hidden_dim to be the same"
+            self.msa_linear1 = AffineLinear(c_m)
+            self.msa_linear2 = AffineLinear(c_m)
+            self.pair_linear1 = AffineLinear(c_z)
+            self.pair_linear2 = AffineLinear(c_z)
+        else:
+            raise ValueError(f"Invalid linear type: {linear_type}")
+        
         # Initialize weights
         self._init_weights()
     
@@ -108,7 +108,7 @@ class SimpleEvoformerReplacement(nn.Module):
         if m is not None:
             # Apply residual connection: m = m + f(LayerNorm(m))
             m_normalized = self.msa_layer_norm(m)
-            m_transformed = self.msa_linear2(self.msa_relu(self.msa_linear1(m_normalized)))
+            m_transformed = self.msa_linear2(F.gelu(self.msa_linear1(m_normalized)))
             if self.gating:
                 gating_output = F.sigmoid(self.m_gating_linear(m))
                 m_transformed = m_transformed * gating_output
@@ -126,7 +126,7 @@ class SimpleEvoformerReplacement(nn.Module):
         if z is not None:
             # Apply residual connection: z = z + f(LayerNorm(z))
             z_normalized = self.pair_layer_norm(z)
-            z_transformed = self.pair_linear2(self.pair_relu(self.pair_linear1(z_normalized)))
+            z_transformed = self.pair_linear2(F.gelu(self.pair_linear1(z_normalized)))
             if self.gating:
                 gating_output = F.sigmoid(self.z_gating_linear(z))
                 z_transformed = z_transformed * gating_output
@@ -152,17 +152,20 @@ class DiagonalLinear(nn.Module):
         self.bias = nn.Parameter(torch.zeros(num_features))
 
     def forward(self, x):
-        return F.linear(x, self.diag_weight, self.bias)
+        # Element-wise multiplication for diagonal transformation
+        return x * self.diag_weight + self.bias
 
 
 class AffineLinear(nn.Module):
     def __init__(self, num_features):
         super(AffineLinear, self).__init__()
-        self.weight = nn.Parameter(torch.zeros(1))
-        self.bias = nn.Parameter(torch.zeros(1))
+        # Affine transformation: y = ax + b (scale and shift)
+        self.weight = nn.Parameter(torch.ones(num_features))
+        self.bias = nn.Parameter(torch.zeros(num_features))
 
     def forward(self, x):
-        return self.weight * x + self.bias
+        # Simple affine transformation (similar to LayerNorm without normalization)
+        return x * self.weight + self.bias
 
 
 def replace_evoformer_block(model, block_index: int, c_m: int, c_z: int, m_hidden_dim: Optional[int] = None, z_hidden_dim: Optional[int] = None, linear_type: str = "full", gating: bool = True, residual: bool = True):
