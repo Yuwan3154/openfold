@@ -192,14 +192,20 @@ def load_pretrained_replacement_block(
     # Create model
     if hidden_dim is None:
         if linear_type == "full":
-            hidden_dim = max(c_m, c_z)
+            m_hidden_dim = c_m  # Use c_m for MSA hidden dimension
+            z_hidden_dim = c_z  # Use c_z for pair hidden dimension
         else:
-            hidden_dim = None
+            m_hidden_dim = None
+            z_hidden_dim = None
+    else:
+        m_hidden_dim = hidden_dim
+        z_hidden_dim = hidden_dim
     
     model = SimpleEvoformerReplacement(
         c_m=c_m,
         c_z=c_z,
-        c_hidden=hidden_dim,
+        m_hidden_dim=m_hidden_dim,
+        z_hidden_dim=z_hidden_dim,
         linear_type=linear_type
     )
     
@@ -276,7 +282,7 @@ def replace_evoformer_blocks_with_adaptive(
     weight_predictors = {}
     
     # Replace blocks in the evoformer stack
-    evoformer_stack = model.evoformer_stack
+    evoformer_stack = model.evoformer
     
     for block_idx in replace_blocks:
         if block_idx >= len(evoformer_stack.blocks):

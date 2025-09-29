@@ -46,6 +46,7 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
             adaptive_config_path: Path to adaptive training config
             learning_rate: Learning rate for training
         """
+        
         # Don't call super().__init__ yet - we need to handle model creation differently
         pl.LightningModule.__init__(self)
         
@@ -105,10 +106,19 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
         if not self.is_adaptive_training:
             return metrics
         
-        # Get MSA from batch
-        msa = batch.get("msa", batch.get("msa_feat", None))
+        # Get MSA from batch - but skip if only msa_feat is available
+        # 'msa' has the full MSA representation (c_m=256), 'msa_feat' is just features (49 dims)
+        msa = None
+        if "msa" in batch:
+            msa = batch["msa"]
+        elif "msa_feat" in batch:
+            # Skip adaptive metrics computation if only msa_feat is available
+            return metrics
         
-        if msa is not None and self.weight_predictors:
+        if msa is None:
+            return metrics
+        
+        if self.weight_predictors:
             with torch.no_grad():
                 # Collect weights for each block
                 block_weights = {}

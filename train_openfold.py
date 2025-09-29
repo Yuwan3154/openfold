@@ -45,6 +45,13 @@ from block_replacement_scripts.custom_evoformer_replacement import (
     freeze_all_except_replaced_block
 )
 
+# Import AdaptiveOpenFoldWrapper for adaptive training
+try:
+    from block_replacement_scripts.custom_openfold_wrapper import AdaptiveOpenFoldWrapper
+    ADAPTIVE_WRAPPER_AVAILABLE = True
+except ImportError:
+    ADAPTIVE_WRAPPER_AVAILABLE = False
+
 
 class OpenFoldWrapper(pl.LightningModule):
     def __init__(self, config, replace_block_index=None, replacement_hidden_dim=None, learning_rate=1e-3):
@@ -339,6 +346,9 @@ def get_model_state_dict_from_ds_checkpoint(checkpoint_dir):
     return torch.load(state_file)
 
 def main(args):
+    print("=== train_openfold.main() called ===")
+    print(f"=== args.adaptive_config_path = {getattr(args, 'adaptive_config_path', 'NOT SET')} ===")
+    
     # Set float32 matmul precision for Tensor Cores
     torch.set_float32_matmul_precision("medium")
     
@@ -380,12 +390,22 @@ def main(args):
         # Reduce some computational requirements
         config.data.train.crop_size = min(config.data.train.crop_size, 256)
 
-    model_module = OpenFoldWrapper(
-        config, 
-        replace_block_index=getattr(args, 'replace_block_index', None),
-        replacement_hidden_dim=getattr(args, 'replacement_hidden_dim', None),
-        learning_rate=getattr(args, 'learning_rate', 1e-3)
-    )
+    # Use AdaptiveOpenFoldWrapper if adaptive_config_path is provided
+    adaptive_config_path = getattr(args, 'adaptive_config_path', None)
+    
+    if adaptive_config_path and ADAPTIVE_WRAPPER_AVAILABLE:
+        model_module = AdaptiveOpenFoldWrapper(
+            config, 
+            adaptive_config_path=adaptive_config_path,
+            learning_rate=getattr(args, 'learning_rate', 1e-3)
+        )
+    else:
+        model_module = OpenFoldWrapper(
+            config, 
+            replace_block_index=getattr(args, 'replace_block_index', None),
+            replacement_hidden_dim=getattr(args, 'replacement_hidden_dim', None),
+            learning_rate=getattr(args, 'learning_rate', 1e-3)
+        )
 
     if args.resume_from_ckpt:
         if args.resume_model_weights_only:
@@ -849,6 +869,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--enable_recursive_search", action="store_true", default=True,
         help="Enable recursive search for structure files in subdirectories"
+    )
+    
+    # Adaptive training argument
+    parser.add_argument(
+        "--adaptive_config_path", type=str, default=None,
+        help="Path to adaptive training configuration JSON file"
     )
 
     trainer_group = parser.add_argument_group(

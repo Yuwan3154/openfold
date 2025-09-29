@@ -210,34 +210,47 @@ def run_adaptive_training(args):
         with open(args.config, 'r') as f:
             config = yaml.safe_load(f)
         
-        # Override with command line arguments
-        if args.csv_path:
+        # Override with command line arguments (only if explicitly provided)
+        # Check if arguments were explicitly provided by looking at sys.argv
+        provided_args = set()
+        for i, arg in enumerate(sys.argv):
+            if arg.startswith('--'):
+                arg_name = arg[2:]  # Remove '--'
+                provided_args.add(arg_name)
+        
+        if 'csv_path' in provided_args and args.csv_path is not None:
             config['csv_path'] = args.csv_path
-        if args.pdb_dir:
+        if 'pdb_dir' in provided_args and args.pdb_dir is not None:
             config['pdb_dir'] = args.pdb_dir
-        if args.checkpoint_path:
+        if 'checkpoint_path' in provided_args and args.checkpoint_path is not None:
             config['weights_path'] = args.checkpoint_path
-        if args.trained_models_dir:
+        if 'trained_models_dir' in provided_args and args.trained_models_dir is not None:
             config['trained_models_dir'] = args.trained_models_dir
-        if args.output_dir:
+        if 'output_dir' in provided_args and args.output_dir is not None:
             config['output_dir'] = args.output_dir
-        if args.linear_type:
+        if 'linear_type' in provided_args and args.linear_type is not None:
             config['linear_type'] = args.linear_type
-        if args.replace_loss_scaler is not None:
+        if 'replace_loss_scaler' in provided_args and args.replace_loss_scaler is not None:
             config['replace_loss_scaler'] = args.replace_loss_scaler
-        if args.max_epochs:
+        if 'max_epochs' in provided_args and args.max_epochs is not None:
             config['max_epochs'] = args.max_epochs
-        if args.batch_size:
+        if 'batch_size' in provided_args and args.batch_size is not None:
             config['batch_size'] = args.batch_size
-        if args.learning_rate:
+        if 'learning_rate' in provided_args and args.learning_rate is not None:
             config['learning_rate'] = args.learning_rate
-        if args.wandb is not None:
+        if 'train_epoch_len' in provided_args and args.train_epoch_len is not None:
+            config['train_epoch_len'] = args.train_epoch_len
+        if 'validation_fraction' in provided_args and args.validation_fraction is not None:
+            config['validation_fraction'] = args.validation_fraction
+        if 'grad_accum_steps' in provided_args and args.grad_accum_steps is not None:
+            config['grad_accum_steps'] = args.grad_accum_steps
+        if 'wandb' in provided_args and args.wandb is not None:
             config['wandb'] = args.wandb
-        if args.wandb_project:
+        if 'wandb_project' in provided_args and args.wandb_project is not None:
             config['wandb_project'] = args.wandb_project
-        if args.wandb_entity:
+        if 'wandb_entity' in provided_args and args.wandb_entity is not None:
             config['wandb_entity'] = args.wandb_entity
-        if args.experiment_name:
+        if 'experiment_name' in provided_args and args.experiment_name is not None:
             config['experiment_name'] = args.experiment_name
     else:
         # Use command line arguments directly
@@ -281,7 +294,13 @@ def run_adaptive_training(args):
     print(f"  Replace loss scaler: {config['replace_loss_scaler']}")
     print(f"  Learning rate: {config['learning_rate']}")
     print(f"  Max epochs: {config['max_epochs']}")
+    print(f"  Train epoch len: {config.get('train_epoch_len', 'NOT SET')}")
     print(f"  Batch size: {config['batch_size']}")
+    print(f"  Validation fraction: {config.get('validation_fraction', 'NOT SET')}")
+    print(f"  Grad accum steps: {config.get('grad_accum_steps', 'NOT SET')}")
+    print(f"  Wandb enabled: {config.get('wandb', 'NOT SET')}")
+    print(f"  Wandb project: {config.get('wandb_project', 'NOT SET')}")
+    print(f"  Experiment name: {config.get('experiment_name', 'NOT SET')}")
     print()
     
     # Check trained models directory
@@ -328,7 +347,7 @@ def run_adaptive_training(args):
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
     
-    # Create adaptive training command file
+    # Create adaptive training command file FIRST (before wrapper script)
     print("4. Creating adaptive training configuration...")
     adaptive_cmd_file = create_adaptive_training_command_file(
         output_dir,
@@ -339,121 +358,8 @@ def run_adaptive_training(args):
     print(f"Adaptive training config saved to: {adaptive_cmd_file}")
     print()
     
-    # Build training command - use standard train_openfold.py
+    # Build training command - use standard train_openfold.py directly
     train_script = home_dir / "openfold" / "train_openfold.py"
-    
-    # Create a Python wrapper script that imports our custom wrapper
-    wrapper_script = output_dir / "run_adaptive_training.py"
-    wrapper_content = f"""#!/usr/bin/env python3
-# Auto-generated wrapper script for adaptive training
-import sys
-from pathlib import Path
-import argparse
-
-# Add openfold to path
-sys.path.insert(0, str(Path.home() / "openfold"))
-
-# Import and replace the OpenFoldWrapper with our custom version
-from block_replacement_scripts.custom_openfold_wrapper import AdaptiveOpenFoldWrapper
-import train_openfold
-train_openfold.OpenFoldWrapper = AdaptiveOpenFoldWrapper
-
-# Create parser manually (since train_openfold.parser is not accessible)
-def create_parser():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("train_data_dir", type=str, help="Directory containing training mmCIF files")
-    parser.add_argument("train_alignment_dir", type=str, help="Directory containing precomputed training alignments")
-    parser.add_argument("template_mmcif_dir", type=str, help="Directory containing mmCIF files to search for templates")
-    parser.add_argument("output_dir", type=str, help="Directory in which to output checkpoints, logs, etc.")
-    parser.add_argument("max_template_date", type=str, help="Cutoff for all templates")
-    
-    # Add all the arguments that train_openfold.py expects
-    parser.add_argument("--train_mmcif_data_cache_path", type=str, default=None)
-    parser.add_argument("--use_single_seq_mode", type=str, default=False)
-    parser.add_argument("--distillation_data_dir", type=str, default=None)
-    parser.add_argument("--distillation_alignment_dir", type=str, default=None)
-    parser.add_argument("--val_data_dir", type=str, default=None)
-    parser.add_argument("--val_alignment_dir", type=str, default=None)
-    parser.add_argument("--val_mmcif_data_cache_path", type=str, default=None)
-    parser.add_argument("--kalign_binary_path", type=str, default='/usr/bin/kalign')
-    parser.add_argument("--train_filter_path", type=str, default=None)
-    parser.add_argument("--distillation_filter_path", type=str, default=None)
-    parser.add_argument("--obsolete_pdbs_file_path", type=str, default=None)
-    parser.add_argument("--template_release_dates_cache_path", type=str, default=None)
-    parser.add_argument("--use_small_bfd", type=str, default=False)
-    parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--deepspeed_config_path", type=str, default=None)
-    parser.add_argument("--checkpoint_every_epoch", action="store_true", default=False)
-    parser.add_argument("--checkpoint_every_n_steps", type=int, default=None)
-    parser.add_argument("--checkpoint_every_n_epochs", type=int, default=None)
-    parser.add_argument("--checkpoint_save_top_k", type=int, default=None)
-    parser.add_argument("--checkpoint_monitor", type=str, default=None)
-    parser.add_argument("--early_stopping", type=str, default=False)
-    parser.add_argument("--min_delta", type=float, default=0)
-    parser.add_argument("--patience", type=int, default=3)
-    parser.add_argument("--resume_from_ckpt", type=str, default=None)
-    parser.add_argument("--resume_model_weights_only", type=str, default=False)
-    parser.add_argument("--resume_from_jax_params", type=str, default=None)
-    parser.add_argument("--log_performance", type=str, default=False)
-    parser.add_argument("--wandb", action="store_true", default=False)
-    parser.add_argument("--experiment_name", type=str, default=None)
-    parser.add_argument("--wandb_id", type=str, default=None)
-    parser.add_argument("--wandb_project", type=str, default=None)
-    parser.add_argument("--wandb_entity", type=str, default=None)
-    parser.add_argument("--script_modules", type=str, default=False)
-    parser.add_argument("--train_chain_data_cache_path", type=str, default=None)
-    parser.add_argument("--distillation_chain_data_cache_path", type=str, default=None)
-    parser.add_argument("--train_epoch_len", type=int, default=10000)
-    parser.add_argument("--log_lr", action="store_true", default=False)
-    parser.add_argument("--config_preset", type=str, default="initial_training")
-    parser.add_argument("--_distillation_structure_index_path", type=str, default=None)
-    parser.add_argument("--alignment_index_path", type=str, default=None)
-    parser.add_argument("--distillation_alignment_index_path", type=str, default=None)
-    parser.add_argument("--experiment_config_json", default="", help="Path to a json file with custom config values")
-    parser.add_argument("--gpus", type=int, default=1)
-    parser.add_argument("--mpi_plugin", action="store_true", default=False)
-    parser.add_argument("--distributed_backend", type=str, default="gloo", choices=["nccl", "gloo", "mpi"])
-    parser.add_argument("--replace_block_index", type=int, default=None)
-    parser.add_argument("--replacement_hidden_dim", type=int, default=None)
-    parser.add_argument("--enable_single_seq_mode", action="store_true", default=False)
-    parser.add_argument("--learning_rate", type=float, default=1e-3)
-    parser.add_argument("--train_chain_list_path", type=str, default=None)
-    parser.add_argument("--distillation_chain_list_path", type=str, default=None)
-    parser.add_argument("--val_chain_list_path", type=str, default=None)
-    parser.add_argument("--enable_recursive_search", action="store_true", default=True)
-    parser.add_argument("--num_nodes", type=int, default=1)
-    parser.add_argument("--precision", type=str, default='bf16')
-    parser.add_argument("--max_epochs", type=int, default=1)
-    parser.add_argument("--log_every_n_steps", type=int, default=25)
-    parser.add_argument("--flush_logs_every_n_steps", type=int, default=5)
-    parser.add_argument("--num_sanity_val_steps", type=int, default=0)
-    parser.add_argument("--reload_dataloaders_every_n_epochs", type=int, default=1)
-    parser.add_argument("--grad_accum_steps", type=int, default=1)
-    return parser
-
-# Run the original training script
-if __name__ == "__main__":
-    # Get original args
-    parser = create_parser()
-    args = parser.parse_args()
-    
-    # Add our adaptive config
-    args.adaptive_config_path = "{adaptive_cmd_file}"
-    
-    # Run training
-    train_openfold.main(args)
-"""
-    
-    with open(wrapper_script, 'w') as f:
-        f.write(wrapper_content)
-    
-    # Make wrapper script executable
-    os.chmod(wrapper_script, 0o755)
-    
-    print(f"Created adaptive training wrapper: {wrapper_script}")
-    
-    # Update train_script to use our wrapper
-    train_script = wrapper_script
     
     cmd = [
         sys.executable, str(train_script),
@@ -480,12 +386,15 @@ if __name__ == "__main__":
         
         # Resource settings
         "--precision", args.precision,
-        "--gpus", str(args.gpus),
+        "--gpus", str(config.get('gpus', args.gpus)),
         "--seed", str(args.seed),
-        "--distributed_backend", args.distributed_backend,
+        "--distributed_backend", "gloo",  # Force gloo backend
         
         # Gradient accumulation
         "--grad_accum_steps", str(config.get('grad_accum_steps', 1)),
+        
+        # Adaptive training configuration
+        "--adaptive_config_path", str(adaptive_cmd_file),
         
         # Logging
         "--log_lr",
@@ -544,7 +453,7 @@ if __name__ == "__main__":
     print("=" * 60)
     
     # Execute the training command
-    result = subprocess.run(cmd, check=True, env=env)
+    result = subprocess.run(cmd, check=True)
     print("Adaptive training completed successfully!")
     return result
 
@@ -594,38 +503,38 @@ def main():
                        const="adaptive_config.yaml",
                        help="Create default config file and exit")
     
-    # Data paths
+    # Data paths (only for command-line override, config file takes precedence)
     parser.add_argument("--csv_path", type=str, default=None,
-                       help="Path to CSV file containing chain list (relative to home)")
+                       help="Override CSV path from config file")
     parser.add_argument("--pdb_dir", type=str, default=None,
-                       help="Directory containing PDB/mmCIF files (relative to home)")
+                       help="Override PDB directory from config file")
     parser.add_argument("--checkpoint_path", type=str, default=None,
-                       help="Path to pre-trained checkpoint (relative to home)")
+                       help="Override checkpoint path from config file")
     parser.add_argument("--trained_models_dir", type=str, default=None,
-                       help="Directory containing trained replacement blocks (relative to home)")
+                       help="Override trained models directory from config file")
     parser.add_argument("--output_dir", type=str, default=None,
-                       help="Output directory for checkpoints and logs (relative to home)")
+                       help="Override output directory from config file")
     
-    # Model configuration
+    # Model configuration (only for command-line override, config file takes precedence)
     parser.add_argument("--linear_type", type=str, default=None,
                        choices=["full", "diagonal", "affine"],
-                       help="Linear type used in pre-trained replacement blocks")
+                       help="Override linear type from config file")
     parser.add_argument("--replace_loss_scaler", type=float, default=None,
-                       help="Scaler for replace loss that penalizes mean adaptive weights")
+                       help="Override replace loss scaler from config file")
     
-    # Training parameters
-    parser.add_argument("--max_epochs", type=int, default=10,
-                       help="Maximum number of training epochs")
-    parser.add_argument("--train_epoch_len", type=int, default=1000,
-                       help="Virtual length of each training epoch")
-    parser.add_argument("--batch_size", type=int, default=1,
-                       help="Batch size for training")
-    parser.add_argument("--learning_rate", type=float, default=1e-4,
-                       help="Learning rate for adaptive weight training")
-    parser.add_argument("--validation_fraction", type=float, default=0.1,
-                       help="Fraction of data to use for validation")
-    parser.add_argument("--grad_accum_steps", type=int, default=2,
-                       help="Accumulate gradients over k batches (gradient accumulation steps)")
+    # Training parameters (only for command-line override, config file takes precedence)
+    parser.add_argument("--max_epochs", type=int, default=None,
+                       help="Override max epochs from config file")
+    parser.add_argument("--train_epoch_len", type=int, default=None,
+                       help="Override train epoch length from config file")
+    parser.add_argument("--batch_size", type=int, default=None,
+                       help="Override batch size from config file")
+    parser.add_argument("--learning_rate", type=float, default=None,
+                       help="Override learning rate from config file")
+    parser.add_argument("--validation_fraction", type=float, default=None,
+                       help="Override validation fraction from config file")
+    parser.add_argument("--grad_accum_steps", type=int, default=None,
+                       help="Override gradient accumulation steps from config file")
     parser.add_argument("--max_template_date", type=str, default="2025-01-01",
                        help="Cutoff date for templates (YYYY-MM-DD)")
     
@@ -635,7 +544,7 @@ def main():
     parser.add_argument("--checkpoint_save_top_k", type=int, default=1,
                        help="Number of best checkpoints to keep")
     
-    # Resource settings
+    # Resource settings (only for command-line override, config file takes precedence)
     parser.add_argument("--precision", type=str, default="bf16-mixed",
                        choices=["16", "32", "bf16", "bf16-mixed"],
                        help="Training precision")
@@ -643,19 +552,19 @@ def main():
                        help="Number of GPUs to use")
     parser.add_argument("--seed", type=int, default=42,
                        help="Random seed for reproducibility")
-    parser.add_argument("--distributed_backend", type=str, default="gloo",
+    parser.add_argument("--distributed_backend", type=str, default=None,
                        choices=["nccl", "gloo", "mpi"],
-                       help="Distributed backend for DDP training")
+                       help="Override distributed backend from config file")
     
-    # Logging and monitoring
+    # Logging and monitoring (only for command-line override, config file takes precedence)
     parser.add_argument("--wandb", action="store_true", default=False,
-                       help="Enable Weights & Biases logging")
+                       help="Override wandb setting from config file")
     parser.add_argument("--experiment_name", type=str, default=None,
-                       help="Experiment name for logging")
+                       help="Override experiment name from config file")
     parser.add_argument("--wandb_project", type=str, default=None,
-                       help="Wandb project name")
+                       help="Override wandb project from config file")
     parser.add_argument("--wandb_entity", type=str, default=None,
-                       help="Wandb entity (username or team)")
+                       help="Override wandb entity from config file")
     
     # Utility
     parser.add_argument("--dry_run", action="store_true", default=False,
@@ -672,6 +581,13 @@ def main():
         print("Edit this file to customize the adaptive training, then run:")
         print(f"python {sys.argv[0]} --config {config_path}")
         return
+    
+    # Require config file for adaptive training
+    if not args.config:
+        print("ERROR: Config file is required for adaptive training.")
+        print("Use --create_config to generate a default config file, then:")
+        print(f"python {sys.argv[0]} --config <config_file.yaml>")
+        sys.exit(1)
     
     # Run adaptive training
     run_adaptive_training(args)
