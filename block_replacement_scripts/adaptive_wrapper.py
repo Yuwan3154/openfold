@@ -40,10 +40,8 @@ def setup_adaptive_training_model(
     with open(config_path, 'r') as f:
         adaptive_config = json.load(f)
     
-    print("\n=== Setting up Adaptive Training ===")
-    print(f"Trained models directory: {adaptive_config['trained_models_dir']}")
-    print(f"Linear type: {adaptive_config['linear_type']}")
-    print(f"Replace loss scaler: {adaptive_config['replace_loss_scaler']}")
+    # Note: We can't access trainer.is_global_zero here, so these prints will happen on all ranks
+    # They will be filtered in the wrapper's _setup_adaptive_training method
     
     # Get model dimensions
     c_m = model_config.model.evoformer_stack.c_m
@@ -66,49 +64,52 @@ def setup_adaptive_training_model(
         'replace_loss_scaler': adaptive_config['replace_loss_scaler'],
         'linear_type': adaptive_config['linear_type'],
         'num_adaptive_blocks': len(weight_predictors),
+        'log_structure_every_k_epoch': adaptive_config.get('log_structure_every_k_epoch', 1),
     }
     
-    print(f"Successfully set up adaptive training with {len(weight_predictors)} blocks")
-    
+    # Print is handled in wrapper
     return model, training_info
 
 
 def compute_adaptive_replace_loss(
-    weight_predictors: Dict[int, AdaptiveWeightPredictor],
+    model: torch.nn.Module,
     replace_loss_scaler: float,
-    c_m: int,
     device: torch.device,
 ) -> torch.Tensor:
     """
     Compute replace loss that penalizes mean of adaptive weights.
     
+    This function collects the actual predicted weights from the adaptive blocks
+    during the forward pass, rather than using dummy inputs.
+    
     Args:
-        weight_predictors: Dictionary of weight predictors
+        model: The model containing adaptive blocks with predicted weights
         replace_loss_scaler: Scaling factor for replace loss
-        c_m: MSA channel dimension
         device: Device to create tensors on
         
     Returns:
         Replace loss value
     """
-    if not weight_predictors:
-        return torch.tensor(0.0, device=device)
-    
-    # Collect all predicted weights
+    # Collect all predicted weights from adaptive blocks
     all_weights = []
     
-    # Get a dummy input for weight prediction (batch size 1)
-    dummy_msa = torch.zeros(1, 1, 1, c_m, device=device)
+    # Find all AdaptiveEvoformerBlock instances and collect their predicted weights
+    for name, module in model.named_modules():
+        # Check if this is an AdaptiveEvoformerBlock with stored weights
+        if hasattr(module, '_predicted_weights') and hasattr(module, 'block_idx'):
+            if module.block_idx in module._predicted_weights:
+                weight = module._predicted_weights[module.block_idx]
+                # Average over batch dimension
+                all_weights.append(weight.mean())
     
-    for block_idx, predictor in weight_predictors.items():
-        weight = predictor(dummy_msa)  # [1, 1]
-        all_weights.append(weight.squeeze())
+    if not all_weights:
+        return torch.tensor(0.0, device=device, requires_grad=True)
     
     # Compute mean weight across all blocks
     mean_weight = torch.stack(all_weights).mean()
     
-    # Penalize deviation from 1.0 (encouraging use of original Evoformer)
-    replace_loss = (1.0 - mean_weight) ** 2
+    # Penalize deviation from 0.0 (encouraging use of replacement Evoformer)
+    replace_loss = mean_weight
     
     return replace_loss * replace_loss_scaler
 
@@ -142,7 +143,6 @@ def freeze_model_except_adaptive_components(model: nn.Module) -> int:
                 trainable_params += param.numel()
     
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"Frozen all parameters except adaptive components (weight predictors + replacement blocks)")
-    print(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({trainable_params/total_params*100:.2f}%)")
+    # Print is handled in wrapper
     
     return trainable_params

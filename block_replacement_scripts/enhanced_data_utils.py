@@ -158,6 +158,15 @@ class EnhancedStructureFinder:
         if chain_list_path and os.path.exists(chain_list_path):
             self.chain_mapping = load_chain_training_list(chain_list_path)
             print(f"Loaded chain mapping for {len(self.chain_mapping)} entries")
+        
+        # Load label->author chain ID mapping if available
+        self.label_to_author_mapping = {}
+        chain_id_mapping_path = os.path.join(os.path.dirname(data_dir), 'chain_id_mapping.json')
+        if os.path.exists(chain_id_mapping_path):
+            import json
+            with open(chain_id_mapping_path, 'r') as f:
+                self.label_to_author_mapping = json.load(f)
+            print(f"Loaded label->author chain ID mapping for {len(self.label_to_author_mapping)} files")
     
     def find_structure_path(self, name: str) -> tuple:
         """
@@ -181,6 +190,15 @@ class EnhancedStructureFinder:
             else:
                 file_id, = spl
                 chain_id = None
+        
+        # Translate label chain ID to author chain ID if mapping exists
+        # This handles cases where mmCIF uses standardized chain IDs (label_asym_id)
+        # but OpenFold parser uses author chain IDs (auth_asym_id)
+        if chain_id and file_id in self.label_to_author_mapping:
+            if chain_id in self.label_to_author_mapping[file_id]:
+                author_chain_id = self.label_to_author_mapping[file_id][chain_id]
+                # Use author chain ID for OpenFold's parser
+                chain_id = author_chain_id
         
         # Find the structure file
         if file_id in self.structure_files:

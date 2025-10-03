@@ -182,7 +182,7 @@ def split_chains_for_validation(chain_list, val_fraction, output_dir, seed=42):
     return train_chains, val_chains, train_list_path, val_list_path
 
 
-def create_adaptive_training_command_file(output_dir, trained_models_dir, linear_type, replace_loss_scaler):
+def create_adaptive_training_command_file(output_dir, trained_models_dir, linear_type, replace_loss_scaler, log_structure_every_k_epoch=1):
     """Create the adaptive training command file for custom loading"""
     adaptive_cmd_file = output_dir / "adaptive_training_cmd.json"
     
@@ -190,6 +190,7 @@ def create_adaptive_training_command_file(output_dir, trained_models_dir, linear
         "trained_models_dir": str(trained_models_dir),
         "linear_type": linear_type,
         "replace_loss_scaler": replace_loss_scaler,
+        "log_structure_every_k_epoch": log_structure_every_k_epoch,
         "adaptive_training": True
     }
     
@@ -244,6 +245,10 @@ def run_adaptive_training(args):
             config['validation_fraction'] = args.validation_fraction
         if 'grad_accum_steps' in provided_args and args.grad_accum_steps is not None:
             config['grad_accum_steps'] = args.grad_accum_steps
+        if 'log_structure_every_k_epoch' in provided_args and args.log_structure_every_k_epoch is not None:
+            config['log_structure_every_k_epoch'] = args.log_structure_every_k_epoch
+        if 'plddt_loss_weight' in provided_args and args.plddt_loss_weight is not None:
+            config['plddt_loss_weight'] = args.plddt_loss_weight
         if 'wandb' in provided_args and args.wandb is not None:
             config['wandb'] = args.wandb
         if 'wandb_project' in provided_args and args.wandb_project is not None:
@@ -267,6 +272,9 @@ def run_adaptive_training(args):
             'batch_size': args.batch_size,
             'learning_rate': args.learning_rate,
             'validation_fraction': args.validation_fraction,
+            'grad_accum_steps': args.grad_accum_steps,
+            'log_structure_every_k_epoch': args.log_structure_every_k_epoch,
+            'plddt_loss_weight': args.plddt_loss_weight if args.plddt_loss_weight is not None else 0.1,
             'wandb': args.wandb,
             'wandb_project': args.wandb_project,
             'wandb_entity': args.wandb_entity,
@@ -298,6 +306,7 @@ def run_adaptive_training(args):
     print(f"  Batch size: {config['batch_size']}")
     print(f"  Validation fraction: {config.get('validation_fraction', 'NOT SET')}")
     print(f"  Grad accum steps: {config.get('grad_accum_steps', 'NOT SET')}")
+    print(f"  Log structure every k epochs: {config.get('log_structure_every_k_epoch', 'NOT SET')}")
     print(f"  Wandb enabled: {config.get('wandb', 'NOT SET')}")
     print(f"  Wandb project: {config.get('wandb_project', 'NOT SET')}")
     print(f"  Experiment name: {config.get('experiment_name', 'NOT SET')}")
@@ -353,7 +362,8 @@ def run_adaptive_training(args):
         output_dir,
         trained_models_dir,
         config['linear_type'],
-        config['replace_loss_scaler']
+        config['replace_loss_scaler'],
+        config.get('log_structure_every_k_epoch', 1)
     )
     print(f"Adaptive training config saved to: {adaptive_cmd_file}")
     print()
@@ -452,8 +462,16 @@ def run_adaptive_training(args):
     print("6. Starting adaptive training...")
     print("=" * 60)
     
+    # Set environment to restrict to requested number of GPUs
+    env = os.environ.copy()
+    if config.get('gpus', args.gpus) == 1:
+        # For single GPU training, set CUDA_VISIBLE_DEVICES to first GPU only
+        # This prevents PyTorch Lightning from auto-detecting multiple GPUs
+        env['CUDA_VISIBLE_DEVICES'] = '0'
+        print("Setting CUDA_VISIBLE_DEVICES=0 for single GPU training")
+    
     # Execute the training command
-    result = subprocess.run(cmd, check=True)
+    result = subprocess.run(cmd, check=True, env=env)
     print("Adaptive training completed successfully!")
     return result
 
@@ -481,6 +499,8 @@ def create_default_config():
         'validation_fraction': 0.1,
         'num_workers': 2,
         'grad_accum_steps': 2,  # Gradient accumulation steps
+        'log_structure_every_k_epoch': 1,  # Log structure every k epochs (0 = disabled)
+        'plddt_loss_weight': 0.1,  # pLDDT loss weight (default: 0.01, increased to 0.1 for better gradient signal)
         
         # Wandb logging
         'wandb': True,
@@ -535,6 +555,10 @@ def main():
                        help="Override validation fraction from config file")
     parser.add_argument("--grad_accum_steps", type=int, default=None,
                        help="Override gradient accumulation steps from config file")
+    parser.add_argument("--log_structure_every_k_epoch", type=int, default=None,
+                       help="Override structure logging frequency from config file")
+    parser.add_argument("--plddt_loss_weight", type=float, default=None,
+                       help="Override pLDDT loss weight from config file (default: 0.01)")
     parser.add_argument("--max_template_date", type=str, default="2025-01-01",
                        help="Cutoff date for templates (YYYY-MM-DD)")
     

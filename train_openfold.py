@@ -346,9 +346,6 @@ def get_model_state_dict_from_ds_checkpoint(checkpoint_dir):
     return torch.load(state_file)
 
 def main(args):
-    print("=== train_openfold.main() called ===")
-    print(f"=== args.adaptive_config_path = {getattr(args, 'adaptive_config_path', 'NOT SET')} ===")
-    
     # Set float32 matmul precision for Tensor Cores
     torch.set_float32_matmul_precision("medium")
     
@@ -387,8 +384,23 @@ def main(args):
             print("Disabled template data usage for single sequence mode")
         else:
             config.model.template.enabled = False
+        # Disable MSA-specific losses for single sequence training
+        print("Disabling masked_msa loss for single sequence mode")
+        config.loss.masked_msa.weight = 0.0
         # Reduce some computational requirements
         config.data.train.crop_size = min(config.data.train.crop_size, 256)
+    
+    # Apply plddt_loss_weight override from adaptive config if provided
+    adaptive_config_path = getattr(args, 'adaptive_config_path', None)
+    if adaptive_config_path:
+        import json
+        with open(adaptive_config_path, 'r') as f:
+            adaptive_config = json.load(f)
+        
+        if 'plddt_loss_weight' in adaptive_config:
+            plddt_weight = adaptive_config['plddt_loss_weight']
+            config.loss.plddt_loss.weight = plddt_weight
+            print(f"Overriding plddt_loss weight: 0.01 → {plddt_weight}")
 
     # Use AdaptiveOpenFoldWrapper if adaptive_config_path is provided
     adaptive_config_path = getattr(args, 'adaptive_config_path', None)

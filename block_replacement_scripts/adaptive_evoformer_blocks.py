@@ -155,6 +155,12 @@ class AdaptiveEvoformerBlock(nn.Module):
         # 3. Predict adaptive weight from MSA representation
         weight = self.weight_predictor(m_input)  # [batch, 1]
         
+        # Store the predicted weight for loss computation (attach to m_out)
+        # This allows the loss function to access the actual predicted weights
+        if not hasattr(self, '_predicted_weights'):
+            self._predicted_weights = {}
+        self._predicted_weights[self.block_idx] = weight
+        
         # Reshape weight for broadcasting
         # m: [batch, N_seq, N_res, C_m] -> weight: [batch, 1, 1, 1]
         # z: [batch, N_res, N_res, C_z] -> weight: [batch, 1, 1, 1]
@@ -225,7 +231,7 @@ def load_pretrained_replacement_block(
                      if k.startswith('replacement_block.') or 'replacement_block' not in k}
         
         model.load_state_dict(state_dict)
-        print(f"Loaded replacement block from {checkpoint_path}")
+        # Print handled by caller if needed
     else:
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     
@@ -240,6 +246,7 @@ def replace_evoformer_blocks_with_adaptive(
     c_z: int = 128,
     hidden_dim: Optional[int] = None,
     replace_blocks: Optional[list] = None,
+    verbose: bool = True,
 ) -> Tuple[nn.Module, Dict[int, AdaptiveWeightPredictor]]:
     """
     Replace specified Evoformer blocks with adaptive versions.
@@ -267,7 +274,8 @@ def replace_evoformer_blocks_with_adaptive(
                 available_blocks.append(block_idx)
     
     available_blocks.sort()
-    print(f"Found {len(available_blocks)} trained replacement blocks: {available_blocks}")
+    if verbose:
+        print(f"Found {len(available_blocks)} trained replacement blocks: {available_blocks}")
     
     # Determine which blocks to replace
     if replace_blocks is None:
@@ -276,7 +284,8 @@ def replace_evoformer_blocks_with_adaptive(
         # Filter to only available blocks
         replace_blocks = [b for b in replace_blocks if b in available_blocks]
     
-    print(f"Replacing {len(replace_blocks)} blocks: {replace_blocks}")
+    if verbose:
+        print(f"Replacing {len(replace_blocks)} blocks: {replace_blocks}")
     
     # Create weight predictors for each block
     weight_predictors = {}
@@ -286,7 +295,8 @@ def replace_evoformer_blocks_with_adaptive(
     
     for block_idx in replace_blocks:
         if block_idx >= len(evoformer_stack.blocks):
-            print(f"Warning: Block {block_idx} out of range, skipping")
+            if verbose:
+                print(f"Warning: Block {block_idx} out of range, skipping")
             continue
             
         # Load pre-trained replacement block
@@ -316,12 +326,6 @@ def replace_evoformer_blocks_with_adaptive(
         
         # Replace in model
         evoformer_stack.blocks[block_idx] = adaptive_block
-        
-    print(f"Successfully replaced {len(replace_blocks)} blocks with adaptive versions")
     
-    # Count trainable parameters
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({trainable_params/total_params*100:.2f}%)")
-    
+    # Don't print here - will be printed in wrapper after freezing
     return model, weight_predictors
