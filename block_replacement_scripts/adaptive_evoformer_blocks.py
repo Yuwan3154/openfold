@@ -18,7 +18,7 @@ import sys
 sys.path.append(str(Path(__file__).parent.parent))
 
 from openfold.model.primitives import Linear
-from .custom_evoformer_replacement import SimpleEvoformerReplacement
+from block_replacement_scripts.custom_evoformer_replacement import SimpleEvoformerReplacement
 
 
 class AdaptiveWeightPredictor(nn.Module):
@@ -27,6 +27,11 @@ class AdaptiveWeightPredictor(nn.Module):
     def __init__(self, c_m: int):
         super().__init__()
         self.linear = nn.Linear(c_m, 1)
+        
+        # Initialize bias to 5.0 so that initial sigmoid(logit) ≈ 0.99
+        # This makes the model initially use ~99% original Evoformer
+        # and gradually learn to trust replacement blocks during training
+        self.linear.bias.data.fill_(5.0)
         
     def forward(self, msa_representation):
         """

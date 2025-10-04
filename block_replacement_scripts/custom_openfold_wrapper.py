@@ -51,43 +51,51 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
             config: Model configuration
             adaptive_config_path: Path to adaptive training config
             learning_rate: Learning rate for training
+            
+        Note: Adaptive blocks are applied AFTER weight loading in on_fit_start()
         """
         
-        # Don't call super().__init__ yet - we need to handle model creation differently
-        pl.LightningModule.__init__(self)
+        # Call super().__init__ to create base model normally
+        # This ensures JAX/checkpoint loading works correctly
+        super().__init__(
+            config=config,
+            replace_block_index=None,  # No block replacement
+            replacement_hidden_dim=None,
+            learning_rate=learning_rate
+        )
         
-        self.config = config
-        self.model = AlphaFold(config)
-        self.is_multimer = self.config.globals.is_multimer
+        # Store adaptive config path for later
         self.adaptive_config_path = adaptive_config_path
-        self.learning_rate = learning_rate
         
-        # Adaptive training attributes
+        # Adaptive training attributes (will be set in on_fit_start)
         self.weight_predictors = {}
         self.replace_loss_scaler = 0.0
         self.is_adaptive_training = False
+        self.adaptive_setup_done = False
         
         # Structure logging attributes
         self.log_structure_every_k_epoch = 1  # Default to logging every epoch
         self.train_sample_batch = None
         self.val_sample_batch = None
+    
+    def on_fit_start(self):
+        """
+        Called when fit begins. This is where we apply adaptive blocks.
         
-        # Apply adaptive training if config provided
-        if adaptive_config_path and Path(adaptive_config_path).exists():
-            self._setup_adaptive_training()
-        
-        # Initialize loss and EMA
-        self.loss = AlphaFoldLoss(config.loss)
-        self.ema = ExponentialMovingAverage(
-            model=self.model, decay=config.ema.decay
-        )
-        
-        self.cached_weights = None
-        self.last_lr_step = -1
-        self._is_distributed = None
-        
-        # Save hyperparameters
-        self.save_hyperparameters()
+        This ensures:
+        1. Base model is created normally
+        2. JAX/checkpoint weights are loaded correctly
+        3. THEN adaptive blocks replace the original Evoformer blocks
+        """
+        if self.adaptive_config_path and not self.adaptive_setup_done:
+            if Path(self.adaptive_config_path).exists():
+                print("\n" + "=" * 80)
+                print("Applying Adaptive Training Modifications (AFTER weight loading)")
+                print("=" * 80)
+                self._setup_adaptive_training()
+                self.adaptive_setup_done = True
+            else:
+                print(f"Warning: Adaptive config not found: {self.adaptive_config_path}")
     
     def _setup_adaptive_training(self):
         """Setup adaptive training by loading pre-trained blocks and creating weight predictors"""

@@ -247,8 +247,6 @@ def run_adaptive_training(args):
             config['grad_accum_steps'] = args.grad_accum_steps
         if 'log_structure_every_k_epoch' in provided_args and args.log_structure_every_k_epoch is not None:
             config['log_structure_every_k_epoch'] = args.log_structure_every_k_epoch
-        if 'plddt_loss_weight' in provided_args and args.plddt_loss_weight is not None:
-            config['plddt_loss_weight'] = args.plddt_loss_weight
         if 'wandb' in provided_args and args.wandb is not None:
             config['wandb'] = args.wandb
         if 'wandb_project' in provided_args and args.wandb_project is not None:
@@ -274,7 +272,6 @@ def run_adaptive_training(args):
             'validation_fraction': args.validation_fraction,
             'grad_accum_steps': args.grad_accum_steps,
             'log_structure_every_k_epoch': args.log_structure_every_k_epoch,
-            'plddt_loss_weight': args.plddt_loss_weight if args.plddt_loss_weight is not None else 0.1,
             'wandb': args.wandb,
             'wandb_project': args.wandb_project,
             'wandb_entity': args.wandb_entity,
@@ -385,11 +382,11 @@ def run_adaptive_training(args):
         "--enable_single_seq_mode",      # No MSAs or templates
         
         # Load pre-trained weights
-        "--resume_from_ckpt", str(checkpoint_path),
+        "--resume_from_jax_params" if str(checkpoint_path).endswith(".npz") else "--resume_from_ckpt", str(checkpoint_path),
         "--resume_model_weights_only", "True",
         
         # Training configuration  
-        "--config_preset", "finetuning_ptm",
+        "--config_preset", "finetuning_no_templ_ptm",  # Use no-template preset for single seq mode
         "--max_epochs", str(config['max_epochs']),
         "--train_epoch_len", str(config.get('train_epoch_len', 1000)),
         "--learning_rate", str(config['learning_rate']),
@@ -482,7 +479,7 @@ def create_default_config():
         # Data paths (relative to home directory)
         'csv_path': 'data/af2rank_single/af2rank_single_set_single_tms_07.csv',
         'pdb_dir': 'data/af2rank_single/pdb',
-        'weights_path': 'openfold/openfold/resources/openfold_params/finetuning_ptm_2.pt',
+        'weights_path': 'openfold/openfold/resources/openfold_params/finetuning_no_templ_ptm_1.pt',
         'trained_models_dir': 'AFdistill/pretrain_full',
         'output_dir': 'AFdistill/adaptive_block_1-46',
         
@@ -500,7 +497,6 @@ def create_default_config():
         'num_workers': 2,
         'grad_accum_steps': 2,  # Gradient accumulation steps
         'log_structure_every_k_epoch': 1,  # Log structure every k epochs (0 = disabled)
-        'plddt_loss_weight': 0.1,  # pLDDT loss weight (default: 0.01, increased to 0.1 for better gradient signal)
         
         # Wandb logging
         'wandb': True,
@@ -557,8 +553,6 @@ def main():
                        help="Override gradient accumulation steps from config file")
     parser.add_argument("--log_structure_every_k_epoch", type=int, default=None,
                        help="Override structure logging frequency from config file")
-    parser.add_argument("--plddt_loss_weight", type=float, default=None,
-                       help="Override pLDDT loss weight from config file (default: 0.01)")
     parser.add_argument("--max_template_date", type=str, default="2025-01-01",
                        help="Cutoff date for templates (YYYY-MM-DD)")
     

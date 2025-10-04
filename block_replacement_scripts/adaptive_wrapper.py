@@ -108,7 +108,9 @@ def compute_adaptive_replace_loss(
     # Compute mean weight across all blocks
     mean_weight = torch.stack(all_weights).mean()
     
-    # Penalize deviation from 0.0 (encouraging use of replacement Evoformer)
+    # Penalize high weights (encourage use of replacement blocks)
+    # weight=0 means full replacement, weight=1 means full original evoformer
+    # So we want to penalize high mean_weight values
     replace_loss = mean_weight
     
     return replace_loss * replace_loss_scaler

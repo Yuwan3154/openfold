@@ -373,34 +373,16 @@ def main(args):
         config.data.common.max_msa_clusters = 1
         config.data.train.max_extra_msa = 1
         config.data.train.max_msa_clusters = 1
-        # Keep template MODEL enabled if using a ptm checkpoint (for weight compatibility)
-        # But disable template DATA usage for single sequence mode
-        if args.resume_from_ckpt and "ptm" in args.resume_from_ckpt:
-            print("Keeping template model enabled due to ptm checkpoint usage")
-            config.model.template.enabled = True
-            # But disable template data usage for single sequence mode
-            config.data.common.use_templates = False
-            config.data.common.use_template_torsion_angles = False
-            print("Disabled template data usage for single sequence mode")
-        else:
-            config.model.template.enabled = False
+        # Disable templates entirely for single sequence mode
+        # (Use finetuning_no_templ_ptm preset with .pt weights instead of JAX .npz)
+        config.model.template.enabled = False
+        config.data.common.use_templates = False
+        config.data.common.use_template_torsion_angles = False
         # Disable MSA-specific losses for single sequence training
         print("Disabling masked_msa loss for single sequence mode")
         config.loss.masked_msa.weight = 0.0
         # Reduce some computational requirements
         config.data.train.crop_size = min(config.data.train.crop_size, 256)
-    
-    # Apply plddt_loss_weight override from adaptive config if provided
-    adaptive_config_path = getattr(args, 'adaptive_config_path', None)
-    if adaptive_config_path:
-        import json
-        with open(adaptive_config_path, 'r') as f:
-            adaptive_config = json.load(f)
-        
-        if 'plddt_loss_weight' in adaptive_config:
-            plddt_weight = adaptive_config['plddt_loss_weight']
-            config.loss.plddt_loss.weight = plddt_weight
-            print(f"Overriding plddt_loss weight: 0.01 → {plddt_weight}")
 
     # Use AdaptiveOpenFoldWrapper if adaptive_config_path is provided
     adaptive_config_path = getattr(args, 'adaptive_config_path', None)
