@@ -74,6 +74,7 @@ class AdaptiveEvoformerBlock(nn.Module):
         block_idx: int,
     ):
         super().__init__()
+        # Properly register submodules so they appear in state_dict
         self.original_block = original_block
         self.replacement_block = replacement_block
         self.weight_predictor = weight_predictor
@@ -85,6 +86,10 @@ class AdaptiveEvoformerBlock(nn.Module):
             
         # Keep replacement block parameters trainable (we want to fine-tune them)
         for param in self.replacement_block.parameters():
+            param.requires_grad = True
+            
+        # Keep weight predictor parameters trainable (this is what we're training!)
+        for param in self.weight_predictor.parameters():
             param.requires_grad = True
     
     def forward(
@@ -117,9 +122,14 @@ class AdaptiveEvoformerBlock(nn.Module):
             m_out: Weighted MSA output
             z_out: Weighted pair output
         """
-        # Store input for replacement block (it expects different signature)
-        m_input = m.clone() if self.training else m
-        z_input = z.clone() if self.training else z
+        # Store input for replacement block (avoid cloning if possible)
+        # Only clone if we're in training mode and need to preserve gradients
+        if self.training:
+            m_input = m.clone()
+            z_input = z.clone()
+        else:
+            m_input = m
+            z_input = z
         
         # 1. Run original Evoformer block
         m_orig, z_orig = self.original_block(
@@ -139,23 +149,33 @@ class AdaptiveEvoformerBlock(nn.Module):
         )
         
         # 2. Run replacement block (with simpler signature)
-        with torch.cuda.amp.autocast(enabled=False):
-            # Cast to float32 for replacement block if needed
-            m_replace_in = m_input.float()
-            z_replace_in = z_input.float()
-            msa_mask_replace = msa_mask.float() if msa_mask is not None else None
-            pair_mask_replace = pair_mask.float() if pair_mask is not None else None
-            
+        # Only convert to float32 if necessary (avoid unnecessary conversions)
+        if m_input.dtype != torch.float32 or z_input.dtype != torch.float32:
+            with torch.cuda.amp.autocast(enabled=False):
+                # Cast to float32 for replacement block if needed
+                m_replace_in = m_input.float()
+                z_replace_in = z_input.float()
+                msa_mask_replace = msa_mask.float() if msa_mask is not None else None
+                pair_mask_replace = pair_mask.float() if pair_mask is not None else None
+                
+                m_replace, z_replace = self.replacement_block(
+                    m_replace_in,
+                    z_replace_in,
+                    msa_mask_replace,
+                    pair_mask_replace
+                )
+                
+                # Cast back to original dtype
+                m_replace = m_replace.to(m_orig.dtype)
+                z_replace = z_replace.to(z_orig.dtype)
+        else:
+            # Already float32, no conversion needed
             m_replace, z_replace = self.replacement_block(
-                m_replace_in,
-                z_replace_in,
-                msa_mask_replace,
-                pair_mask_replace
+                m_input,
+                z_input,
+                msa_mask,
+                pair_mask
             )
-            
-            # Cast back to original dtype
-            m_replace = m_replace.to(m_orig.dtype)
-            z_replace = z_replace.to(z_orig.dtype)
         
         # 3. Predict adaptive weight from MSA representation
         weight = self.weight_predictor(m_input)  # [batch, 1]
@@ -304,6 +324,14 @@ def replace_evoformer_blocks_with_adaptive(
                 print(f"Warning: Block {block_idx} out of range, skipping")
             continue
             
+        # Get original block first to determine device
+        original_block = evoformer_stack.blocks[block_idx]
+        
+        # CRITICAL: Create a deep copy of the original block to preserve its weights
+        # This ensures the original block weights are preserved in the adaptive block
+        import copy
+        original_block_copy = copy.deepcopy(original_block)
+        
         # Load pre-trained replacement block
         checkpoint_path = trained_models_dir / f"block_{block_idx:02d}" / linear_type / "best_model.ckpt"
         replacement_block = load_pretrained_replacement_block(
@@ -314,16 +342,19 @@ def replace_evoformer_blocks_with_adaptive(
             hidden_dim=hidden_dim,
         )
         
-        # Create weight predictor for this block
+        # Move replacement block to same device as original block
+        device = next(original_block.parameters()).device
+        replacement_block = replacement_block.to(device)
+        original_block_copy = original_block_copy.to(device)
+        
+        # Create weight predictor for this block and move to device
         weight_predictor = AdaptiveWeightPredictor(c_m=c_m)
+        weight_predictor = weight_predictor.to(device)
         weight_predictors[block_idx] = weight_predictor
         
-        # Get original block
-        original_block = evoformer_stack.blocks[block_idx]
-        
-        # Create adaptive block
+        # Create adaptive block with the copied original block
         adaptive_block = AdaptiveEvoformerBlock(
-            original_block=original_block,
+            original_block=original_block_copy,
             replacement_block=replacement_block,
             weight_predictor=weight_predictor,
             block_idx=block_idx,

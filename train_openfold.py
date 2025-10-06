@@ -401,6 +401,7 @@ def main(args):
             learning_rate=getattr(args, 'learning_rate', 1e-3)
         )
 
+    # Handle checkpoint loading
     if args.resume_from_ckpt:
         if args.resume_model_weights_only:
             # Load the checkpoint
@@ -441,10 +442,44 @@ def main(args):
             model_module.resume_last_lr_step(last_global_step)
             logging.info("Successfully loaded last lr step...")
 
+    # Handle JAX weight loading with template workaround for single sequence mode
     if args.resume_from_jax_params:
-        model_module.load_from_jax(args.resume_from_jax_params)
-        logging.info(
-            f"Successfully loaded JAX parameters at {args.resume_from_jax_params}...")
+        if args.enable_single_seq_mode:
+            print("JAX loading with template workaround for single sequence mode...")
+            # Temporarily enable templates for JAX loading
+            original_template_enabled = config.model.template.enabled
+            config.model.template.enabled = True
+            
+            # Recreate model with templates enabled for JAX loading
+            if adaptive_config_path and ADAPTIVE_WRAPPER_AVAILABLE:
+                model_module = AdaptiveOpenFoldWrapper(
+                    config, 
+                    adaptive_config_path=adaptive_config_path,
+                    learning_rate=getattr(args, 'learning_rate', 1e-3)
+                )
+            else:
+                model_module = OpenFoldWrapper(
+                    config, 
+                    replace_block_index=getattr(args, 'replace_block_index', None),
+                    replacement_hidden_dim=getattr(args, 'replacement_hidden_dim', None),
+                    learning_rate=getattr(args, 'learning_rate', 1e-3)
+                )
+            
+            # Load JAX weights
+            model_module.load_from_jax(args.resume_from_jax_params)
+            logging.info(f"Successfully loaded JAX parameters at {args.resume_from_jax_params}...")
+            
+            # Disable templates again and remove template embedder
+            config.model.template.enabled = False
+            if hasattr(model_module.model, 'template_embedder'):
+                delattr(model_module.model, 'template_embedder')
+                print("Removed template_embedder from model after JAX loading")
+            
+            print("JAX loading completed - templates disabled for single sequence training")
+        else:
+            # Normal JAX loading when templates are enabled
+            model_module.load_from_jax(args.resume_from_jax_params)
+            logging.info(f"Successfully loaded JAX parameters at {args.resume_from_jax_params}...")
 
     # TorchScript components of the model
     if (args.script_modules):

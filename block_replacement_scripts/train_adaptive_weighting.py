@@ -182,7 +182,7 @@ def split_chains_for_validation(chain_list, val_fraction, output_dir, seed=42):
     return train_chains, val_chains, train_list_path, val_list_path
 
 
-def create_adaptive_training_command_file(output_dir, trained_models_dir, linear_type, replace_loss_scaler, log_structure_every_k_epoch=1):
+def create_adaptive_training_command_file(output_dir, trained_models_dir, linear_type, replace_loss_scaler, log_structure_every_k_epoch=1, disable_per_block_logging=False):
     """Create the adaptive training command file for custom loading"""
     adaptive_cmd_file = output_dir / "adaptive_training_cmd.json"
     
@@ -191,6 +191,7 @@ def create_adaptive_training_command_file(output_dir, trained_models_dir, linear
         "linear_type": linear_type,
         "replace_loss_scaler": replace_loss_scaler,
         "log_structure_every_k_epoch": log_structure_every_k_epoch,
+        "disable_per_block_logging": disable_per_block_logging,
         "adaptive_training": True
     }
     
@@ -247,6 +248,8 @@ def run_adaptive_training(args):
             config['grad_accum_steps'] = args.grad_accum_steps
         if 'log_structure_every_k_epoch' in provided_args and args.log_structure_every_k_epoch is not None:
             config['log_structure_every_k_epoch'] = args.log_structure_every_k_epoch
+        if 'disable_per_block_logging' in provided_args and args.disable_per_block_logging is not None:
+            config['disable_per_block_logging'] = args.disable_per_block_logging
         if 'wandb' in provided_args and args.wandb is not None:
             config['wandb'] = args.wandb
         if 'wandb_project' in provided_args and args.wandb_project is not None:
@@ -360,7 +363,8 @@ def run_adaptive_training(args):
         trained_models_dir,
         config['linear_type'],
         config['replace_loss_scaler'],
-        config.get('log_structure_every_k_epoch', 1)
+        config.get('log_structure_every_k_epoch', 1),
+        config.get('disable_per_block_logging', False)
     )
     print(f"Adaptive training config saved to: {adaptive_cmd_file}")
     print()
@@ -459,13 +463,17 @@ def run_adaptive_training(args):
     print("6. Starting adaptive training...")
     print("=" * 60)
     
-    # Set environment to restrict to requested number of GPUs
+    # Set environment to restrict to requested number of GPUs and force gloo backend
     env = os.environ.copy()
     if config.get('gpus', args.gpus) == 1:
         # For single GPU training, set CUDA_VISIBLE_DEVICES to first GPU only
         # This prevents PyTorch Lightning from auto-detecting multiple GPUs
         env['CUDA_VISIBLE_DEVICES'] = '0'
         print("Setting CUDA_VISIBLE_DEVICES=0 for single GPU training")
+    
+    # Force gloo backend via environment variable
+    env['PL_TORCH_DISTRIBUTED_BACKEND'] = 'gloo'
+    print("Setting PL_TORCH_DISTRIBUTED_BACKEND=gloo to force gloo backend")
     
     # Execute the training command
     result = subprocess.run(cmd, check=True, env=env)
@@ -479,7 +487,7 @@ def create_default_config():
         # Data paths (relative to home directory)
         'csv_path': 'data/af2rank_single/af2rank_single_set_single_tms_07.csv',
         'pdb_dir': 'data/af2rank_single/pdb',
-        'weights_path': 'openfold/openfold/resources/openfold_params/finetuning_no_templ_ptm_1.pt',
+        'weights_path': 'openfold/openfold/resources/openfold_params/finetuning_ptm_2.pt',
         'trained_models_dir': 'AFdistill/pretrain_full',
         'output_dir': 'AFdistill/adaptive_block_1-46',
         
@@ -553,6 +561,8 @@ def main():
                        help="Override gradient accumulation steps from config file")
     parser.add_argument("--log_structure_every_k_epoch", type=int, default=None,
                        help="Override structure logging frequency from config file")
+    parser.add_argument("--disable_per_block_logging", action="store_true", default=False,
+                       help="Disable per-block weight logging for faster training")
     parser.add_argument("--max_template_date", type=str, default="2025-01-01",
                        help="Cutoff date for templates (YYYY-MM-DD)")
     

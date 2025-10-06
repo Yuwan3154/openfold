@@ -65,6 +65,7 @@ def setup_adaptive_training_model(
         'linear_type': adaptive_config['linear_type'],
         'num_adaptive_blocks': len(weight_predictors),
         'log_structure_every_k_epoch': adaptive_config.get('log_structure_every_k_epoch', 1),
+        'disable_per_block_logging': adaptive_config.get('disable_per_block_logging', False),
     }
     
     # Print is handled in wrapper

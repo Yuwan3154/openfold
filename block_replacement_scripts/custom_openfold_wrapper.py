@@ -77,6 +77,7 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
         self.log_structure_every_k_epoch = 1  # Default to logging every epoch
         self.train_sample_batch = None
         self.val_sample_batch = None
+        self.disable_per_block_logging = False  # Option to disable per-block logging for speed
     
     def on_fit_start(self):
         """
@@ -114,157 +115,71 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
         self.weight_predictors = training_info['weight_predictors']
         self.replace_loss_scaler = training_info['replace_loss_scaler']
         self.log_structure_every_k_epoch = training_info.get('log_structure_every_k_epoch', 1)
+        self.disable_per_block_logging = training_info.get('disable_per_block_logging', False)
         self.is_adaptive_training = True
         
         # Freeze all parameters except adaptive components
         trainable_params = freeze_model_except_adaptive_components(self.model)
         
+        # CRITICAL: Reinitialize EMA after model structure changed
+        # The EMA was created with the original model structure, but now we have adaptive blocks
+        # with different parameter names, so we need to recreate it
+        self.ema = ExponentialMovingAverage(
+            model=self.model, decay=self.config.ema.decay
+        )
+        
         total_params = sum(p.numel() for p in self.model.parameters())
         print(f"Successfully set up adaptive training with {len(self.weight_predictors)} blocks")
         print(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({trainable_params/total_params*100:.2f}%)")
     
-    def _compute_adaptive_metrics(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
-        """Compute adaptive training metrics for logging"""
+    def _compute_adaptive_metrics(self, batch: Dict[str, torch.Tensor], log_per_block: bool = False) -> Dict[str, float]:
+        """
+        Compute adaptive training metrics for logging.
+        
+        Args:
+            batch: Input batch
+            log_per_block: If True, log weights for each block (expensive). 
+                          If False, only log summary statistics (default).
+        """
         
         metrics = {}
         
         if not self.is_adaptive_training:
             return metrics
         
-        # Get MSA from batch - but skip if only msa_feat is available
-        # 'msa' has the full MSA representation (c_m=256), 'msa_feat' is just features (49 dims)
-        msa = None
-        if "msa" in batch:
-            msa = batch["msa"]
-        elif "msa_feat" in batch:
-            # Skip adaptive metrics computation if only msa_feat is available
-            return metrics
-        
-        if msa is None:
-            return metrics
-        
-        if self.weight_predictors:
-            with torch.no_grad():
-                # Collect weights for each block
-                block_weights = {}
-                for block_idx, predictor in self.weight_predictors.items():
-                    # Get weight prediction for this batch
-                    weight = predictor(msa).mean().item()
-                    block_weights[block_idx] = weight
-                    metrics[f"adaptive_weight_block_{block_idx}"] = weight
+        # Collect weights from adaptive blocks (computed during forward pass)
+        block_weights = {}
+        for block_idx, adaptive_block in self._get_adaptive_blocks():
+            if hasattr(adaptive_block, '_predicted_weights') and block_idx in adaptive_block._predicted_weights:
+                weight = adaptive_block._predicted_weights[block_idx].mean().item()
+                block_weights[block_idx] = weight
                 
-                # Compute mean weight
-                if block_weights:
-                    mean_weight = sum(block_weights.values()) / len(block_weights)
-                    metrics["mean_adaptive_weight"] = mean_weight
-                    
-                    # Compute weight statistics
-                    weights_list = list(block_weights.values())
-                    metrics["adaptive_weight_std"] = torch.std(torch.tensor(weights_list)).item()
-                    metrics["adaptive_weight_min"] = min(weights_list)
-                    metrics["adaptive_weight_max"] = max(weights_list)
+                # Only log per-block weights if explicitly requested (expensive for 46 blocks)
+                if log_per_block:
+                    metrics[f"adaptive_weight_block_{block_idx:02d}"] = weight
+        
+        # Compute summary statistics efficiently
+        if block_weights:
+            weights_list = list(block_weights.values())
+            metrics["mean_adaptive_weight"] = np.mean(weights_list)
+            metrics["std_adaptive_weight"] = np.std(weights_list)
+            metrics["min_adaptive_weight"] = np.min(weights_list)
+            metrics["max_adaptive_weight"] = np.max(weights_list)
         
         return metrics
     
-    def _convert_to_protein(self, batch: Dict[str, torch.Tensor], outputs: Dict[str, torch.Tensor]) -> str:
-        """Convert batch and outputs to a PDB string using BioPython (AFdiffusion approach)"""
-        
-        # Debug: Check for None values
-        if "final_atom_positions" not in outputs or outputs["final_atom_positions"] is None:
-            raise ValueError("final_atom_positions is missing or None in outputs")
-        if "all_atom_mask" not in batch or batch["all_atom_mask"] is None:
-            raise ValueError("all_atom_mask is missing or None in batch")
-        if "aatype" not in batch or batch["aatype"] is None:
-            raise ValueError("aatype is missing or None in batch")
-        
-        # Import BioPython components
-        from Bio.PDB import PDBIO, Structure, Model, Chain, Residue, Atom
-        import numpy as np
-        
-        # Extract atom positions and mask
-        atom_positions = outputs["final_atom_positions"]  # [batch, N_res, 37, 3]
-        atom_mask = batch["all_atom_mask"]  # [batch, N_res, 37]
-        aatype = batch["aatype"]  # [batch, N_res]
-        
-        # Take first sample from batch
-        atom_positions = atom_positions[0]  # [N_res, 37, 3]
-        atom_mask = atom_mask[0]  # [N_res, 37]
-        aatype = aatype[0]  # [N_res]
-        
-        # Convert to numpy
-        atom_positions = atom_positions.detach().cpu().numpy()
-        atom_mask = atom_mask.detach().cpu().numpy()
-        aatype = aatype.detach().cpu().numpy()
-        
-        # Extract CA atoms only (like AFdiffusion does)
-        ca_index = 1  # CA is at index 1 in the 37 atoms
-        ca_positions = atom_positions[:, ca_index, :]  # [N_res, 3]
-        
-        # Create BioPython structure
-        structure = Structure.Structure("predicted_structure")
-        model = Model.Model(0)
-        chain = Chain.Chain('A')
-        
-        for i, ca_coord in enumerate(ca_positions):
-            res_id = (' ', i, ' ')
-            residue = Residue.Residue(res_id, 'GLY', '')  # Using GLY as placeholder
-            
-            # Convert to numpy and flatten
-            coord_np = ca_coord.flatten()
-            
-            if coord_np.shape[0] != 3:
-                raise ValueError(f"Coordinate shape mismatch: expected (3,), got {coord_np.shape}")
-            
-            atom_CA = Atom.Atom('CA', coord_np, 1.0, 1.0, ' ', 'CA', i, 'C')
-            residue.add(atom_CA)
-            chain.add(residue)
-        
-        model.add(chain)
-        structure.add(model)
-        
-        # Convert to PDB string
-        io = PDBIO()
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.pdb', delete=False) as f:
-            io.set_structure(structure)
-            io.save(f)
-            temp_pdb_path = f.name
-        
-        # Read the PDB string
-        with open(temp_pdb_path, 'r') as f:
-            pdb_string = f.read()
-        
-        # Clean up
-        os.unlink(temp_pdb_path)
-        
-        return pdb_string
+    def _get_adaptive_blocks(self):
+        """Get all adaptive blocks from the model"""
+        adaptive_blocks = []
+        for block_idx, block in enumerate(self.model.evoformer.blocks):
+            if hasattr(block, 'weight_predictor'):  # This is an AdaptiveEvoformerBlock
+                adaptive_blocks.append((block_idx, block))
+        return adaptive_blocks
     
-    def _log_structure_to_wandb(self, batch: Dict[str, torch.Tensor], outputs: Dict[str, torch.Tensor], 
-                               phase: str, epoch: int):
-        """Log predicted structure to wandb as PDB file"""
-        
-        try:
-            # Convert to PDB string directly
-            pdb_string = self._convert_to_protein(batch, outputs)
-            
-            # Create temporary file
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.pdb', delete=False) as f:
-                f.write(pdb_string)
-                temp_pdb_path = f.name
-            
-            # Log to wandb using wandb.Molecule (like AFdiffusion)
-            if wandb.run is not None:
-                wandb.log({
-                    f"{phase}_predicted_structure": wandb.Molecule(temp_pdb_path)
-                })
-            
-            # Clean up temporary file
-            os.unlink(temp_pdb_path)
-            
-        except Exception as e:
-            print(f"Warning: Failed to log {phase} structure to wandb: {e}")
     
     def on_train_epoch_end(self):
         """Log training structure sample at end of epoch if enabled"""
+        from openfold.utils.tensor_utils import tensor_tree_map
         
         # Only log on rank 0
         if (self.trainer.is_global_zero and 
@@ -272,56 +187,140 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
             self.trainer.current_epoch % self.log_structure_every_k_epoch == 0 and
             self.train_sample_batch is not None):
             
-            # Get sample outputs for the stored batch
+            # Use EMA weights for structure prediction (consistent with validation)
+            cached_weights_temp = tensor_tree_map(
+                lambda t: t.detach().clone(), self.model.state_dict()
+            )
+            self.model.load_state_dict(self.ema.state_dict()["params"])
+            
+            # Run inference on stored batch to get structure
             with torch.no_grad():
-                # Filter out None values from the batch
-                filtered_batch = {k: v for k, v in self.train_sample_batch.items() if v is not None}
-                if filtered_batch:  # Only proceed if we have valid data
-                    # Additional check: ensure all values are tensors
-                    valid_batch = {}
-                    for k, v in filtered_batch.items():
-                        if torch.is_tensor(v) and v.numel() > 0:
-                            valid_batch[k] = v
-                    
-                    if valid_batch:  # Only proceed if we have valid tensors
-                        outputs = self(valid_batch)
-                        self._log_structure_to_wandb(
-                            valid_batch, outputs, "train", self.trainer.current_epoch
-                        )
+                outputs = self(self.train_sample_batch)
+            
+            # Restore training weights
+            self.model.load_state_dict(cached_weights_temp)
+            
+            # Convert to PDB and log to wandb
+            pdb_string = self._convert_to_pdb(self.train_sample_batch, outputs)
+            # Note: step parameter is ignored, kept for API compatibility
+            self._log_structure_to_wandb(pdb_string, "train_structure", None)
     
     def on_validation_epoch_end(self):
         """Log validation structure sample at end of epoch if enabled"""
         
-        # Only log on rank 0
+        # Structure logging happens BEFORE restoring weights (while still using EMA)
         if (self.trainer.is_global_zero and 
             self.log_structure_every_k_epoch > 0 and 
             self.trainer.current_epoch % self.log_structure_every_k_epoch == 0 and
             self.val_sample_batch is not None):
             
-            # Get sample outputs for the stored batch
+            # Run inference on stored batch to get structure (using EMA weights)
             with torch.no_grad():
-                # Filter out None values from the batch
-                filtered_batch = {k: v for k, v in self.val_sample_batch.items() if v is not None}
-                if filtered_batch:  # Only proceed if we have valid data
-                    # Additional check: ensure all values are tensors
-                    valid_batch = {}
-                    for k, v in filtered_batch.items():
-                        if torch.is_tensor(v) and v.numel() > 0:
-                            valid_batch[k] = v
-                    
-                    if valid_batch:  # Only proceed if we have valid tensors
-                        outputs = self(valid_batch)
-                        self._log_structure_to_wandb(
-                            valid_batch, outputs, "val", self.trainer.current_epoch
-                        )
+                outputs = self(self.val_sample_batch)
+            
+            # Convert to PDB and log to wandb
+            pdb_string = self._convert_to_pdb(self.val_sample_batch, outputs)
+            # Note: step parameter is ignored, kept for API compatibility
+            self._log_structure_to_wandb(pdb_string, "val_structure", None)
+        
+        # CRITICAL: Restore the model weights to normal (from parent class)
+        if self.cached_weights is not None:
+            self.model.load_state_dict(self.cached_weights)
+            self.cached_weights = None
+    
+    def _convert_to_pdb(self, batch, outputs):
+        """Convert model outputs to PDB string using OpenFold's protein module"""
+        import numpy as np
+        from openfold.utils.tensor_utils import tensor_tree_map
+        from openfold.np import protein, residue_constants
+        
+        # CRITICAL: Process batch and outputs correctly (same as official OpenFold)
+        # 1. Remove recycling dimension from batch: x[..., -1]
+        # 2. Remove batch dimension: x[0] (since batch_size=1 in training)
+        # 3. Outputs don't have recycling dimension, just remove batch dimension
+        def process_features(x):
+            if torch.is_tensor(x):
+                x_np = np.array(x.cpu())
+                # Handle different tensor shapes
+                if x.ndim >= 2:
+                    # Has both batch and recycling dimensions
+                    return x_np[..., -1][0]
+                elif x.ndim == 1:
+                    # Only batch dimension (no recycling)
+                    return x_np[0]
+                else:
+                    # Scalar
+                    return x_np
+            else:
+                return x
+        
+        def process_outputs(x):
+            if torch.is_tensor(x):
+                x_np = np.array(x.cpu())
+                # Remove batch dimension only (no recycling dimension in outputs)
+                if x.ndim >= 1:
+                    return x_np[0]
+                else:
+                    return x_np
+            else:
+                return x
+        
+        processed_feature_dict = tensor_tree_map(process_features, batch)
+        out = tensor_tree_map(process_outputs, outputs)
+        
+        # Get pLDDT from outputs
+        if "plddt" in out:
+            plddt = out["plddt"]
+        else:
+            # Fallback to dummy plddt if not available
+            seq_len = processed_feature_dict["aatype"].shape[0]
+            plddt = np.full(seq_len, 90.0)
+        
+        # Create pLDDT b-factors (same as official OpenFold)
+        plddt_b_factors = np.repeat(
+            plddt[..., None], residue_constants.atom_type_num, axis=-1
+        )
+        
+        # Create protein object using official OpenFold approach
+        unrelaxed_protein = protein.from_prediction(
+            features=processed_feature_dict,
+            result=out,
+            b_factors=plddt_b_factors,
+            remove_leading_feature_dimension=False,
+            remark="Adaptive training prediction",
+        )
+        
+        # Convert to PDB
+        pdb_string = protein.to_pdb(unrelaxed_protein)
+        
+        return pdb_string
+    
+    def _log_structure_to_wandb(self, pdb_string, name, step):
+        """Log structure to wandb using temporary file"""
+        import tempfile
+        import wandb
+        
+        # Create temporary PDB file
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.pdb', delete=False) as f:
+            f.write(pdb_string)
+            temp_pdb_path = f.name
+        
+        try:
+            # Log to wandb WITHOUT step parameter - let wandb use its internal counter
+            # This avoids conflicts with training/validation steps
+            wandb.log({name: wandb.Molecule(temp_pdb_path)})
+        finally:
+            # Clean up temporary file
+            import os
+            os.unlink(temp_pdb_path)
     
     def training_step(self, batch, batch_idx):
         """Extended training step that includes adaptive training loss"""
         
-        # Store first batch for structure logging (only on rank 0)
+        # Store first batch of each epoch for structure logging (only on rank 0)
+        # Update every epoch to show training progression
         if (self.trainer.is_global_zero and 
             self.log_structure_every_k_epoch > 0 and 
-            self.train_sample_batch is None and 
             batch_idx == 0):
             self.train_sample_batch = {k: v.clone() if torch.is_tensor(v) else v for k, v in batch.items() if v is not None}
         
@@ -368,11 +367,18 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
             loss_breakdown["replace_loss_scaled"] = scaled_replace_loss  # Scaled loss
             
             # Compute and log adaptive metrics
-            adaptive_metrics = self._compute_adaptive_metrics(batch)
-            for metric_name, value in adaptive_metrics.items():
-                self.log(f"train/{metric_name}", value, 
-                        on_step=True, on_epoch=True, 
-                        prog_bar=(metric_name == "mean_adaptive_weight"))
+            # Only compute adaptive metrics every 50 steps to reduce overhead significantly
+            if batch_idx % 50 == 0:
+                # Disable per-block logging if requested for speed
+                log_per_block = not self.disable_per_block_logging and (batch_idx % 200 == 0)
+                adaptive_metrics = self._compute_adaptive_metrics(batch, log_per_block=log_per_block)
+                for metric_name, value in adaptive_metrics.items():
+                    # Use sync_dist=True for distributed logging to avoid warnings
+                    sync_dist = self.trainer.world_size > 1 if hasattr(self.trainer, 'world_size') else False
+                    self.log(f"train/{metric_name}", value, 
+                            on_step=True, on_epoch=True, 
+                            prog_bar=(metric_name == "mean_adaptive_weight"),
+                            sync_dist=sync_dist)
         
         # Log losses
         self._log(loss_breakdown, batch, outputs, train=True)
@@ -382,10 +388,10 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
     def validation_step(self, batch, batch_idx):
         """Extended validation step with adaptive metrics and replace loss"""
         
-        # Store first batch for structure logging (only on rank 0)
+        # Store first batch of each epoch for structure logging (only on rank 0)
+        # Update every epoch to show validation progression
         if (self.trainer.is_global_zero and 
             self.log_structure_every_k_epoch > 0 and 
-            self.val_sample_batch is None and 
             batch_idx == 0):
             self.val_sample_batch = {k: v.clone() if torch.is_tensor(v) else v for k, v in batch.items() if v is not None}
         
@@ -438,11 +444,18 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
             loss_breakdown["replace_loss_scaled"] = scaled_replace_loss  # Scaled loss
             
             # Compute and log adaptive metrics
-            adaptive_metrics = self._compute_adaptive_metrics(batch)
-            for metric_name, value in adaptive_metrics.items():
-                self.log(f"val/{metric_name}", value,
-                        on_step=False, on_epoch=True,
-                        prog_bar=(metric_name == "mean_adaptive_weight"))
+            # For validation, only compute on first batch to minimize overhead
+            if batch_idx == 0:
+                # Disable per-block logging if requested for speed
+                log_per_block = not self.disable_per_block_logging
+                adaptive_metrics = self._compute_adaptive_metrics(batch, log_per_block=log_per_block)
+                for metric_name, value in adaptive_metrics.items():
+                    # Use sync_dist=True for distributed logging to avoid warnings
+                    sync_dist = self.trainer.world_size > 1 if hasattr(self.trainer, 'world_size') else False
+                    self.log(f"val/{metric_name}", value,
+                            on_step=False, on_epoch=True,
+                            prog_bar=(metric_name == "mean_adaptive_weight"),
+                            sync_dist=sync_dist)
 
         # Log losses (same as training)
         self._log(loss_breakdown, batch, outputs, train=False)
