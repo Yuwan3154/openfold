@@ -13,6 +13,7 @@ import os
 import sys
 import torch
 import pytorch_lightning as pl
+from pytorch_lightning.utilities.rank_zero import rank_zero_info
 from pathlib import Path
 from typing import Optional, Dict, Any
 import tempfile
@@ -28,6 +29,8 @@ from openfold.utils.exponential_moving_average import ExponentialMovingAverage
 from openfold.utils.tensor_utils import tensor_tree_map
 from openfold.np import protein
 from openfold.np import residue_constants
+from openfold.utils.multi_chain_permutation import multi_chain_permutation_align
+from openfold.utils.lr_schedulers import AlphaFoldLRScheduler
 
 # Import adaptive training utilities
 from .adaptive_wrapper import (
@@ -72,6 +75,7 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
         self.replace_loss_scaler = 0.0
         self.is_adaptive_training = False
         self.adaptive_setup_done = False
+        self.optimizer_configured = False
         
         # Structure logging attributes
         self.log_structure_every_k_epoch = 1  # Default to logging every epoch
@@ -88,21 +92,22 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
         2. JAX/checkpoint weights are loaded correctly
         3. THEN adaptive blocks replace the original Evoformer blocks
         """
+
         if self.adaptive_config_path and not self.adaptive_setup_done:
             if Path(self.adaptive_config_path).exists():
-                print("\n" + "=" * 80)
-                print("Applying Adaptive Training Modifications (AFTER weight loading)")
-                print("=" * 80)
+                rank_zero_info("\n" + "=" * 80)
+                rank_zero_info("Applying Adaptive Training Modifications (AFTER weight loading)")
+                rank_zero_info("=" * 80)
                 self._setup_adaptive_training()
                 self.adaptive_setup_done = True
             else:
-                print(f"Warning: Adaptive config not found: {self.adaptive_config_path}")
+                rank_zero_info(f"Warning: Adaptive config not found: {self.adaptive_config_path}")
     
     def _setup_adaptive_training(self):
         """Setup adaptive training by loading pre-trained blocks and creating weight predictors"""
         
-        # Note: trainer is not available during __init__, prints will be done on_fit_start
-        print("\n=== Adaptive Training Mode ===")
+        # Note: trainer is not available during __init__, rank_zero_infos will be done on_fit_start
+        rank_zero_info("\n=== Adaptive Training Mode ===")
         
         # Setup adaptive training
         self.model, training_info = setup_adaptive_training_model(
@@ -129,8 +134,41 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
         )
         
         total_params = sum(p.numel() for p in self.model.parameters())
-        print(f"Successfully set up adaptive training with {len(self.weight_predictors)} blocks")
-        print(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({trainable_params/total_params*100:.2f}%)")
+        rank_zero_info(f"Successfully set up adaptive training with {len(self.weight_predictors)} blocks")
+        rank_zero_info(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({trainable_params/total_params*100:.2f}%)")
+        
+        # CRITICAL: Reconfigure optimizer after adaptive blocks are applied
+        self._reconfigure_optimizer()
+    
+    def _reconfigure_optimizer(self):
+        """Reconfigure optimizer after adaptive blocks are applied"""
+
+        if not hasattr(self, 'trainer') or self.trainer is None:
+            return
+            
+        # Get the current optimizer from trainer
+        if hasattr(self.trainer, 'optimizers') and self.trainer.optimizers:
+            # Create new optimizer with correct parameters
+            params_to_optimize = [p for p in self.model.parameters() if p.requires_grad]
+            new_optimizer = torch.optim.Adam(
+                params_to_optimize,
+                lr=self.learning_rate,
+                eps=1e-5
+            )
+            
+            # Replace optimizer in trainer
+            self.trainer.optimizers = [new_optimizer]
+    
+    def training_step(self, batch, batch_idx):
+        """Override training step to ensure optimizer is reconfigured for adaptive training"""
+
+        # Ensure optimizer is reconfigured if needed
+        if self.is_adaptive_training and not self.optimizer_configured:
+            self._reconfigure_optimizer()
+            self.optimizer_configured = True
+        
+        # Call parent training step
+        return super().training_step(batch, batch_idx)
     
     def _compute_adaptive_metrics(self, batch: Dict[str, torch.Tensor], log_per_block: bool = False) -> Dict[str, float]:
         """
@@ -170,6 +208,7 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
     
     def _get_adaptive_blocks(self):
         """Get all adaptive blocks from the model"""
+
         adaptive_blocks = []
         for block_idx, block in enumerate(self.model.evoformer.blocks):
             if hasattr(block, 'weight_predictor'):  # This is an AdaptiveEvoformerBlock
@@ -179,8 +218,7 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
     
     def on_train_epoch_end(self):
         """Log training structure sample at end of epoch if enabled"""
-        from openfold.utils.tensor_utils import tensor_tree_map
-        
+
         # Only log on rank 0
         if (self.trainer.is_global_zero and 
             self.log_structure_every_k_epoch > 0 and 
@@ -207,7 +245,7 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
     
     def on_validation_epoch_end(self):
         """Log validation structure sample at end of epoch if enabled"""
-        
+
         # Structure logging happens BEFORE restoring weights (while still using EMA)
         if (self.trainer.is_global_zero and 
             self.log_structure_every_k_epoch > 0 and 
@@ -230,14 +268,11 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
     
     def _convert_to_pdb(self, batch, outputs):
         """Convert model outputs to PDB string using OpenFold's protein module"""
-        import numpy as np
-        from openfold.utils.tensor_utils import tensor_tree_map
-        from openfold.np import protein, residue_constants
-        
         # CRITICAL: Process batch and outputs correctly (same as official OpenFold)
         # 1. Remove recycling dimension from batch: x[..., -1]
         # 2. Remove batch dimension: x[0] (since batch_size=1 in training)
         # 3. Outputs don't have recycling dimension, just remove batch dimension
+
         def process_features(x):
             if torch.is_tensor(x):
                 x_np = np.array(x.cpu())
@@ -297,9 +332,7 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
     
     def _log_structure_to_wandb(self, pdb_string, name, step):
         """Log structure to wandb using temporary file"""
-        import tempfile
-        import wandb
-        
+
         # Create temporary PDB file
         with tempfile.NamedTemporaryFile(mode='w', suffix='.pdb', delete=False) as f:
             f.write(pdb_string)
@@ -311,17 +344,16 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
             wandb.log({name: wandb.Molecule(temp_pdb_path)})
         finally:
             # Clean up temporary file
-            import os
             os.unlink(temp_pdb_path)
     
     def training_step(self, batch, batch_idx):
         """Extended training step that includes adaptive training loss"""
         
-        # Store first batch of each epoch for structure logging (only on rank 0)
-        # Update every epoch to show training progression
+        # Store a different batch each epoch for structure logging (only on rank 0)
+        # Cycle through training batches to show different proteins across epochs
         if (self.trainer.is_global_zero and 
             self.log_structure_every_k_epoch > 0 and 
-            batch_idx == 0):
+            batch_idx == (self.trainer.current_epoch % 8)):  # Cycle through batches 0-7 (8 training chains)
             self.train_sample_batch = {k: v.clone() if torch.is_tensor(v) else v for k, v in batch.items() if v is not None}
         
         # Run standard training step
@@ -337,7 +369,6 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
         batch = {k: v[..., -1] if torch.is_tensor(v) else v for k, v in batch.items()}
         
         if self.is_multimer:
-            from openfold.utils.multi_chain_permutation import multi_chain_permutation_align
             batch = multi_chain_permutation_align(
                 out=outputs,
                 features=batch,
@@ -387,16 +418,18 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
     
     def validation_step(self, batch, batch_idx):
         """Extended validation step with adaptive metrics and replace loss"""
-        
-        # Store first batch of each epoch for structure logging (only on rank 0)
-        # Update every epoch to show validation progression
+
+        # Store a different batch each epoch for structure logging (only on rank 0)
+        # Cycle through validation batches to show different proteins across epochs
         if (self.trainer.is_global_zero and 
             self.log_structure_every_k_epoch > 0 and 
-            batch_idx == 0):
+            batch_idx == (self.trainer.current_epoch % 6)):  # Cycle through batches 0-5
             self.val_sample_batch = {k: v.clone() if torch.is_tensor(v) else v for k, v in batch.items() if v is not None}
         
         # At the start of validation, load the EMA weights
         if (self.cached_weights is None):
+            if self.trainer.is_global_zero:
+                rank_zero_info(f"  Loading EMA weights (first validation batch of epoch)")
             # model.state_dict() contains references to model weights rather
             # than copies. Therefore, we need to clone them before calling
             # load_state_dict().
@@ -404,6 +437,9 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
             self.cached_weights = tensor_tree_map(
                 clone_param, self.model.state_dict())
             self.model.load_state_dict(self.ema.state_dict()["params"])
+        else:
+            if self.trainer.is_global_zero and batch_idx == 0:
+                rank_zero_info(f"  EMA weights already loaded (cached_weights is not None)")
 
         ground_truth = batch.pop('gt_features', None)
 
@@ -414,7 +450,6 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
         batch["use_clamped_fape"] = 0.
 
         if self.is_multimer:
-            from openfold.utils.multi_chain_permutation import multi_chain_permutation_align
             batch = multi_chain_permutation_align(
                 out=outputs,
                 features=batch,
@@ -425,7 +460,7 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
         loss, loss_breakdown = self.loss(
             outputs, batch, _return_breakdown=True
         )
-        
+
         # Add adaptive training loss if applicable (same as training)
         if self.is_adaptive_training:
             # Compute raw replace loss (unscaled)
@@ -462,6 +497,12 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
     
     def configure_optimizers(self, learning_rate: float = None, eps: float = 1e-5):
         """Configure optimizer with special handling for adaptive training"""
+        
+        # For adaptive training, defer optimizer configuration until after adaptive blocks are applied
+        if self.adaptive_config_path and not self.adaptive_setup_done:
+            # Return a placeholder optimizer that will be replaced later
+            placeholder_params = [p for p in self.model.parameters() if p.requires_grad]
+            return torch.optim.Adam(placeholder_params, lr=1e-3)
         
         # Use learning rate from args if provided
         if learning_rate is None:
@@ -504,7 +545,6 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
             }
         else:
             # Use standard AlphaFold scheduler
-            from openfold.utils.lr_schedulers import AlphaFoldLRScheduler
             lr_scheduler = AlphaFoldLRScheduler(
                 optimizer,
                 last_epoch=self.last_lr_step
