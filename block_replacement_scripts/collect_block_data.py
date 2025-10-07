@@ -51,8 +51,7 @@ class EvoformerBlockDataCollector:
         self.weights_path = self.home_dir / args.weights_path
         
         # Create output directories
-        self.data_dir = self.output_dir / "block_data"
-        os.makedirs(self.data_dir, exist_ok=True)
+        os.makedirs(self.output_dir, exist_ok=True)
         
         # Data storage (no hooks needed)
         
@@ -323,7 +322,7 @@ _atom_site.pdbx_PDB_model_num 1
         
         # Check if at least one block file exists for this protein
         for block_idx in range(1, 47):  # Skip first and last blocks
-            block_dir = self.output_dir / "block_data" / f"block_{block_idx:02d}" / split
+            block_dir = self.output_dir / f"block_{block_idx:02d}" / split
             pt_file = block_dir / f"{chain_id}.pt"
             pkl_file = block_dir / f"{chain_id}.pkl"  # Backward compatibility
             
@@ -354,7 +353,7 @@ _atom_site.pdbx_PDB_model_num 1
                 continue  # Skip if this block wasn't captured
             
             # Create block-specific directory
-            block_dir = self.data_dir / f"block_{block_idx:02d}" / split
+            block_dir = self.output_dir / f"block_{block_idx:02d}" / split
             os.makedirs(block_dir, exist_ok=True)
             
             # Get the block outputs (tuple of m, z)
@@ -406,14 +405,14 @@ _atom_site.pdbx_PDB_model_num 1
             "config": "model_2_ptm"
         }
         
-        with open(self.data_dir / "metadata.json", 'w') as f:
+        with open(self.output_dir / "metadata.json", 'w') as f:
             json.dump(metadata, f, indent=2)
         
         # Create summary
         summary = []
         for block_idx in range(48):
-            train_dir = self.data_dir / f"block_{block_idx:02d}" / "train"
-            val_dir = self.data_dir / f"block_{block_idx:02d}" / "val"
+            train_dir = self.output_dir / f"block_{block_idx:02d}" / "train"
+            val_dir = self.output_dir / f"block_{block_idx:02d}" / "val"
             
             train_count = len(list(train_dir.glob("*.pkl"))) if train_dir.exists() else 0
             val_count = len(list(val_dir.glob("*.pkl"))) if val_dir.exists() else 0
@@ -425,14 +424,14 @@ _atom_site.pdbx_PDB_model_num 1
             })
         
         summary_df = pd.DataFrame(summary)
-        summary_df.to_csv(self.data_dir / "data_summary.csv", index=False)
+        summary_df.to_csv(self.output_dir / "data_summary.csv", index=False)
         
         print(f"\nData collection summary:")
         print(f"  Total blocks: 48")
         print(f"  Train proteins: {len(train_chains)}")
         print(f"  Val proteins: {len(val_chains)}")
-        print(f"  Data saved to: {self.data_dir}")
-        print(f"  Summary saved to: {self.data_dir / 'data_summary.csv'}")
+        print(f"  Data saved to: {self.output_dir}")
+        print(f"  Summary saved to: {self.output_dir / 'data_summary.csv'}")
 
 
 def main():
@@ -460,6 +459,11 @@ def main():
     parser.add_argument(
         "--max_proteins", type=int, default=None,
         help="Maximum number of proteins to process (None for all)"
+    )
+    parser.add_argument(
+        "--blocks", type=int, nargs="+", 
+        default=list(range(1, 47)),
+        help="Block indices to process (default: all blocks 1-46)"
     )
     
     args = parser.parse_args()

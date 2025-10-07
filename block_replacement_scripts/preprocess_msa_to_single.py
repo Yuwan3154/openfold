@@ -56,21 +56,20 @@ def process_single_file(input_file: Path, output_dir: Path):
     
     # Load original data
     data = torch.load(input_file, map_location='cpu')
-    
     # Extract single sequence (first sequence only)
+    # CRITICAL: Use .clone() to create new tensors, not views that reference original data
     processed_data = {
         'input': {
-            'm': data['input']['m'][0:1],  # Take only first sequence [1, n_res, c_m]
-            'z': data['input']['z']        # Pair representation is already single sequence
+            'm': data['input']['m'][0:1].clone(),  # Take only first sequence [1, n_res, c_m]
+            'z': data['input']['z'].clone()        # Pair representation is already single sequence
         },
         'output': {
-            'm': data['output']['m'][0:1],  # Take only first sequence [1, n_res, c_m]
-            'z': data['output']['z']        # Pair representation is already single sequence
+            'm': data['output']['m'][0:1].clone(),  # Take only first sequence [1, n_res, c_m]
+            'z': data['output']['z'].clone()        # Pair representation is already single sequence
         },
         'chain_id': data['chain_id'],
         'block_idx': data['block_idx']
     }
-    
     # Save processed data
     output_file = output_dir / input_file.name
     torch.save(processed_data, output_file)
@@ -82,13 +81,19 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
-    parser.add_argument("--input_dir", type=str, required=True,
-                       help="Input directory containing MSA data (relative to home directory)")
-    parser.add_argument("--output_dir", type=str, required=True,
-                       help="Output directory for single sequence data (relative to home directory)")
-    parser.add_argument("--blocks", type=int, nargs="+", 
-                       default=list(range(1, 47)),
-                       help="Block indices to process (default: all blocks 1-46)")
+    parser.add_argument(
+        "--input_dir", type=str, required=True,
+        help="Input directory containing MSA data (relative to home directory)"
+    )
+    parser.add_argument(
+        "--output_dir", type=str, required=True,
+        help="Output directory for single sequence data (relative to home directory)"
+    )
+    parser.add_argument(
+        "--blocks", type=int, nargs="+", 
+        default=list(range(1, 47)),
+        help="Block indices to process (default: all blocks 1-46)"
+    )
     
     args = parser.parse_args()
     

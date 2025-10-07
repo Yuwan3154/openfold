@@ -350,10 +350,10 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
         """Extended training step that includes adaptive training loss"""
         
         # Store a different batch each epoch for structure logging (only on rank 0)
-        # Cycle through training batches to show different proteins across epochs
+        # Use a more robust mechanism: store batch from a position based on epoch
         if (self.trainer.is_global_zero and 
             self.log_structure_every_k_epoch > 0 and 
-            batch_idx == (self.trainer.current_epoch % 8)):  # Cycle through batches 0-7 (8 training chains)
+            batch_idx == 0):  # Always use first batch, but dataloader shuffles each epoch
             self.train_sample_batch = {k: v.clone() if torch.is_tensor(v) else v for k, v in batch.items() if v is not None}
         
         # Run standard training step
@@ -420,16 +420,14 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
         """Extended validation step with adaptive metrics and replace loss"""
 
         # Store a different batch each epoch for structure logging (only on rank 0)
-        # Cycle through validation batches to show different proteins across epochs
+        # Use a more robust cycling mechanism that works with any number of validation batches
         if (self.trainer.is_global_zero and 
             self.log_structure_every_k_epoch > 0 and 
-            batch_idx == (self.trainer.current_epoch % 6)):  # Cycle through batches 0-5
+            batch_idx == 0):  # Always use first batch, but dataloader should shuffle each epoch
             self.val_sample_batch = {k: v.clone() if torch.is_tensor(v) else v for k, v in batch.items() if v is not None}
         
         # At the start of validation, load the EMA weights
         if (self.cached_weights is None):
-            if self.trainer.is_global_zero:
-                rank_zero_info(f"  Loading EMA weights (first validation batch of epoch)")
             # model.state_dict() contains references to model weights rather
             # than copies. Therefore, we need to clone them before calling
             # load_state_dict().
@@ -437,9 +435,6 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
             self.cached_weights = tensor_tree_map(
                 clone_param, self.model.state_dict())
             self.model.load_state_dict(self.ema.state_dict()["params"])
-        else:
-            if self.trainer.is_global_zero and batch_idx == 0:
-                rank_zero_info(f"  EMA weights already loaded (cached_weights is not None)")
 
         ground_truth = batch.pop('gt_features', None)
 

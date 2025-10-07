@@ -10,11 +10,12 @@ This module provides wrapper classes that:
 
 import torch
 import torch.nn as nn
+import sys
 from typing import Tuple, Optional, Dict, Any
 from pathlib import Path
+import copy
 
 # Import from parent directory
-import sys
 sys.path.append(str(Path(__file__).parent.parent))
 
 from openfold.model.primitives import Linear
@@ -271,7 +272,6 @@ def replace_evoformer_blocks_with_adaptive(
     c_z: int = 128,
     hidden_dim: Optional[int] = None,
     replace_blocks: Optional[list] = None,
-    verbose: bool = True,
 ) -> Tuple[nn.Module, Dict[int, AdaptiveWeightPredictor]]:
     """
     Replace specified Evoformer blocks with adaptive versions.
@@ -299,8 +299,6 @@ def replace_evoformer_blocks_with_adaptive(
                 available_blocks.append(block_idx)
     
     available_blocks.sort()
-    if verbose:
-        print(f"Found {len(available_blocks)} trained replacement blocks: {available_blocks}")
     
     # Determine which blocks to replace
     if replace_blocks is None:
@@ -308,9 +306,6 @@ def replace_evoformer_blocks_with_adaptive(
     else:
         # Filter to only available blocks
         replace_blocks = [b for b in replace_blocks if b in available_blocks]
-    
-    if verbose:
-        print(f"Replacing {len(replace_blocks)} blocks: {replace_blocks}")
     
     # Create weight predictors for each block
     weight_predictors = {}
@@ -320,8 +315,6 @@ def replace_evoformer_blocks_with_adaptive(
     
     for block_idx in replace_blocks:
         if block_idx >= len(evoformer_stack.blocks):
-            if verbose:
-                print(f"Warning: Block {block_idx} out of range, skipping")
             continue
             
         # Get original block first to determine device
@@ -329,7 +322,6 @@ def replace_evoformer_blocks_with_adaptive(
         
         # CRITICAL: Create a deep copy of the original block to preserve its weights
         # This ensures the original block weights are preserved in the adaptive block
-        import copy
         original_block_copy = copy.deepcopy(original_block)
         
         # Load pre-trained replacement block

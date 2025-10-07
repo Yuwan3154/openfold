@@ -70,11 +70,7 @@ class GPUTaskScheduler:
     def __init__(self, args):
         self.args = args
         self.home_dir = Path.home()
-        # Check if data_dir already contains block_data subdirectory
-        if (self.home_dir / args.data_dir / "block_data").exists():
-            self.data_dir = self.home_dir / args.data_dir / "block_data"
-        else:
-            self.data_dir = self.home_dir / args.data_dir
+        self.data_dir = self.home_dir / args.data_dir
         self.output_dir = self.home_dir / args.output_dir
         
         # Create output directory
