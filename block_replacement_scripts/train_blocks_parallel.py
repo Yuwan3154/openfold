@@ -147,6 +147,7 @@ class GPUTaskScheduler:
             "--max_epochs", str(self.args.max_epochs),
             "--learning_rate", str(self.args.learning_rate),
             "--weight_decay", str(self.args.weight_decay),
+            "--val_fraction", str(self.args.val_fraction),
             "--num_workers", str(self.args.num_workers),
             "--distributed_backend", str(self.args.distributed_backend),
         ]
@@ -484,6 +485,8 @@ def main():
                        help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=1e-4,
                        help="Weight decay")
+    parser.add_argument("--val_fraction", type=float, default=0.2,
+                       help="Fraction of data to use for validation (default: 0.2)")
     parser.add_argument("--num_workers", type=int, default=4,
                        help="Number of data loader workers")
     parser.add_argument("--distributed_backend", type=str, default="gloo",

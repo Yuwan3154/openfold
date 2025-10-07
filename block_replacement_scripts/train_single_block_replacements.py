@@ -135,32 +135,68 @@ class PaddingCollator:
 
 
 class BlockDataset(Dataset):
-    """Dataset for loading block input/output pairs"""
+    """Dataset for loading block input/output pairs with GPU preloading"""
     
-    def __init__(self, data_dir: Path, block_idx: int, split: str):
-        self.data_dir = data_dir / f"block_{block_idx:02d}" / split
-        self.files = list(self.data_dir.glob("*.pt")) if self.data_dir.exists() else []
+    def __init__(self, data_dir: Path, block_idx: int, split: str, val_fraction: float = 0.2, seed: int = 42, device: str = 'cuda'):
+        self.data_dir = data_dir / f"block_{block_idx:02d}"
+        all_files = list(self.data_dir.glob("*.pt")) if self.data_dir.exists() else []
+        
+        # Split files into train/val
+        import random
+        random.seed(seed)
+        random.shuffle(all_files)
+        
+        val_size = int(len(all_files) * val_fraction)
+        if split == "train":
+            self.files = all_files[val_size:]
+        elif split == "val":
+            self.files = all_files[:val_size]
+        else:
+            raise ValueError(f"Invalid split: {split}. Must be 'train' or 'val'")
+        
+        print(f"Block {block_idx:02d} {split}: {len(self.files)} files (val_fraction={val_fraction})")
+        
+        # Preload all data to GPU memory
+        self.device = device
+        self.data_cache = []
+        self._preload_data()
+        
+    def _preload_data(self):
+        """Preload all data files to GPU memory"""
+        print(f"  Preloading {len(self.files)} files to {self.device}...")
+        
+        total_memory = 0
+        for file_path in self.files:
+            # Load data from disk
+            data = torch.load(file_path, map_location='cpu')
+            
+            # Move tensors to GPU
+            gpu_data = {
+                "m_in": data["input"]["m"].to(self.device),
+                "z_in": data["input"]["z"].to(self.device),
+                "m_out": data["output"]["m"].to(self.device),
+                "z_out": data["output"]["z"].to(self.device),
+                "chain_id": data["chain_id"]
+            }
+            
+            # Estimate memory usage
+            for key, tensor in gpu_data.items():
+                if isinstance(tensor, torch.Tensor):
+                    total_memory += tensor.numel() * tensor.element_size()
+            
+            self.data_cache.append(gpu_data)
+        
+        # Convert to MB
+        memory_mb = total_memory / (1024 * 1024)
+        print(f"  Preloaded {len(self.data_cache)} files to {self.device}")
+        print(f"  Estimated GPU memory usage: {memory_mb:.1f} MB")
         
     def __len__(self):
-        return len(self.files)
+        return len(self.data_cache)
     
     def __getitem__(self, idx):
-        file_path = self.files[idx]
-        data = torch.load(file_path, map_location='cpu')
-        
-        # Extract input and output tensors
-        m_in = data["input"]["m"]  # MSA representation (now single sequence)
-        z_in = data["input"]["z"]  # Pair representation
-        m_out = data["output"]["m"]  # Target MSA output (now single sequence)
-        z_out = data["output"]["z"]  # Target pair output
-        
-        return {
-            "m_in": m_in,
-            "z_in": z_in, 
-            "m_out": m_out,
-            "z_out": z_out,
-            "chain_id": data["chain_id"]
-        }
+        # Return preloaded data directly (no disk I/O)
+        return self.data_cache[idx]
 
 
 class ReplacementBlockTrainer(pl.LightningModule):
@@ -357,11 +393,11 @@ class SingleBlockTrainingPipeline:
         print(f"  Linear types: {args.linear_types}")
         print()
 
-    def create_data_loaders(self, block_idx: int) -> Tuple[DataLoader, DataLoader]:
+    def create_data_loaders(self, block_idx: int, val_fraction: float = 0.2, device: str = 'cuda') -> Tuple[DataLoader, DataLoader]:
         """Create train and validation data loaders for a specific block"""
         
-        train_dataset = BlockDataset(self.data_dir, block_idx, "train")
-        val_dataset = BlockDataset(self.data_dir, block_idx, "val")
+        train_dataset = BlockDataset(self.data_dir, block_idx, "train", val_fraction=val_fraction, device=device)
+        val_dataset = BlockDataset(self.data_dir, block_idx, "val", val_fraction=val_fraction, device=device)
         
         if len(train_dataset) == 0 or len(val_dataset) == 0:
             return None, None
@@ -369,12 +405,15 @@ class SingleBlockTrainingPipeline:
         # Create padding collator for variable-length sequences
         collator = PaddingCollator()
         
+        # Use fewer workers since data is preloaded to GPU
+        num_workers = min(self.args.num_workers, 2) if device == 'cuda' else self.args.num_workers
+        
         train_loader = DataLoader(
             train_dataset,
             batch_size=self.args.batch_size,
             shuffle=True,
-            num_workers=self.args.num_workers,
-            pin_memory=True,
+            num_workers=num_workers,
+            pin_memory=(device == 'cpu'),  # Only pin memory for CPU data
             collate_fn=collator
         )
         
@@ -382,8 +421,8 @@ class SingleBlockTrainingPipeline:
             val_dataset,
             batch_size=self.args.batch_size,
             shuffle=False,
-            num_workers=self.args.num_workers,
-            pin_memory=True,
+            num_workers=num_workers,
+            pin_memory=(device == 'cpu'),  # Only pin memory for CPU data
             collate_fn=collator
         )
         
@@ -425,8 +464,9 @@ class SingleBlockTrainingPipeline:
         if existing_results is not None:
             return existing_results
         
-        # Create data loaders
-        train_loader, val_loader = self.create_data_loaders(block_idx)
+        # Create data loaders with GPU preloading
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        train_loader, val_loader = self.create_data_loaders(block_idx, val_fraction=self.args.val_fraction, device=device)
         
         if train_loader is None:
             print(f"  No data available for block {block_idx}, skipping...")
@@ -646,6 +686,8 @@ def main():
                        default=["full", "diagonal", "affine"],
                        choices=["full", "diagonal", "affine"],
                        help="Linear layer types to test")
+    parser.add_argument("--val_fraction", type=float, default=0.2,
+                       help="Fraction of data to use for validation (default: 0.2)")
     
     # Training parameters
     parser.add_argument("--hidden_dim", type=int, default=None,

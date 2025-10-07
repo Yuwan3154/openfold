@@ -156,8 +156,8 @@ _atom_site.pdbx_PDB_model_num 1
         return model
 
 
-    def _load_chain_list(self) -> Tuple[List[str], List[str]]:
-        """Load chain list and create train/val split"""
+    def _load_chain_list(self) -> List[str]:
+        """Load chain list without train/val split"""
         print("Loading chain list from CSV...")
         
         df = pd.read_csv(self.csv_path)
@@ -186,18 +186,9 @@ _atom_site.pdbx_PDB_model_num 1
             available_chains = available_chains[:self.args.max_proteins]
             print(f"  Limited to: {len(available_chains)} proteins")
         
-        # Create 80/20 train/val split
-        np.random.seed(42)
-        indices = np.random.permutation(len(available_chains))
-        split_idx = int(0.8 * len(available_chains))
+        print(f"  Total chains to process: {len(available_chains)}")
         
-        train_chains = [available_chains[i] for i in indices[:split_idx]]
-        val_chains = [available_chains[i] for i in indices[split_idx:]]
-        
-        print(f"  Train set: {len(train_chains)} proteins")
-        print(f"  Validation set: {len(val_chains)} proteins")
-        
-        return train_chains, val_chains
+        return available_chains
 
     def _create_features(self, chain_id: str) -> Dict[str, np.ndarray]:
         """Create features for a protein"""
@@ -267,14 +258,14 @@ _atom_site.pdbx_PDB_model_num 1
         model = self._load_model()
         
         try:
-            # Load chain lists
-            train_chains, val_chains = self._load_chain_list()
+            # Load chain list (no train/val split)
+            all_chains = self._load_chain_list()
             
-            # Process training data
-            print(f"\nProcessing training data ({len(train_chains)} proteins)...")
-            for i, chain_id in enumerate(tqdm(train_chains, desc="Training proteins")):
+            # Process all data
+            print(f"\nProcessing data ({len(all_chains)} proteins)...")
+            for i, chain_id in enumerate(tqdm(all_chains, desc="Processing proteins")):
                 # Check if data already exists for this protein
-                if self._check_protein_data_exists(chain_id, "train"):
+                if self._check_protein_data_exists(chain_id):
                     print(f"  ✅ Data already exists for {chain_id} - skipping")
                     continue
                 
@@ -283,26 +274,7 @@ _atom_site.pdbx_PDB_model_num 1
                 outputs = self._run_inference_with_hooks(model, features)
                 
                 # Save data for this protein
-                self._save_protein_data(chain_id, "train", outputs)
-                
-                # Clear GPU cache
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            
-            # Process validation data
-            print(f"\nProcessing validation data ({len(val_chains)} proteins)...")
-            for i, chain_id in enumerate(tqdm(val_chains, desc="Validation proteins")):
-                # Check if data already exists for this protein
-                if self._check_protein_data_exists(chain_id, "val"):
-                    print(f"  ✅ Data already exists for {chain_id} - skipping")
-                    continue
-                
-                # Create features and run inference
-                features = self._create_features(chain_id)
-                outputs = self._run_inference_with_hooks(model, features)
-                
-                # Save data for this protein
-                self._save_protein_data(chain_id, "val", outputs)
+                self._save_protein_data(chain_id, outputs)
                 
                 # Clear GPU cache
                 if torch.cuda.is_available():
@@ -315,14 +287,14 @@ _atom_site.pdbx_PDB_model_num 1
             pass
         
         # Save metadata
-        self._save_metadata(train_chains, val_chains)
+        self._save_metadata(all_chains)
 
-    def _check_protein_data_exists(self, chain_id: str, split: str) -> bool:
+    def _check_protein_data_exists(self, chain_id: str) -> bool:
         """Check if data has already been collected for this protein"""
         
         # Check if at least one block file exists for this protein
         for block_idx in range(1, 47):  # Skip first and last blocks
-            block_dir = self.output_dir / f"block_{block_idx:02d}" / split
+            block_dir = self.output_dir / f"block_{block_idx:02d}"
             pt_file = block_dir / f"{chain_id}.pt"
             pkl_file = block_dir / f"{chain_id}.pkl"  # Backward compatibility
             
@@ -331,7 +303,7 @@ _atom_site.pdbx_PDB_model_num 1
         
         return False
 
-    def _save_protein_data(self, chain_id: str, split: str, outputs: Dict[str, torch.Tensor]):
+    def _save_protein_data(self, chain_id: str, outputs: Dict[str, torch.Tensor]):
         """Save data for a single protein using built-in intermediate outputs"""
         
         # Extract recycle 0 data (we want only the first recycle)
@@ -353,7 +325,7 @@ _atom_site.pdbx_PDB_model_num 1
                 continue  # Skip if this block wasn't captured
             
             # Create block-specific directory
-            block_dir = self.output_dir / f"block_{block_idx:02d}" / split
+            block_dir = self.output_dir / f"block_{block_idx:02d}"
             os.makedirs(block_dir, exist_ok=True)
             
             # Get the block outputs (tuple of m, z)
@@ -394,12 +366,11 @@ _atom_site.pdbx_PDB_model_num 1
         
         print(f"    Saved data for {saved_blocks} blocks")
 
-    def _save_metadata(self, train_chains: List[str], val_chains: List[str]):
+    def _save_metadata(self, all_chains: List[str]):
         """Save metadata about the collected data"""
         
         metadata = {
-            "train_chains": train_chains,
-            "val_chains": val_chains,
+            "all_chains": all_chains,
             "total_blocks": 48,
             "weights_path": str(self.weights_path),
             "config": "model_2_ptm"
@@ -411,16 +382,13 @@ _atom_site.pdbx_PDB_model_num 1
         # Create summary
         summary = []
         for block_idx in range(48):
-            train_dir = self.output_dir / f"block_{block_idx:02d}" / "train"
-            val_dir = self.output_dir / f"block_{block_idx:02d}" / "val"
+            block_dir = self.output_dir / f"block_{block_idx:02d}"
             
-            train_count = len(list(train_dir.glob("*.pkl"))) if train_dir.exists() else 0
-            val_count = len(list(val_dir.glob("*.pkl"))) if val_dir.exists() else 0
+            sample_count = len(list(block_dir.glob("*.pt"))) if block_dir.exists() else 0
             
             summary.append({
                 "block_idx": block_idx,
-                "train_samples": train_count,
-                "val_samples": val_count
+                "total_samples": sample_count
             })
         
         summary_df = pd.DataFrame(summary)
@@ -428,8 +396,7 @@ _atom_site.pdbx_PDB_model_num 1
         
         print(f"\nData collection summary:")
         print(f"  Total blocks: 48")
-        print(f"  Train proteins: {len(train_chains)}")
-        print(f"  Val proteins: {len(val_chains)}")
+        print(f"  Total proteins: {len(all_chains)}")
         print(f"  Data saved to: {self.output_dir}")
         print(f"  Summary saved to: {self.output_dir / 'data_summary.csv'}")
 
