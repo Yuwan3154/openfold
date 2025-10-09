@@ -43,9 +43,10 @@ from .adaptive_wrapper import (
 class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
     """Extended OpenFoldWrapper with adaptive weighting training support"""
     
-    def __init__(self, config, 
+    def __init__(self, config,
                  adaptive_config_path=None,
                  learning_rate=1e-3,
+                 data_loading_strategy='preload_gpu',
                  **kwargs):
         """
         Initialize wrapper with adaptive training support.
@@ -81,7 +82,12 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
         self.log_structure_every_k_epoch = 1  # Default to logging every epoch
         self.train_sample_batch = None
         self.val_sample_batch = None
+        self.train_sample_chain_id = None
+        self.val_sample_chain_id = None
         self.disable_per_block_logging = False  # Option to disable per-block logging for speed
+
+        # Data loading strategy
+        self.data_loading_strategy = data_loading_strategy
     
     def on_fit_start(self):
         """
@@ -159,6 +165,36 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
             # Replace optimizer in trainer
             self.trainer.optimizers = [new_optimizer]
     
+    def _log_structure_to_wandb(self, pdb_string, name, step, ground_truth_pdb_path=None, chain_id=None):
+        """Log structure to wandb using temporary file"""
+
+        # Create temporary PDB file for prediction
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.pdb', delete=False) as f:
+            f.write(pdb_string)
+            temp_pdb_path = f.name
+
+        try:
+            # Log predicted structure to wandb
+            wandb.log({name: wandb.Molecule(temp_pdb_path)})
+
+            # Also log ground truth structure if available
+            if ground_truth_pdb_path and os.path.exists(ground_truth_pdb_path):
+                # Extract C-alpha only atoms from ground truth
+                ca_only_pdb = self._extrac_backbone_only_pdb(ground_truth_pdb_path, chain_id)
+                
+                if ca_only_pdb:
+                    try:
+                        # Create a unique name for ground truth
+                        gt_name = name.replace("structure", "ground_truth")
+                        wandb.log({gt_name: wandb.Molecule(ca_only_pdb)})
+                    finally:
+                        # Clean up temporary C-alpha file
+                        if os.path.exists(ca_only_pdb):
+                            os.unlink(ca_only_pdb)
+        finally:
+            # Clean up temporary prediction file
+            os.unlink(temp_pdb_path)
+
     def training_step(self, batch, batch_idx):
         """Override training step to ensure optimizer is reconfigured for adaptive training"""
 
@@ -240,8 +276,15 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
             
             # Convert to PDB and log to wandb
             pdb_string = self._convert_to_pdb(self.train_sample_batch, outputs)
+            # Find ground truth PDB path and log both predicted and ground truth structures
+            rank_zero_info(f"Train chain_id for structure logging: {self.train_sample_chain_id}")
+            ground_truth_pdb_path = self._find_ground_truth_pdb(self.train_sample_chain_id) if self.train_sample_chain_id else None
+            if ground_truth_pdb_path:
+                rank_zero_info(f"Found ground truth PDB: {ground_truth_pdb_path}")
+            else:
+                rank_zero_info("No ground truth PDB found for training structure")
             # Note: step parameter is ignored, kept for API compatibility
-            self._log_structure_to_wandb(pdb_string, "train_structure", None)
+            self._log_structure_to_wandb(pdb_string, "train_structure", None, ground_truth_pdb_path, self.train_sample_chain_id)
     
     def on_validation_epoch_end(self):
         """Log validation structure sample at end of epoch if enabled"""
@@ -258,14 +301,31 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
             
             # Convert to PDB and log to wandb
             pdb_string = self._convert_to_pdb(self.val_sample_batch, outputs)
+            # Find ground truth PDB path and log both predicted and ground truth structures
+            rank_zero_info(f"Val chain_id for structure logging: {self.val_sample_chain_id}")
+            ground_truth_pdb_path = self._find_ground_truth_pdb(self.val_sample_chain_id) if self.val_sample_chain_id else None
+            if ground_truth_pdb_path:
+                rank_zero_info(f"Found ground truth PDB: {ground_truth_pdb_path}")
+            else:
+                rank_zero_info("No ground truth PDB found for validation structure")
             # Note: step parameter is ignored, kept for API compatibility
-            self._log_structure_to_wandb(pdb_string, "val_structure", None)
-        
+            self._log_structure_to_wandb(pdb_string, "val_structure", None, ground_truth_pdb_path, self.val_sample_chain_id)
+
         # CRITICAL: Restore the model weights to normal (from parent class)
         if self.cached_weights is not None:
             self.model.load_state_dict(self.cached_weights)
             self.cached_weights = None
-    
+
+    def train_dataloader(self):
+        """Override train dataloader to support different loading strategies"""
+        # For now, return None to use the default OpenFold dataloader
+        return None
+
+    def val_dataloader(self):
+        """Override val dataloader to support different loading strategies"""
+        # For now, return None to use the default OpenFold dataloader
+        return None
+
     def _convert_to_pdb(self, batch, outputs):
         """Convert model outputs to PDB string using OpenFold's protein module"""
         # CRITICAL: Process batch and outputs correctly (same as official OpenFold)
@@ -330,31 +390,221 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
         
         return pdb_string
     
-    def _log_structure_to_wandb(self, pdb_string, name, step):
-        """Log structure to wandb using temporary file"""
-
-        # Create temporary PDB file
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.pdb', delete=False) as f:
-            f.write(pdb_string)
-            temp_pdb_path = f.name
-        
+    def _get_chain_id_from_batch_idx(self, batch_idx, split='train'):
+        """Get chain ID from dataloader for a given batch index"""
         try:
-            # Log to wandb WITHOUT step parameter - let wandb use its internal counter
-            # This avoids conflicts with training/validation steps
-            wandb.log({name: wandb.Molecule(temp_pdb_path)})
-        finally:
-            # Clean up temporary file
-            os.unlink(temp_pdb_path)
-    
+            if not hasattr(self, 'trainer') or not self.trainer or not hasattr(self.trainer, 'datamodule'):
+                return None
+            
+            datamodule = self.trainer.datamodule
+            
+            # Get the appropriate dataset
+            if split == 'train':
+                if hasattr(datamodule, 'train_dataset'):
+                    dataset = datamodule.train_dataset
+                else:
+                    return None
+            else:  # validation
+                # Try different attribute names
+                if hasattr(datamodule, 'valid_dataset'):
+                    dataset = datamodule.valid_dataset
+                elif hasattr(datamodule, 'val_dataset'):
+                    dataset = datamodule.val_dataset
+                elif hasattr(datamodule, 'eval_dataset'):
+                    dataset = datamodule.eval_dataset
+                else:
+                    return None
+            
+            # OpenFoldDataset is a wrapper that loops/samples from underlying datasets
+            # We need to get the actual underlying dataset that has the chain IDs
+            if hasattr(dataset, 'datasets') and hasattr(dataset, 'datapoints'):
+                # This is the looped OpenFoldDataset wrapper
+                # Get the actual dataset index and datapoint index
+                if batch_idx < len(dataset.datapoints):
+                    dataset_idx, datapoint_idx = dataset.datapoints[batch_idx]
+                    actual_dataset = dataset.datasets[dataset_idx]
+                    
+                    # Now try to get chain ID from the actual dataset
+                    if hasattr(actual_dataset, 'idx_to_chain_id'):
+                        return actual_dataset.idx_to_chain_id(datapoint_idx)
+                    elif hasattr(actual_dataset, '_chain_ids') and datapoint_idx < len(actual_dataset._chain_ids):
+                        return actual_dataset._chain_ids[datapoint_idx]
+            
+            # Fallback: try direct access (for non-wrapped datasets)
+            if hasattr(dataset, 'idx_to_chain_id'):
+                return dataset.idx_to_chain_id(batch_idx)
+            elif hasattr(dataset, '_chain_ids') and batch_idx < len(dataset._chain_ids):
+                return dataset._chain_ids[batch_idx]
+            
+            return None
+                
+        except Exception as e:
+            rank_zero_info(f"Warning: Could not get chain_id from batch_idx {batch_idx}: {e}")
+            return None
+
+    def _find_ground_truth_pdb(self, chain_id):
+        """Find the ground truth PDB file path for a given chain_id"""
+        if not chain_id:
+            return None
+
+        try:
+            # Import here to avoid circular imports
+            import sys
+            from pathlib import Path
+            sys.path.append(str(Path(__file__).parent))
+            from enhanced_data_utils import EnhancedStructureFinder
+
+            # Get the data directory from the trainer or use a default
+            # Try to get it from the trainer's datamodule
+            pdb_dir = None
+            if hasattr(self, 'trainer') and self.trainer and hasattr(self.trainer, 'datamodule'):
+                datamodule = self.trainer.datamodule
+                if hasattr(datamodule, 'data_dir'):
+                    pdb_dir = datamodule.data_dir
+                elif hasattr(datamodule, 'train_data_dir'):
+                    pdb_dir = datamodule.train_data_dir
+
+            # Fallback to standard location if not found
+            if not pdb_dir:
+                pdb_dir = "/home/jupyter-chenxi/data/af2rank_single/pdb"
+
+            # Create structure finder
+            structure_finder = EnhancedStructureFinder(
+                pdb_dir,
+                [".cif", ".pdb", ".core"],
+                None
+            )
+
+            # Find the structure path
+            structure_path, file_id, chain_id_only, ext = structure_finder.find_structure_path(chain_id)
+
+            return structure_path
+
+        except Exception as e:
+            rank_zero_info(f"Warning: Could not find ground truth PDB for chain_id {chain_id}: {e}")
+            return None
+
+    def _extrac_backbone_only_pdb(self, structure_path, chain_id):
+        """
+        Extract backbone atoms (N, CA, C, CB, O) from a structure file and save as temporary PDB.
+        
+        Args:
+            structure_path: Path to the structure file (CIF, PDB, etc.)
+            chain_id: Chain ID to extract (e.g., "1abc_A" -> extract chain "A")
+        
+        Returns:
+            Path to temporary PDB file with backbone atoms only
+        """
+        try:
+            # Parse chain ID to get the actual chain letter
+            if '_' in chain_id:
+                target_chain = chain_id.split('_')[-1]
+            else:
+                target_chain = None
+            
+            # Define backbone atoms to extract
+            backbone_atoms = ['N', 'CA', 'C', 'CB', 'O']
+            
+            # Read structure file
+            if structure_path.endswith('.cif') or structure_path.endswith('.core'):
+                # Parse mmCIF file
+                from openfold.data.mmcif_parsing import parse as parse_mmcif
+                with open(structure_path, 'r') as f:
+                    mmcif_string = f.read()
+                parsing_result = parse_mmcif(file_id=os.path.basename(structure_path), mmcif_string=mmcif_string)
+                
+                # Get the Bio.PDB structure from the parsing result
+                # ParsingResult.mmcif_object.structure is a Bio.PDB.Model object
+                bio_structure = parsing_result.mmcif_object.structure
+                
+                # Extract backbone atoms for the target chain
+                lines = []
+                lines.append("HEADER    GROUND TRUTH STRUCTURE (BACKBONE ATOMS)")
+                lines.append(f"TITLE     {chain_id}")
+                
+                atom_index = 1
+                for chain in bio_structure.get_chains():
+                    # Match chain ID (try both auth_asym_id and label_asym_id)
+                    if target_chain and chain.id != target_chain:
+                        continue
+                    
+                    for residue in chain.get_residues():
+                        for atom_name in backbone_atoms:
+                            if atom_name in residue:
+                                atom = residue[atom_name]
+                                coord = atom.coord
+                                res_name = residue.resname
+                                res_num = residue.id[1]
+                                
+                                pdb_line = (
+                                    f"ATOM  {atom_index:5d}  {atom_name:<3s} {res_name:3s} {chain.id}{res_num:4d}    "
+                                    f"{coord[0]:8.3f}{coord[1]:8.3f}{coord[2]:8.3f}"
+                                    f"  1.00 50.00           {atom_name[0]}"
+                                )
+                                lines.append(pdb_line)
+                                atom_index += 1
+                    
+                    # If we found the target chain, stop
+                    if target_chain:
+                        break
+                
+                lines.append("END")
+                
+            else:
+                # Parse PDB file
+                lines = []
+                lines.append("HEADER    GROUND TRUTH STRUCTURE (BACKBONE ATOMS)")
+                lines.append(f"TITLE     {chain_id}")
+                
+                atom_index = 1
+                with open(structure_path, 'r') as f:
+                    for line in f:
+                        if line.startswith('ATOM') or line.startswith('HETATM'):
+                            # Extract fields from PDB line
+                            atom_name = line[12:16].strip()
+                            chain = line[21].strip()
+                            
+                            # Check if this is a backbone atom and matches target chain
+                            if atom_name in backbone_atoms:
+                                if target_chain is None or chain == target_chain:
+                                    # Extract coordinates and residue info
+                                    res_name = line[17:20].strip()
+                                    res_num = line[22:26].strip()
+                                    x = float(line[30:38])
+                                    y = float(line[38:46])
+                                    z = float(line[46:54])
+                                    
+                                    pdb_line = (
+                                        f"ATOM  {atom_index:5d}  {atom_name:<3s} {res_name:3s} {chain}{res_num:>4s}    "
+                                        f"{x:8.3f}{y:8.3f}{z:8.3f}"
+                                        f"  1.00 50.00           {atom_name[0]}"
+                                    )
+                                    lines.append(pdb_line)
+                                    atom_index += 1
+                
+                lines.append("END")
+            
+            # Write to temporary file
+            temp_pdb = tempfile.NamedTemporaryFile(mode='w', suffix='.pdb', delete=False)
+            temp_pdb.write('\n'.join(lines))
+            temp_pdb.close()
+            
+            return temp_pdb.name
+            
+        except Exception as e:
+            rank_zero_info(f"Warning: Could not extract backbone atoms from {structure_path}: {e}")
+            return None
+
     def training_step(self, batch, batch_idx):
         """Extended training step that includes adaptive training loss"""
         
         # Store a different batch each epoch for structure logging (only on rank 0)
         # Use a more robust mechanism: store batch from a position based on epoch
-        if (self.trainer.is_global_zero and 
-            self.log_structure_every_k_epoch > 0 and 
+        if (self.trainer.is_global_zero and
+            self.log_structure_every_k_epoch > 0 and
             batch_idx == 0):  # Always use first batch, but dataloader shuffles each epoch
             self.train_sample_batch = {k: v.clone() if torch.is_tensor(v) else v for k, v in batch.items() if v is not None}
+            self.train_sample_chain_id = self._get_chain_id_from_batch_idx(batch_idx, split='train')
         
         # Run standard training step
         if self.ema.device != batch["aatype"].device:
@@ -421,10 +671,11 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
 
         # Store a different batch each epoch for structure logging (only on rank 0)
         # Use a more robust cycling mechanism that works with any number of validation batches
-        if (self.trainer.is_global_zero and 
-            self.log_structure_every_k_epoch > 0 and 
+        if (self.trainer.is_global_zero and
+            self.log_structure_every_k_epoch > 0 and
             batch_idx == 0):  # Always use first batch, but dataloader should shuffle each epoch
             self.val_sample_batch = {k: v.clone() if torch.is_tensor(v) else v for k, v in batch.items() if v is not None}
+            self.val_sample_chain_id = self._get_chain_id_from_batch_idx(batch_idx, split='val')
         
         # At the start of validation, load the EMA weights
         if (self.cached_weights is None):
@@ -524,18 +775,22 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
         
         # Use a simpler scheduler for adaptive training
         if self.is_adaptive_training:
-            # Use cosine annealing for adaptive training
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            # Use ReduceLROnPlateau for adaptive training to avoid step order issues
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 optimizer,
-                T_max=100,  # Will be adjusted based on max_epochs
-                eta_min=learning_rate * 0.01
+                mode='min',
+                factor=0.5,
+                patience=10,
+                verbose=True
             )
             return {
                 "optimizer": optimizer,
                 "lr_scheduler": {
                     "scheduler": scheduler,
+                    "monitor": "train/loss",  # Monitor training loss
                     "interval": "epoch",
-                    "name": "CosineAnnealingLR",
+                    "frequency": 1,
+                    "name": "ReduceLROnPlateau",
                 }
             }
         else:

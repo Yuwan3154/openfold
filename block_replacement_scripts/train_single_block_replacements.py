@@ -135,17 +135,17 @@ class PaddingCollator:
 
 
 class BlockDataset(Dataset):
-    """Dataset for loading block input/output pairs with GPU preloading"""
-    
-    def __init__(self, data_dir: Path, block_idx: int, split: str, val_fraction: float = 0.2, seed: int = 42, device: str = 'cuda'):
+    """Dataset for loading block input/output pairs with GPU or CPU preloading"""
+
+    def __init__(self, data_dir: Path, block_idx: int, split: str, val_fraction: float = 0.2, seed: int = 42, device: str = 'cuda', preload_to_gpu: bool = True):
         self.data_dir = data_dir / f"block_{block_idx:02d}"
         all_files = list(self.data_dir.glob("*.pt")) if self.data_dir.exists() else []
-        
+
         # Split files into train/val
         import random
         random.seed(seed)
         random.shuffle(all_files)
-        
+
         val_size = int(len(all_files) * val_fraction)
         if split == "train":
             self.files = all_files[val_size:]
@@ -153,50 +153,120 @@ class BlockDataset(Dataset):
             self.files = all_files[:val_size]
         else:
             raise ValueError(f"Invalid split: {split}. Must be 'train' or 'val'")
-        
+
         print(f"Block {block_idx:02d} {split}: {len(self.files)} files (val_fraction={val_fraction})")
-        
-        # Preload all data to GPU memory
+
+        # Choose preloading strategy
         self.device = device
+        self.preload_to_gpu = preload_to_gpu
         self.data_cache = []
-        self._preload_data()
+
+        if preload_to_gpu:
+            self._preload_to_gpu()
+        else:
+            self._preload_to_cpu()
         
-    def _preload_data(self):
+    def _preload_to_gpu(self):
         """Preload all data files to GPU memory"""
         print(f"  Preloading {len(self.files)} files to {self.device}...")
-        
+
+        # Clear GPU cache before preloading
+        if self.device == 'cuda' and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            initial_memory = torch.cuda.memory_allocated() / (1024 * 1024)
+            print(f"  Initial GPU memory: {initial_memory:.1f} MB")
+
         total_memory = 0
-        for file_path in self.files:
+        for i, file_path in enumerate(self.files):
+            if i % 10 == 0 and i > 0:  # Progress indicator
+                print(f"    Loaded {i}/{len(self.files)} files...")
+
             # Load data from disk
             data = torch.load(file_path, map_location='cpu')
-            
+
             # Move tensors to GPU
             gpu_data = {
-                "m_in": data["input"]["m"].to(self.device),
-                "z_in": data["input"]["z"].to(self.device),
-                "m_out": data["output"]["m"].to(self.device),
-                "z_out": data["output"]["z"].to(self.device),
+                "m_in": data["input"]["m"].to(self.device, non_blocking=True),
+                "z_in": data["input"]["z"].to(self.device, non_blocking=True),
+                "m_out": data["output"]["m"].to(self.device, non_blocking=True),
+                "z_out": data["output"]["z"].to(self.device, non_blocking=True),
                 "chain_id": data["chain_id"]
             }
-            
+
             # Estimate memory usage
             for key, tensor in gpu_data.items():
                 if isinstance(tensor, torch.Tensor):
                     total_memory += tensor.numel() * tensor.element_size()
-            
+
             self.data_cache.append(gpu_data)
-        
+
+            # Clean up CPU data immediately
+            del data
+
         # Convert to MB
         memory_mb = total_memory / (1024 * 1024)
         print(f"  Preloaded {len(self.data_cache)} files to {self.device}")
         print(f"  Estimated GPU memory usage: {memory_mb:.1f} MB")
+
+        # Show actual GPU memory usage
+        if self.device == 'cuda' and torch.cuda.is_available():
+            final_memory = torch.cuda.memory_allocated() / (1024 * 1024)
+            print(f"  Actual GPU memory allocated: {final_memory:.1f} MB")
+            print(f"  Memory increase: {final_memory - initial_memory:.1f} MB")
+
+    def _preload_to_cpu(self):
+        """Preload all data files to CPU memory"""
+        print(f"  Preloading {len(self.files)} files to CPU memory...")
+
+        total_memory = 0
+        for i, file_path in enumerate(self.files):
+            if i % 10 == 0 and i > 0:  # Progress indicator
+                print(f"    Loaded {i}/{len(self.files)} files...")
+
+            # Load data from disk
+            data = torch.load(file_path, map_location='cpu')
+
+            # Keep tensors on CPU
+            cpu_data = {
+                "m_in": data["input"]["m"],
+                "z_in": data["input"]["z"],
+                "m_out": data["output"]["m"],
+                "z_out": data["output"]["z"],
+                "chain_id": data["chain_id"]
+            }
+
+            # Estimate memory usage
+            for key, tensor in cpu_data.items():
+                if isinstance(tensor, torch.Tensor):
+                    total_memory += tensor.numel() * tensor.element_size()
+
+            self.data_cache.append(cpu_data)
+
+        # Convert to MB
+        memory_mb = total_memory / (1024 * 1024)
+        print(f"  Preloaded {len(self.data_cache)} files to CPU memory")
+        print(f"  Estimated CPU memory usage: {memory_mb:.1f} MB")
         
     def __len__(self):
         return len(self.data_cache)
     
     def __getitem__(self, idx):
-        # Return preloaded data directly (no disk I/O)
-        return self.data_cache[idx]
+        # Get data from cache
+        data = self.data_cache[idx]
+
+        # If data is on CPU and device is GPU, move to GPU
+        if not self.preload_to_gpu and self.device == 'cuda' and torch.cuda.is_available():
+            gpu_data = {
+                "m_in": data["m_in"].to(self.device, non_blocking=True),
+                "z_in": data["z_in"].to(self.device, non_blocking=True),
+                "m_out": data["m_out"].to(self.device, non_blocking=True),
+                "z_out": data["z_out"].to(self.device, non_blocking=True),
+                "chain_id": data["chain_id"]
+            }
+            return gpu_data
+        else:
+            # Data is already on the correct device
+            return data
 
 
 class ReplacementBlockTrainer(pl.LightningModule):
@@ -393,11 +463,11 @@ class SingleBlockTrainingPipeline:
         print(f"  Linear types: {args.linear_types}")
         print()
 
-    def create_data_loaders(self, block_idx: int, val_fraction: float = 0.2, device: str = 'cuda') -> Tuple[DataLoader, DataLoader]:
+    def create_data_loaders(self, block_idx: int, val_fraction: float = 0.2, device: str = 'cuda', preload_to_gpu: bool = True) -> Tuple[DataLoader, DataLoader]:
         """Create train and validation data loaders for a specific block"""
-        
-        train_dataset = BlockDataset(self.data_dir, block_idx, "train", val_fraction=val_fraction, device=device)
-        val_dataset = BlockDataset(self.data_dir, block_idx, "val", val_fraction=val_fraction, device=device)
+
+        train_dataset = BlockDataset(self.data_dir, block_idx, "train", val_fraction=val_fraction, device=device, preload_to_gpu=preload_to_gpu)
+        val_dataset = BlockDataset(self.data_dir, block_idx, "val", val_fraction=val_fraction, device=device, preload_to_gpu=preload_to_gpu)
         
         if len(train_dataset) == 0 or len(val_dataset) == 0:
             return None, None
@@ -464,9 +534,10 @@ class SingleBlockTrainingPipeline:
         if existing_results is not None:
             return existing_results
         
-        # Create data loaders with GPU preloading
+        # Create data loaders with configurable preloading
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        train_loader, val_loader = self.create_data_loaders(block_idx, val_fraction=self.args.val_fraction, device=device)
+        preload_to_gpu = getattr(self.args, 'preload_to_gpu', True)  # Default to GPU preloading
+        train_loader, val_loader = self.create_data_loaders(block_idx, val_fraction=self.args.val_fraction, device=device, preload_to_gpu=preload_to_gpu)
         
         if train_loader is None:
             print(f"  No data available for block {block_idx}, skipping...")
@@ -713,11 +784,15 @@ def main():
                        help="Enable Weights & Biases logging")
     parser.add_argument("--wandb_project", type=str, default="af2distill",
                        help="Wandb project name")
-    parser.add_argument("--wandb_entity", type=str, 
+    parser.add_argument("--wandb_entity", type=str,
                        default="kryst3154-massachusetts-institute-of-technology",
                        help="Wandb entity (username or team)")
     parser.add_argument("--experiment_name", type=str, default="single_block_replacement",
                        help="Base experiment name for wandb logging")
+    parser.add_argument("--preload_to_gpu", action="store_true", default=True,
+                       help="Preload data to GPU memory (faster but uses more GPU memory)")
+    parser.add_argument("--no_preload_to_gpu", action="store_false", dest="preload_to_gpu",
+                       help="Preload data to CPU memory and transfer to GPU when needed (slower but uses less GPU memory)")
     
     args = parser.parse_args()
     

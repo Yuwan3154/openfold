@@ -12,6 +12,7 @@ from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.strategies import DDPStrategy, DeepSpeedStrategy
 from pytorch_lightning.plugins.environments import MPIEnvironment
 from pytorch_lightning import seed_everything
+from pytorch_lightning.utilities.rank_zero import rank_zero_info
 import torch
 import wandb
 from deepspeed.utils import zero_to_fp32 
@@ -102,7 +103,7 @@ class OpenFoldWrapper(pl.LightningModule):
             self.replace_block_index
         )
         
-        print(f"Applied block replacement and freezing. Trainable parameters: {trainable_params:,}")
+        rank_zero_info(f"Applied block replacement and freezing. Trainable parameters: {trainable_params:,}")
 
     def forward(self, batch):
         return self.model(batch)
@@ -367,7 +368,7 @@ def main(args):
 
     # Configure for single sequence mode if requested
     if args.enable_single_seq_mode:
-        print("Enabling single sequence mode - reducing MSA and template requirements")
+        rank_zero_info("Enabling single sequence mode - reducing MSA and template requirements")
         # Reduce MSA requirements for single sequence training
         config.data.common.max_extra_msa = 1
         config.data.common.max_msa_clusters = 1
@@ -379,7 +380,7 @@ def main(args):
         config.data.common.use_templates = False
         config.data.common.use_template_torsion_angles = False
         # Disable MSA-specific losses for single sequence training
-        print("Disabling masked_msa loss for single sequence mode")
+        rank_zero_info("Disabling masked_msa loss for single sequence mode")
         config.loss.masked_msa.weight = 0.0
         # Reduce some computational requirements
         config.data.train.crop_size = min(config.data.train.crop_size, 256)
@@ -389,9 +390,10 @@ def main(args):
     
     if adaptive_config_path and ADAPTIVE_WRAPPER_AVAILABLE:
         model_module = AdaptiveOpenFoldWrapper(
-            config, 
+            config,
             adaptive_config_path=adaptive_config_path,
-            learning_rate=getattr(args, 'learning_rate', 1e-3)
+            learning_rate=getattr(args, 'learning_rate', 1e-3),
+            data_loading_strategy=getattr(args, 'data_loading_strategy', 'preload_gpu')
         )
     else:
         model_module = OpenFoldWrapper(
@@ -418,9 +420,9 @@ def main(args):
             )
             if not strict_loading:
                 if hasattr(args, 'replace_block_index') and args.replace_block_index is not None:
-                    print(f"Using strict=False for weight loading due to block replacement at index {args.replace_block_index}")
+                    rank_zero_info(f"Using strict=False for weight loading due to block replacement at index {args.replace_block_index}")
                 elif hasattr(args, 'enable_single_seq_mode') and args.enable_single_seq_mode:
-                    print(f"Using strict=False for weight loading due to single sequence mode (templates disabled)")
+                    rank_zero_info(f"Using strict=False for weight loading due to single sequence mode (templates disabled)")
             if 'module' in sd:
                 sd = {k[len('module.'):]: v for k, v in sd['module'].items()}
                 import_openfold_weights_(model=model_module, state_dict=sd, strict=strict_loading)
@@ -445,7 +447,7 @@ def main(args):
     # Handle JAX weight loading with template workaround for single sequence mode
     if args.resume_from_jax_params:
         if args.enable_single_seq_mode:
-            print("JAX loading with template workaround for single sequence mode...")
+            rank_zero_info("JAX loading with template workaround for single sequence mode...")
             # Temporarily enable templates for JAX loading
             original_template_enabled = config.model.template.enabled
             config.model.template.enabled = True
@@ -453,9 +455,10 @@ def main(args):
             # Recreate model with templates enabled for JAX loading
             if adaptive_config_path and ADAPTIVE_WRAPPER_AVAILABLE:
                 model_module = AdaptiveOpenFoldWrapper(
-                    config, 
+                    config,
                     adaptive_config_path=adaptive_config_path,
-                    learning_rate=getattr(args, 'learning_rate', 1e-3)
+                    learning_rate=getattr(args, 'learning_rate', 1e-3),
+                    data_loading_strategy=getattr(args, 'data_loading_strategy', 'preload_gpu')
                 )
             else:
                 model_module = OpenFoldWrapper(
@@ -473,9 +476,9 @@ def main(args):
             config.model.template.enabled = False
             if hasattr(model_module.model, 'template_embedder'):
                 delattr(model_module.model, 'template_embedder')
-                print("Removed template_embedder from model after JAX loading")
+                rank_zero_info("Removed template_embedder from model after JAX loading")
             
-            print("JAX loading completed - templates disabled for single sequence training")
+            rank_zero_info("JAX loading completed - templates disabled for single sequence training")
         else:
             # Normal JAX loading when templates are enabled
             model_module.load_from_jax(args.resume_from_jax_params)
@@ -537,7 +540,7 @@ def main(args):
         if args.enable_single_seq_mode:
             # In single sequence mode, we typically don't have validation data
             early_stopping_metric = 'train/lddt_ca'
-            print(f"Using training metric for early stopping: {early_stopping_metric}")
+            rank_zero_info(f"Using training metric for early stopping: {early_stopping_metric}")
         
         es = EarlyStoppingVerbose(
             monitor=early_stopping_metric,
@@ -605,13 +608,11 @@ def main(args):
         if(args.wandb and is_rank_zero):
             wdb_logger.experiment.save(args.deepspeed_config_path)
             wdb_logger.experiment.save("openfold/config.py")
-    elif (args.gpus is not None and args.gpus > 1) or args.num_nodes > 1:
-        print(f"Using distributed training with {args.distributed_backend} backend")
+    else:
+        rank_zero_info(f"Using distributed training with {args.distributed_backend} backend")
         strategy = DDPStrategy(find_unused_parameters=False,
                                cluster_environment=cluster_environment,
                                process_group_backend=args.distributed_backend)
-    else:
-        strategy = "auto"  # Use "auto" instead of None for newer PyTorch Lightning
  
     if(args.wandb and is_rank_zero):
         freeze_path = f"{wdb_logger.experiment.dir}/package_versions.txt"
@@ -900,10 +901,15 @@ if __name__ == "__main__":
         help="Enable recursive search for structure files in subdirectories"
     )
     
-    # Adaptive training argument
+    # Adaptive training arguments
     parser.add_argument(
         "--adaptive_config_path", type=str, default=None,
         help="Path to adaptive training configuration JSON file"
+    )
+    parser.add_argument(
+        "--data_loading_strategy", type=str, default="on_demand",
+        choices=["preload_gpu", "preload_cpu", "on_demand"],
+        help="Data loading strategy for adaptive training: 'preload_gpu' (default), 'preload_cpu', or 'on_demand'"
     )
 
     trainer_group = parser.add_argument_group(
@@ -960,8 +966,8 @@ if __name__ == "__main__":
         if args.replace_block_index >= max_block_index:
             raise ValueError(f"replace_block_index must be less than {max_block_index} (not last block)")
         
-        print(f"Will replace evoformer block {args.replace_block_index} with simple architecture")
+        rank_zero_info(f"Will replace evoformer block {args.replace_block_index} with simple architecture")
         if args.replacement_hidden_dim:
-            print(f"Using replacement hidden dimension: {args.replacement_hidden_dim}")
+            rank_zero_info(f"Using replacement hidden dimension: {args.replacement_hidden_dim}")
 
     main(args)

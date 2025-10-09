@@ -22,6 +22,12 @@ import pandas as pd
 import torch
 import random
 import json
+from pytorch_lightning.utilities.rank_zero import rank_zero_info
+
+
+def _is_torchrun():
+    """Check if we're running under torchrun distributed training"""
+    return 'TORCHRUN_PROC_RANK' in os.environ or 'RANK' in os.environ
 
 
 def find_available_structure_files(pdb_dir):
@@ -45,7 +51,7 @@ def find_available_structure_files(pdb_dir):
 
 def extract_chain_list_from_csv(csv_path, output_path, pdb_dir=None):
     """Extract chain list from CSV file's 'natives_rcsb' column and filter by available structure files"""
-    print(f"Reading CSV file: {csv_path}")
+    rank_zero_info(f"Reading CSV file: {csv_path}")
     
     # Read CSV file
     df = pd.read_csv(csv_path)
@@ -53,11 +59,11 @@ def extract_chain_list_from_csv(csv_path, output_path, pdb_dir=None):
     # Extract the 'natives_rcsb' column, skip empty values
     all_chains = df['natives_rcsb'].dropna().tolist()
     
-    print(f"Found {len(all_chains)} chains in CSV file")
+    rank_zero_info(f"Found {len(all_chains)} chains in CSV file")
     
     # Filter chains by available structure files if pdb_dir is provided
     if pdb_dir:
-        print(f"Checking for available structure files in: {pdb_dir}")
+        rank_zero_info(f"Checking for available structure files in: {pdb_dir}")
         available_structures = find_available_structure_files(pdb_dir)
         
         available_chains = []
@@ -75,9 +81,9 @@ def extract_chain_list_from_csv(csv_path, output_path, pdb_dir=None):
             else:
                 missing_chains.append(chain)
         
-        print(f"Available structure files: {len(available_structures)}")
-        print(f"Chains with available structures: {len(available_chains)}")
-        print(f"Chains missing structures: {len(missing_chains)}")
+        rank_zero_info(f"Available structure files: {len(available_structures)}")
+        rank_zero_info(f"Chains with available structures: {len(available_chains)}")
+        rank_zero_info(f"Chains missing structures: {len(missing_chains)}")
         
         chain_list = available_chains
     else:
@@ -95,7 +101,7 @@ def extract_chain_list_from_csv(csv_path, output_path, pdb_dir=None):
         for chain in chain_list:
             f.write(f"{chain}\n")
     
-    print(f"Written filtered chain list to: {output_path}")
+    rank_zero_info(f"Written filtered chain list to: {output_path}")
     
     return chain_list
 
@@ -120,7 +126,7 @@ def create_minimal_alignment_structure(alignment_dir, chain_list=None):
                 with open(alignment_file, 'w') as f:
                     f.write(f">{chain}\nA\n")  # Single sequence alignment
     
-    print(f"Created minimal alignment structure at: {alignment_dir}")
+    rank_zero_info(f"Created minimal alignment structure at: {alignment_dir}")
 
 
 def split_chains_for_validation(chain_list, val_fraction, output_dir, seed=42):
@@ -147,10 +153,10 @@ def split_chains_for_validation(chain_list, val_fraction, output_dir, seed=42):
     if len(train_chains) == 0:
         train_chains = [val_chains.pop()]
     
-    print(f"Chain split (seed={seed}):")
-    print(f"  - Total chains: {len(chain_list)}")
-    print(f"  - Training chains: {len(train_chains)}")
-    print(f"  - Validation chains: {len(val_chains)}")
+    rank_zero_info(f"Chain split (seed={seed}):")
+    rank_zero_info(f"  - Total chains: {len(chain_list)}")
+    rank_zero_info(f"  - Training chains: {len(train_chains)}")
+    rank_zero_info(f"  - Validation chains: {len(val_chains)}")
     
     # Save split chain lists
     chain_list_dir = output_dir / "chain_lists"
@@ -173,11 +179,11 @@ def split_chains_for_validation(chain_list, val_fraction, output_dir, seed=42):
             f.write("# Format: pdb_id_chain\n")
             for chain in val_chains:
                 f.write(f"{chain}\n")
-        print(f"  - Validation chains saved to: {val_list_path}")
+        rank_zero_info(f"  - Validation chains saved to: {val_list_path}")
     else:
         val_list_path = None
     
-    print(f"  - Training chains saved to: {train_list_path}")
+    rank_zero_info(f"  - Training chains saved to: {train_list_path}")
     
     return train_chains, val_chains, train_list_path, val_list_path
 
@@ -258,6 +264,8 @@ def run_adaptive_training(args):
             config['wandb_entity'] = args.wandb_entity
         if 'experiment_name' in provided_args and args.experiment_name is not None:
             config['experiment_name'] = args.experiment_name
+        if 'distributed_backend' in provided_args and args.distributed_backend is not None:
+            config['distributed_backend'] = args.distributed_backend
     else:
         # Use command line arguments directly
         config = {
@@ -275,6 +283,7 @@ def run_adaptive_training(args):
             'validation_fraction': args.validation_fraction,
             'grad_accum_steps': args.grad_accum_steps,
             'log_structure_every_k_epoch': args.log_structure_every_k_epoch,
+            'distributed_backend': args.distributed_backend,
             'wandb': args.wandb,
             'wandb_project': args.wandb_project,
             'wandb_entity': args.wandb_entity,
@@ -290,27 +299,39 @@ def run_adaptive_training(args):
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
     
-    print("=== Adaptive Evoformer-Replacement Weighting Training ===")
-    print()
-    print(f"Configuration:")
-    print(f"  CSV path: {csv_path}")
-    print(f"  PDB directory: {pdb_dir}")
-    print(f"  Pre-trained weights: {checkpoint_path}")
-    print(f"  Trained models directory: {trained_models_dir}")
-    print(f"  Output directory: {output_dir}")
-    print(f"  Linear type: {config['linear_type']}")
-    print(f"  Replace loss scaler: {config['replace_loss_scaler']}")
-    print(f"  Learning rate: {config['learning_rate']}")
-    print(f"  Max epochs: {config['max_epochs']}")
-    print(f"  Train epoch len: {config.get('train_epoch_len', 'NOT SET')}")
-    print(f"  Batch size: {config['batch_size']}")
-    print(f"  Validation fraction: {config.get('validation_fraction', 'NOT SET')}")
-    print(f"  Grad accum steps: {config.get('grad_accum_steps', 'NOT SET')}")
-    print(f"  Log structure every k epochs: {config.get('log_structure_every_k_epoch', 'NOT SET')}")
-    print(f"  Wandb enabled: {config.get('wandb', 'NOT SET')}")
-    print(f"  Wandb project: {config.get('wandb_project', 'NOT SET')}")
-    print(f"  Experiment name: {config.get('experiment_name', 'NOT SET')}")
-    print()
+    rank_zero_info("=== Adaptive Evoformer-Replacement Weighting Training ===")
+
+    # Check if running under torchrun
+    is_torchrun = _is_torchrun()
+    if is_torchrun:
+        rank = os.environ.get('RANK', 'unknown')
+        local_rank = os.environ.get('LOCAL_RANK', 'unknown')
+        world_size = os.environ.get('WORLD_SIZE', 'unknown')
+        print(f"🔄 Running under torchrun distributed training:")
+        print(f"  RANK: {rank}")
+        print(f"  LOCAL_RANK: {local_rank}")
+        print(f"  WORLD_SIZE: {world_size}")
+    else:
+        print("🔄 Running as single process (not distributed)")
+
+    rank_zero_info(f"Configuration:")
+    rank_zero_info(f"  CSV path: {csv_path}")
+    rank_zero_info(f"  PDB directory: {pdb_dir}")
+    rank_zero_info(f"  Pre-trained weights: {checkpoint_path}")
+    rank_zero_info(f"  Trained models directory: {trained_models_dir}")
+    rank_zero_info(f"  Output directory: {output_dir}")
+    rank_zero_info(f"  Linear type: {config['linear_type']}")
+    rank_zero_info(f"  Replace loss scaler: {config['replace_loss_scaler']}")
+    rank_zero_info(f"  Learning rate: {config['learning_rate']}")
+    rank_zero_info(f"  Max epochs: {config['max_epochs']}")
+    rank_zero_info(f"  Train epoch len: {config.get('train_epoch_len', 'NOT SET')}")
+    rank_zero_info(f"  Batch size: {config['batch_size']}")
+    rank_zero_info(f"  Validation fraction: {config.get('validation_fraction', 'NOT SET')}")
+    rank_zero_info(f"  Grad accum steps: {config.get('grad_accum_steps', 'NOT SET')}")
+    rank_zero_info(f"  Log structure every k epochs: {config.get('log_structure_every_k_epoch', 'NOT SET')}")
+    rank_zero_info(f"  Wandb enabled: {config.get('wandb', 'NOT SET')}")
+    rank_zero_info(f"  Wandb project: {config.get('wandb_project', 'NOT SET')}")
+    rank_zero_info(f"  Experiment name: {config.get('experiment_name', 'NOT SET')}")
     
     # Check trained models directory
     if not trained_models_dir.exists():
@@ -326,38 +347,35 @@ def run_adaptive_training(args):
                 available_blocks.append(block_idx)
     
     available_blocks.sort()
-    print(f"Found {len(available_blocks)} trained replacement blocks: {available_blocks[:10]}...")
+    rank_zero_info(f"Found {len(available_blocks)} trained replacement blocks: {available_blocks[:10]}...")
     
     if len(available_blocks) == 0:
         raise ValueError(f"No trained replacement blocks found in {trained_models_dir}")
     
     # Extract chain list
-    print("\n1. Extracting chain list from CSV...")
+    rank_zero_info("\n1. Extracting chain list from CSV...")
     chain_list_dir = output_dir / "chain_lists"
     chain_list_path = chain_list_dir / "all_chains.txt"
     all_chains = extract_chain_list_from_csv(csv_path, chain_list_path, pdb_dir)
-    print()
     
     # Split chains for validation
-    print("2. Splitting data for validation...")
+    rank_zero_info("2. Splitting data for validation...")
     val_fraction = config.get('validation_fraction', 0.1)
     train_chains, val_chains, train_list_path, val_list_path = split_chains_for_validation(
         all_chains, val_fraction, output_dir, args.seed
     )
-    print()
     
     # Create minimal alignment structure
-    print("3. Setting up minimal alignment structure...")
+    rank_zero_info("3. Setting up minimal alignment structure...")
     alignment_dir = output_dir / "alignments"
     create_minimal_alignment_structure(alignment_dir, all_chains)
-    print()
     
     # Verify checkpoint exists
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
     
     # Create adaptive training command file FIRST (before wrapper script)
-    print("4. Creating adaptive training configuration...")
+    rank_zero_info("4. Creating adaptive training configuration...")
     adaptive_cmd_file = create_adaptive_training_command_file(
         output_dir,
         trained_models_dir,
@@ -366,12 +384,17 @@ def run_adaptive_training(args):
         config.get('log_structure_every_k_epoch', 1),
         config.get('disable_per_block_logging', False)
     )
-    print(f"Adaptive training config saved to: {adaptive_cmd_file}")
-    print()
+    rank_zero_info(f"Adaptive training config saved to: {adaptive_cmd_file}")
     
     # Build training command - use standard train_openfold.py directly
     train_script = home_dir / "openfold" / "train_openfold.py"
-    
+
+    # Set distributed backend if specified (from config or command line)
+    if args.distributed_backend is not None:
+        distributed_backend = args.distributed_backend
+    else:
+        distributed_backend = config.get('distributed_backend')
+
     cmd = [
         sys.executable, str(train_script),
         str(pdb_dir),                    # train_data_dir
@@ -395,15 +418,14 @@ def run_adaptive_training(args):
         "--train_epoch_len", str(config.get('train_epoch_len', 1000)),
         "--learning_rate", str(config['learning_rate']),
         
-        # Resource settings
+        # Resource settings - let torchrun handle GPU assignment
         "--precision", args.precision,
-        "--gpus", str(config.get('gpus', args.gpus)),
+        "--gpus", "1",  # Each process uses 1 GPU when using torchrun
         "--seed", str(args.seed),
-        "--distributed_backend", "gloo",  # Force gloo backend
-        
+
         # Gradient accumulation
         "--grad_accum_steps", str(config.get('grad_accum_steps', 1)),
-        
+
         # Adaptive training configuration
         "--adaptive_config_path", str(adaptive_cmd_file),
         
@@ -411,7 +433,11 @@ def run_adaptive_training(args):
         "--log_lr",
         "--log_every_n_steps", "10",
     ]
-    
+
+    # Add distributed backend if specified
+    if distributed_backend:
+        cmd.extend(["--distributed_backend", distributed_backend])
+
     # Add validation data if available
     if val_list_path and val_chains:
         cmd.extend([
@@ -437,47 +463,48 @@ def run_adaptive_training(args):
         if config.get('wandb_entity'):
             cmd.extend(["--wandb_entity", config['wandb_entity']])
     
-    print("5. Training command:")
-    print(" ".join(cmd))
-    print()
+    rank_zero_info("5. Training command:")
+    rank_zero_info(" ".join(cmd))
     
-    print("Key features:")
-    print("  ✓ Adaptive weighting: w * evoformer_output + (1-w) * replacement_output")
-    print(f"  ✓ Weight prediction: sigmoid(linear(mean_pool(m[..., 0, :, :]))) ")
-    print(f"  ✓ {len(available_blocks)} replacement blocks loaded from {trained_models_dir}")
-    print(f"  ✓ Replace loss scaler: {config['replace_loss_scaler']} (penalizes mean weights)")
-    print("  ✓ Trainable parameters: weight predictors + replacement blocks")
-    print("  ✓ Single sequence mode: No MSAs or templates required")
-    print(f"  ✓ Learning rate: {config['learning_rate']} (for adaptive components)")
-    print(f"  ✓ Gradient accumulation: {config.get('grad_accum_steps', 1)} steps")
+    rank_zero_info("Key features:")
+    rank_zero_info("  ✓ Adaptive weighting: w * evoformer_output + (1-w) * replacement_output")
+    rank_zero_info(f"  ✓ Weight prediction: sigmoid(linear(mean_pool(m[..., 0, :, :]))) ")
+    rank_zero_info(f"  ✓ {len(available_blocks)} replacement blocks loaded from {trained_models_dir}")
+    rank_zero_info(f"  ✓ Replace loss scaler: {config['replace_loss_scaler']} (penalizes mean weights)")
+    rank_zero_info("  ✓ Trainable parameters: weight predictors + replacement blocks")
+    rank_zero_info("  ✓ Single sequence mode: No MSAs or templates required")
+    rank_zero_info(f"  ✓ Learning rate: {config['learning_rate']} (for adaptive components)")
+    rank_zero_info(f"  ✓ Gradient accumulation: {config.get('grad_accum_steps', 1)} steps")
     
     if val_chains:
-        print(f"  ✓ Validation split: {len(val_chains)}/{len(all_chains)} chains")
+        rank_zero_info(f"  ✓ Validation split: {len(val_chains)}/{len(all_chains)} chains")
     
-    print()
     
     if args.dry_run:
-        print("DRY RUN: Command would be executed but --dry_run flag is set")
+        rank_zero_info("DRY RUN: Command would be executed but --dry_run flag is set")
         return cmd
     
-    print("6. Starting adaptive training...")
-    print("=" * 60)
+    rank_zero_info("6. Starting adaptive training...")
+    rank_zero_info("=" * 60)
     
-    # Set environment to restrict to requested number of GPUs and force gloo backend
+    # Set environment for proper distributed training
     env = os.environ.copy()
+
+    # Only set CUDA_VISIBLE_DEVICES for single GPU training
+    # For multi-GPU, let torchrun handle GPU assignment
     if config.get('gpus', args.gpus) == 1:
-        # For single GPU training, set CUDA_VISIBLE_DEVICES to first GPU only
-        # This prevents PyTorch Lightning from auto-detecting multiple GPUs
         env['CUDA_VISIBLE_DEVICES'] = '0'
-        print("Setting CUDA_VISIBLE_DEVICES=0 for single GPU training")
-    
-    # Force gloo backend via environment variable
-    env['PL_TORCH_DISTRIBUTED_BACKEND'] = 'gloo'
-    print("Setting PL_TORCH_DISTRIBUTED_BACKEND=gloo to force gloo backend")
+        rank_zero_info("Setting CUDA_VISIBLE_DEVICES=0 for single GPU training")
+
+    # Don't override distributed backend - let torchrun handle it
+    # Only set if explicitly needed for compatibility
+    if 'PL_TORCH_DISTRIBUTED_BACKEND' not in env:
+        env['PL_TORCH_DISTRIBUTED_BACKEND'] = 'gloo'
+        rank_zero_info("Setting PL_TORCH_DISTRIBUTED_BACKEND=gloo for compatibility")
     
     # Execute the training command
     result = subprocess.run(cmd, check=True, env=env)
-    print("Adaptive training completed successfully!")
+    rank_zero_info("Adaptive training completed successfully!")
     return result
 
 
@@ -511,6 +538,9 @@ def create_default_config():
         'wandb_project': 'af2distill',
         'wandb_entity': 'kryst3154-massachusetts-institute-of-technology',
         'experiment_name': 'adaptive_block_1-46',
+
+        # Data loading strategy
+        'data_loading_strategy': 'preload_gpu',  # Options: 'preload_gpu', 'preload_cpu', 'on_demand'
     }
 
 
@@ -593,10 +623,13 @@ def main():
                        help="Override wandb project from config file")
     parser.add_argument("--wandb_entity", type=str, default=None,
                        help="Override wandb entity from config file")
-    
+    parser.add_argument("--data_loading_strategy", type=str, default=None,
+                       choices=["preload_gpu", "preload_cpu", "on_demand"],
+                       help="Override data loading strategy from config file")
+
     # Utility
     parser.add_argument("--dry_run", action="store_true", default=False,
-                       help="Print command but don't execute training")
+                       help="rank_zero_info command but don't execute training")
     
     args = parser.parse_args()
     
@@ -605,16 +638,16 @@ def main():
         config_path = args.create_config
         with open(config_path, 'w') as f:
             yaml.dump(config, f, default_flow_style=False, indent=2)
-        print(f"Created default config file: {config_path}")
-        print("Edit this file to customize the adaptive training, then run:")
-        print(f"python {sys.argv[0]} --config {config_path}")
+        rank_zero_info(f"Created default config file: {config_path}")
+        rank_zero_info("Edit this file to customize the adaptive training, then run:")
+        rank_zero_info(f"python {sys.argv[0]} --config {config_path}")
         return
     
     # Require config file for adaptive training
     if not args.config:
-        print("ERROR: Config file is required for adaptive training.")
-        print("Use --create_config to generate a default config file, then:")
-        print(f"python {sys.argv[0]} --config <config_file.yaml>")
+        rank_zero_info("ERROR: Config file is required for adaptive training.")
+        rank_zero_info("Use --create_config to generate a default config file, then:")
+        rank_zero_info(f"python {sys.argv[0]} --config <config_file.yaml>")
         sys.exit(1)
     
     # Run adaptive training

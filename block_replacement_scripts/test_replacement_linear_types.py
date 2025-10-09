@@ -100,8 +100,8 @@ class LinearTypeComparison:
         
         print(f"Running command: {' '.join(cmd)}")
         
-        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-        print("Training completed successfully!")
+            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+            print("Training completed successfully!")
         print(f"STDOUT: {result.stdout}")
         if result.stderr:
             print(f"STDERR: {result.stderr}")
@@ -830,10 +830,10 @@ class LinearTypeComparison:
         if missing_combinations:
             print(f"🚀 Training {len(missing_combinations)} missing combinations...")
             success = self._train_missing_combinations(missing_combinations)
-            
-            if not success:
+        
+        if not success:
                 print("❌ Training failed. Aborting analysis.")
-                return
+            return
         
         # Step 3: Load final results and analyze
         df = self.load_training_results()
@@ -894,7 +894,7 @@ class LinearTypeComparison:
         analysis = self.analyze_linear_types(df)
         
         # Step 4: Create visualizations
-        self.create_visualizations(df, analysis)
+            self.create_visualizations(df, analysis)
         
         # Step 5: Generate report
         self.generate_report(analysis)

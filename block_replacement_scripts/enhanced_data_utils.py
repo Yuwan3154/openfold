@@ -5,6 +5,12 @@ import os
 import glob
 from typing import Dict, List, Optional, Set
 
+try:
+    from pytorch_lightning.utilities.rank_zero import rank_zero_info
+except ImportError:
+    # Fallback if pytorch_lightning is not available
+    def rank_zero_info(msg):
+        print(msg)
 
 def find_structure_file_recursive(data_dir: str, file_id: str, supported_exts: List[str]) -> Optional[str]:
     """
@@ -115,13 +121,13 @@ def build_chain_ids_from_structures_and_list(
         # Load from provided chain list
         chain_mapping = load_chain_training_list(chain_list_path)
         chain_ids = list(chain_mapping.keys())
-        print(f"Loaded {len(chain_ids)} chains from {chain_list_path}")
+        rank_zero_info(f"Loaded {len(chain_ids)} chains from {chain_list_path}")
         return chain_ids
     
     elif alignment_dir and os.path.exists(alignment_dir):
         # Use existing alignment directory logic (backward compatibility)
         chain_ids = list(os.listdir(alignment_dir))
-        print(f"Using {len(chain_ids)} chains from alignment directory")
+        rank_zero_info(f"Using {len(chain_ids)} chains from alignment directory")
         return chain_ids
     
     else:
@@ -134,7 +140,7 @@ def build_chain_ids_from_structures_and_list(
             # Could be enhanced to parse actual chains from structures
             chain_ids.append(file_id)
         
-        print(f"Auto-discovered {len(chain_ids)} structures in {data_dir}")
+        rank_zero_info(f"Auto-discovered {len(chain_ids)} structures in {data_dir}")
         return chain_ids
 
 
@@ -157,7 +163,7 @@ class EnhancedStructureFinder:
         self.chain_mapping = {}
         if chain_list_path and os.path.exists(chain_list_path):
             self.chain_mapping = load_chain_training_list(chain_list_path)
-            print(f"Loaded chain mapping for {len(self.chain_mapping)} entries")
+            rank_zero_info(f"Loaded chain mapping for {len(self.chain_mapping)} entries")
         
         # Load label->author chain ID mapping if available
         self.label_to_author_mapping = {}
@@ -166,7 +172,7 @@ class EnhancedStructureFinder:
             import json
             with open(chain_id_mapping_path, 'r') as f:
                 self.label_to_author_mapping = json.load(f)
-            print(f"Loaded label->author chain ID mapping for {len(self.label_to_author_mapping)} files")
+            rank_zero_info(f"Loaded label->author chain ID mapping for {len(self.label_to_author_mapping)} files")
     
     def find_structure_path(self, name: str) -> tuple:
         """
