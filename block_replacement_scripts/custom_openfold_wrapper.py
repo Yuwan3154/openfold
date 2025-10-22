@@ -275,7 +275,8 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
             self.model.load_state_dict(cached_weights_temp)
             
             # Convert to PDB and log to wandb
-            pdb_string = self._convert_to_pdb(self.train_sample_batch, outputs)
+            # Use crop_to_ground_truth=True to match ground truth residue range
+            pdb_string = self._convert_to_pdb(self.train_sample_batch, outputs, crop_to_ground_truth=True)
             # Find ground truth PDB path and log both predicted and ground truth structures
             rank_zero_info(f"Train chain_id for structure logging: {self.train_sample_chain_id}")
             ground_truth_pdb_path = self._find_ground_truth_pdb(self.train_sample_chain_id) if self.train_sample_chain_id else None
@@ -300,7 +301,8 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
                 outputs = self(self.val_sample_batch)
             
             # Convert to PDB and log to wandb
-            pdb_string = self._convert_to_pdb(self.val_sample_batch, outputs)
+            # Use crop_to_ground_truth=True to match ground truth residue range
+            pdb_string = self._convert_to_pdb(self.val_sample_batch, outputs, crop_to_ground_truth=True)
             # Find ground truth PDB path and log both predicted and ground truth structures
             rank_zero_info(f"Val chain_id for structure logging: {self.val_sample_chain_id}")
             ground_truth_pdb_path = self._find_ground_truth_pdb(self.val_sample_chain_id) if self.val_sample_chain_id else None
@@ -326,8 +328,14 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
         # For now, return None to use the default OpenFold dataloader
         return None
 
-    def _convert_to_pdb(self, batch, outputs):
-        """Convert model outputs to PDB string using OpenFold's protein module"""
+    def _convert_to_pdb(self, batch, outputs, crop_to_ground_truth=False):
+        """Convert model outputs to PDB string using OpenFold's protein module
+        
+        Args:
+            batch: Input batch
+            outputs: Model outputs
+            crop_to_ground_truth: If True, crop predicted structure to match ground truth mask
+        """
         # CRITICAL: Process batch and outputs correctly (same as official OpenFold)
         # 1. Remove recycling dimension from batch: x[..., -1]
         # 2. Remove batch dimension: x[0] (since batch_size=1 in training)
@@ -362,6 +370,20 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
         
         processed_feature_dict = tensor_tree_map(process_features, batch)
         out = tensor_tree_map(process_outputs, outputs)
+        
+        # If crop_to_ground_truth is True, mask out predicted residues that don't have ground truth
+        if crop_to_ground_truth and 'all_atom_mask' in processed_feature_dict:
+            # The all_atom_mask tells us which residues have resolved coordinates in the ground truth
+            # If a residue has no atoms with mask=1, it's unresolved in the crystal structure
+            gt_residue_mask = np.any(processed_feature_dict['all_atom_mask'] > 0, axis=-1)
+            
+            # Apply mask to outputs - zero out predictions for unresolved residues
+            # This makes them appear as missing in the PDB
+            if 'final_atom_positions' in out:
+                out['final_atom_positions'] = out['final_atom_positions'] * gt_residue_mask[:, None, None]
+                # Also mask the atom positions mask
+                if 'atom14_atom_exists' in out:
+                    out['atom14_atom_exists'] = out['atom14_atom_exists'] * gt_residue_mask[:, None]
         
         # Get pLDDT from outputs
         if "plddt" in out:
@@ -529,6 +551,12 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
                         continue
                     
                     for residue in chain.get_residues():
+                        # Skip water molecules (HOH) and other hetero atoms
+                        if residue.id[0] != ' ':  # Heteroatom flag - ' ' means standard residue
+                            continue
+                        if residue.resname in ['HOH', 'WAT']:  # Skip water molecules
+                            continue
+                        
                         for atom_name in backbone_atoms:
                             if atom_name in residue:
                                 atom = residue[atom_name]
@@ -559,16 +587,20 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
                 atom_index = 1
                 with open(structure_path, 'r') as f:
                     for line in f:
-                        if line.startswith('ATOM') or line.startswith('HETATM'):
+                        if line.startswith('ATOM'):  # Only process ATOM, not HETATM
                             # Extract fields from PDB line
                             atom_name = line[12:16].strip()
+                            res_name = line[17:20].strip()
                             chain = line[21].strip()
+                            
+                            # Skip water molecules
+                            if res_name in ['HOH', 'WAT']:
+                                continue
                             
                             # Check if this is a backbone atom and matches target chain
                             if atom_name in backbone_atoms:
                                 if target_chain is None or chain == target_chain:
                                     # Extract coordinates and residue info
-                                    res_name = line[17:20].strip()
                                     res_num = line[22:26].strip()
                                     x = float(line[30:38])
                                     y = float(line[38:46])
@@ -604,6 +636,7 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
             self.log_structure_every_k_epoch > 0 and
             batch_idx == 0):  # Always use first batch, but dataloader shuffles each epoch
             self.train_sample_batch = {k: v.clone() if torch.is_tensor(v) else v for k, v in batch.items() if v is not None}
+            # Get chain_id from datamodule using batch index
             self.train_sample_chain_id = self._get_chain_id_from_batch_idx(batch_idx, split='train')
         
         # Run standard training step
@@ -670,11 +703,15 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
         """Extended validation step with adaptive metrics and replace loss"""
 
         # Store a different batch each epoch for structure logging (only on rank 0)
-        # Use a more robust cycling mechanism that works with any number of validation batches
+        # Cycle through validation batches by using epoch number modulo
+        # Since validation typically doesn't shuffle, we need to actively select different batches
+        target_batch_idx = self.trainer.current_epoch % max(1, self.trainer.num_val_batches[0] if hasattr(self.trainer, 'num_val_batches') and self.trainer.num_val_batches else 10)
+        
         if (self.trainer.is_global_zero and
             self.log_structure_every_k_epoch > 0 and
-            batch_idx == 0):  # Always use first batch, but dataloader should shuffle each epoch
+            batch_idx == target_batch_idx):
             self.val_sample_batch = {k: v.clone() if torch.is_tensor(v) else v for k, v in batch.items() if v is not None}
+            # Get chain_id from datamodule using batch index
             self.val_sample_chain_id = self._get_chain_id_from_batch_idx(batch_idx, split='val')
         
         # At the start of validation, load the EMA weights
