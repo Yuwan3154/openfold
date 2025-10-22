@@ -54,42 +54,75 @@ from adaptive_wrapper import (
 
 
 class SequenceDataset(Dataset):
-    """Dataset for loading protein sequences from FASTA files
+    """Dataset for loading protein sequences from FASTA or TSV files
     
-    Supports two modes:
+    Supported formats:
+    - FASTA: Standard FASTA format with '>' headers
+    - TSV: Tab-separated format with no header, each line is 'id<tab>sequence'
+    
+    Supports two loading modes:
     - preload (default): Load all sequences into memory (faster, higher memory)
     - on_demand: Load sequences on-the-fly from file (slower, lower memory)
     """
     
-    def __init__(self, fasta_file: str, max_length: Optional[int] = None, preload: bool = True):
+    def __init__(self, dataset_file: str, max_length: Optional[int] = None, preload: bool = True):
         """
         Args:
-            fasta_file: Path to FASTA file
+            dataset_file: Path to FASTA or TSV file
             max_length: Maximum sequence length (sequences longer than this are filtered)
             preload: If True, load all sequences into memory. If False, load on-demand.
         """
-        self.fasta_file = fasta_file
+        self.dataset_file = dataset_file
         self.max_length = max_length
         self.preload = preload
         
+        # Detect file format
+        self.file_format = self._detect_format(dataset_file)
+        print(f"Detected file format: {self.file_format}")
+        
         if preload:
             # Preload all sequences into memory
-            self.sequences = self._load_sequences(fasta_file)
+            self.sequences = self._load_sequences(dataset_file)
             # Filter by length if specified
             if max_length:
+                original_count = len(self.sequences)
                 self.sequences = [s for s in self.sequences if len(s['sequence']) <= max_length]
+                if original_count > len(self.sequences):
+                    print(f"Filtered {original_count - len(self.sequences)} sequences longer than {max_length}")
         else:
             # On-demand mode: just index the file
-            self.sequence_offsets = self._index_fasta(fasta_file)
+            self.sequence_offsets = self._index_file(dataset_file)
             # Filter by length if specified (requires reading sequences)
             if max_length:
+                original_count = len(self.sequence_offsets)
                 self.sequence_offsets = [
                     offset for offset in self.sequence_offsets
                     if len(self._read_sequence_at_offset(offset)['sequence']) <= max_length
                 ]
+                if original_count > len(self.sequence_offsets):
+                    print(f"Filtered {original_count - len(self.sequence_offsets)} sequences longer than {max_length}")
             self.sequences = None  # Not preloaded
     
-    def _load_sequences(self, fasta_file: str):
+    def _detect_format(self, dataset_file: str) -> str:
+        """Detect if file is FASTA or TSV format"""
+        with open(dataset_file, 'r') as f:
+            first_line = f.readline().strip()
+            if first_line.startswith('>'):
+                return 'fasta'
+            elif '\t' in first_line:
+                return 'tsv'
+            else:
+                # Default to FASTA if unclear
+                return 'fasta'
+    
+    def _load_sequences(self, dataset_file: str):
+        """Load sequences from FASTA or TSV file"""
+        if self.file_format == 'tsv':
+            return self._load_sequences_tsv(dataset_file)
+        else:
+            return self._load_sequences_fasta(dataset_file)
+    
+    def _load_sequences_fasta(self, fasta_file: str):
         """Load sequences from FASTA file"""
         sequences = []
         current_id = None
@@ -121,6 +154,44 @@ class SequenceDataset(Dataset):
         print(f"Loaded {len(sequences)} sequences from {fasta_file}")
         return sequences
     
+    def _load_sequences_tsv(self, tsv_file: str):
+        """Load sequences from TSV file (format: id<tab>sequence, no header)"""
+        sequences = []
+        
+        with open(tsv_file, 'r') as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:  # Skip empty lines
+                    continue
+                
+                parts = line.split('\t')
+                if len(parts) != 2:
+                    print(f"Warning: Line {line_num} does not have exactly 2 tab-separated fields, skipping")
+                    continue
+                
+                seq_id, sequence = parts
+                seq_id = seq_id.strip()
+                sequence = sequence.strip()
+                
+                if not seq_id or not sequence:
+                    print(f"Warning: Line {line_num} has empty id or sequence, skipping")
+                    continue
+                
+                sequences.append({
+                    'id': seq_id,
+                    'sequence': sequence
+                })
+        
+        print(f"Loaded {len(sequences)} sequences from {tsv_file}")
+        return sequences
+    
+    def _index_file(self, dataset_file: str):
+        """Index FASTA or TSV file for on-demand loading"""
+        if self.file_format == 'tsv':
+            return self._index_tsv(dataset_file)
+        else:
+            return self._index_fasta(dataset_file)
+    
     def _index_fasta(self, fasta_file: str):
         """Index FASTA file for on-demand loading (stores file offsets)"""
         offsets = []
@@ -135,9 +206,31 @@ class SequenceDataset(Dataset):
         print(f"Indexed {len(offsets)} sequences from {fasta_file}")
         return offsets
     
+    def _index_tsv(self, tsv_file: str):
+        """Index TSV file for on-demand loading (stores file offsets)"""
+        offsets = []
+        with open(tsv_file, 'r') as f:
+            while True:
+                offset = f.tell()
+                line = f.readline()
+                if not line:
+                    break
+                # Each non-empty line is a sequence entry
+                if line.strip():
+                    offsets.append(offset)
+        print(f"Indexed {len(offsets)} sequences from {tsv_file}")
+        return offsets
+    
     def _read_sequence_at_offset(self, offset: int):
         """Read a single sequence from file at given offset"""
-        with open(self.fasta_file, 'r') as f:
+        if self.file_format == 'tsv':
+            return self._read_sequence_at_offset_tsv(offset)
+        else:
+            return self._read_sequence_at_offset_fasta(offset)
+    
+    def _read_sequence_at_offset_fasta(self, offset: int):
+        """Read a single sequence from FASTA file at given offset"""
+        with open(self.dataset_file, 'r') as f:
             f.seek(offset)
             header = f.readline().strip()
             seq_id = header[1:]  # Remove '>'
@@ -148,6 +241,21 @@ class SequenceDataset(Dataset):
                     break
                 seq_lines.append(line.strip())
             return {'id': seq_id, 'sequence': ''.join(seq_lines)}
+    
+    def _read_sequence_at_offset_tsv(self, offset: int):
+        """Read a single sequence from TSV file at given offset"""
+        with open(self.dataset_file, 'r') as f:
+            f.seek(offset)
+            line = f.readline().strip()
+            if not line:
+                return {'id': '', 'sequence': ''}
+            
+            parts = line.split('\t')
+            if len(parts) != 2:
+                return {'id': '', 'sequence': ''}
+            
+            seq_id, sequence = parts
+            return {'id': seq_id.strip(), 'sequence': sequence.strip()}
     
     def __len__(self):
         if self.preload:
@@ -193,7 +301,7 @@ class RepresentationDistillationDataModule(pl.LightningDataModule):
     
     def __init__(
         self,
-        fasta_path: str,
+        dataset_path: str,
         batch_size: int = 1,
         num_workers: int = 0,
         max_length: Optional[int] = 256,
@@ -207,7 +315,7 @@ class RepresentationDistillationDataModule(pl.LightningDataModule):
         data_loading_strategy: str = 'on_demand',
     ):
         super().__init__()
-        self.fasta_path = fasta_path
+        self.dataset_path = dataset_path
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.max_length = max_length
@@ -237,7 +345,7 @@ class RepresentationDistillationDataModule(pl.LightningDataModule):
     def setup(self, stage=None):
         """Setup datasets with train/val split"""
         # Load full dataset from single FASTA file
-        full_dataset = SequenceDataset(self.fasta_path, self.max_length, preload=self.preload_sequences)
+        full_dataset = SequenceDataset(self.dataset_path, self.max_length, preload=self.preload_sequences)
         
         # Split from training data
         random.seed(self.split_seed)
@@ -814,8 +922,8 @@ def main():
                        help='Path to YAML config file (follows AFdistill/configs/ pattern)')
     
     # Data arguments
-    parser.add_argument('--fasta_path', type=str, required=True,
-                       help='Path to training FASTA file')
+    parser.add_argument('--dataset_path', type=str, required=True,
+                       help='Path to the dataset file containing sequences; can be a FASTA file or a TSV file')
     parser.add_argument('--max_length', type=int, default=256,
                        help='Maximum sequence length')
     
@@ -926,7 +1034,7 @@ def main():
     
     # Convert relative paths to absolute (relative to home directory)
     home_dir = Path.home()
-    path_args = ['fasta_path', 'weights_path', 'adaptive_config_path', 
+    path_args = ['dataset_path', 'weights_path', 'adaptive_config_path', 
                 'trained_models_dir', 'output_dir', 'config']
     
     for path_arg in path_args:
@@ -979,8 +1087,8 @@ def main():
         print(f"Created adaptive config file: {args.adaptive_config_path}")
     
     # Validate required arguments
-    if not args.fasta_path:
-        raise ValueError("--fasta_path is required (or provide via --config)")
+    if not args.dataset_path:
+        raise ValueError("--dataset_path is required (or provide via --config)")
     if not args.weights_path:
         raise ValueError("--weights_path is required (or provide via --config)")
     if not args.output_dir:
@@ -995,7 +1103,7 @@ def main():
     print("="*80)
     print("REPRESENTATION DISTILLATION TRAINING")
     print("="*80)
-    print(f"FASTA path: {args.fasta_path}")
+    print(f"dataset path: {args.dataset_path}")
     print(f"Max length: {args.max_length}")
     print(f"Weights path: {args.weights_path}")
     print(f"Adaptive config: {args.adaptive_config_path}")
@@ -1011,7 +1119,7 @@ def main():
     
     # Create data module
     datamodule = RepresentationDistillationDataModule(
-        fasta_path=args.fasta_path,
+        dataset_path=args.dataset_path,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         max_length=args.max_length,
