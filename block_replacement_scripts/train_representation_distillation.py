@@ -33,6 +33,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning.loggers import WandbLogger
 import yaml
 import random
+import json
 
 # Add openfold to path
 sys.path.append(str(Path(__file__).parent.parent))
