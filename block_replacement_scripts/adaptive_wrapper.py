@@ -11,9 +11,13 @@ import torch.nn as nn
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 import json
+import sys
+
+# Add openfold to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Import adaptive evoformer blocks
-from .adaptive_evoformer_blocks import (
+from openfold.block_replacement_scripts.adaptive_evoformer_blocks import (
     replace_evoformer_blocks_with_adaptive,
     AdaptiveWeightPredictor
 )

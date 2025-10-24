@@ -33,7 +33,7 @@ from openfold.utils.multi_chain_permutation import multi_chain_permutation_align
 from openfold.utils.lr_schedulers import AlphaFoldLRScheduler
 
 # Import adaptive training utilities
-from .adaptive_wrapper import (
+from openfold.block_replacement_scripts.adaptive_wrapper import (
     setup_adaptive_training_model,
     compute_adaptive_replace_loss,
     freeze_model_except_adaptive_components

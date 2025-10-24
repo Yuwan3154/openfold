@@ -15,11 +15,11 @@ from typing import Tuple, Optional, Dict, Any
 from pathlib import Path
 import copy
 
-# Import from parent directory
-sys.path.append(str(Path(__file__).parent.parent))
+# Add openfold to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from openfold.model.primitives import Linear
-from block_replacement_scripts.custom_evoformer_replacement import SimpleEvoformerReplacement
+from openfold.block_replacement_scripts.custom_evoformer_replacement import SimpleEvoformerReplacement
 
 
 class AdaptiveWeightPredictor(nn.Module):

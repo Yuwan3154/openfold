@@ -45,8 +45,7 @@ from openfold.data import feature_pipeline, data_pipeline, templates
 from openfold.utils.tensor_utils import tensor_tree_map
 
 # Import adaptive training utilities
-sys.path.append(str(Path(__file__).parent))
-from adaptive_wrapper import (
+from openfold.block_replacement_scripts.adaptive_wrapper import (
     setup_adaptive_training_model,
     compute_adaptive_replace_loss,
     freeze_model_except_adaptive_components
