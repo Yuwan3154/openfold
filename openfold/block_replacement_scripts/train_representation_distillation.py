@@ -31,6 +31,7 @@ from torch.utils.data import Dataset, DataLoader
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning.loggers import WandbLogger
+from pytorch_lightning.strategies import DDPStrategy
 import yaml
 import random
 import json
@@ -448,7 +449,7 @@ class RepresentationDistillationDataModule(pl.LightningDataModule):
             
             teacher_model.load_state_dict(state_dict, strict=False)
         
-        # Move to GPU if available and set to eval mode
+        # Move to GPU and set to eval mode
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         teacher_model = teacher_model.to(device)
         teacher_model.eval()
@@ -528,58 +529,59 @@ _atom_site.pdbx_PDB_model_num 1
             seqemb_mode=False
         )
         
+        # Add placeholder ground truth features for sequence-only training
+        # These are required by some data transforms but won't affect representation extraction
+        num_res = len(sequence)
+        feature_dict['all_atom_positions'] = np.zeros((num_res, 37, 3), dtype=np.float32)
+        feature_dict['all_atom_mask'] = np.ones((num_res, 37), dtype=np.float32)  # Assume all atoms present
+        feature_dict['resolution'] = np.array([0.0], dtype=np.float32)  # Placeholder resolution
+        feature_dict['is_distillation'] = np.array(0.0, dtype=np.float32)  # Not distillation data
+        feature_dict['release_date'] = np.array(['2025-01-01'.encode('utf-8')], dtype=object)  # Placeholder date
+        
         # Cleanup
         os.remove(tmp_fasta_path)
         shutil.rmtree(temp_alignment_dir)
         
         return feature_dict
     
-    def _generate_target_representations(
+    def _generate_target_representations_from_processed(
         self, 
-        feature_dict: Dict[str, np.ndarray],
+        processed_batch: Dict[str, torch.Tensor],
         device: torch.device
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Generate target representations using teacher model.
+        Generate target representations using teacher model from already-processed features.
         
-        Following OpenFold's uniform_recycling convention:
-        - Uniformly sample num_iters from [0, 1, ..., max_recycling_iters-1]
-        - Run teacher with that many recycling iterations
-        - Return representations from the final iteration
+        For representation distillation, we always use 0 recycles for efficiency
+        since we only need the Evoformer outputs, not structure predictions.
+        
+        Args:
+            processed_batch: Already processed features (as tensors on device)
+            device: Device to run on
+        
+        Returns:
+            target_s: Single representation [batch, N, C_s]
+            target_z: Pair representation [batch, N, N, C_z]
         """
         # Get teacher for current worker/process
-        teacher_model, feature_processor, _ = self._get_or_create_teacher_components()
+        teacher_model, _, _ = self._get_or_create_teacher_components()
         
-        # Process features for model input
-        processed_features = feature_processor.process_features(
-            feature_dict, mode='predict', is_multimer=False
-        )
+        # Make a copy to avoid modifying the student batch
+        teacher_batch = {k: v.clone() if isinstance(v, torch.Tensor) else v 
+                        for k, v in processed_batch.items()}
         
-        # Convert to tensors and move to device
-        processed_features = {
-            k: torch.as_tensor(v, device=device)
-            for k, v in processed_features.items()
-        }
-        
-        # Determine number of recycling iterations following OpenFold's uniform_recycling
-        if self.use_recycling and self.uniform_recycling:
-            # Uniformly sample from [0, 1, ..., max_recycling_iters-1]
-            # Note: max_recycling_iters=3 means we sample from [0, 1, 2]
-            num_recycles = np.random.randint(0, self.max_recycling_iters)
-        else:
-            num_recycles = 0
-        
-        # Override recycling in features
-        processed_features['no_recycling_iters'] = torch.tensor(num_recycles, device=device)
+        # Add flag to request representations only (skip structure module)
+        teacher_batch['return_representations'] = True
         
         # Run teacher model (no gradients)
         with torch.no_grad():
-            outputs = teacher_model(processed_features)
+            outputs = teacher_model(teacher_batch)
         
         # Extract single (s) and pair (z) representations
         # These are after the Evoformer stack
-        target_s = outputs['single']  # [N, C_s] where C_s = 384
-        target_z = outputs['pair']    # [N, N, C_z] where C_z = 128
+        # Shapes: [batch, N, C_s] and [batch, N, N, C_z]
+        target_s = outputs['single']
+        target_z = outputs['pair']
         
         return target_s, target_z
     
@@ -608,23 +610,43 @@ _atom_site.pdbx_PDB_model_num 1
         # Determine device
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        # Generate target representations using teacher model
-        target_s, target_z = self._generate_target_representations(feature_dict, device)
-        
-        # Prepare student batch (sequence features without teacher inference)
-        # The student will learn to generate these representations from scratch
-        from openfold.data import feature_pipeline
+        # Process features once for both teacher and student
+        # IMPORTANT: Use same mode to ensure identical feature processing
         _, feature_processor, _ = self._get_or_create_teacher_components()
-        
-        student_features = feature_processor.process_features(
+        processed_features = feature_processor.process_features(
             feature_dict, mode='train', is_multimer=False
         )
         
         # Convert to tensors
-        student_batch = {
+        processed_batch = {
             k: torch.as_tensor(v, device=device)
-            for k, v in student_features.items()
+            for k, v in processed_features.items()
         }
+        
+        # Generate target representations using teacher model
+        # Teacher uses the same processed features as student
+        target_s, target_z = self._generate_target_representations_from_processed(
+            processed_batch, device
+        )
+        
+        # Prepare student batch (copy of processed features)
+        student_batch = processed_batch.copy()
+        
+        # Add flag to request representations only (skip structure module)
+        student_batch['return_representations'] = True
+        
+        # Create proper sequence mask based on actual sequence length
+        # The features might be padded to max_length, but we only want loss on actual sequence
+        actual_seq_len = len(sequence)
+        if 'seq_mask' in student_batch:
+            # Get the padded sequence length from the feature shape
+            padded_len = student_batch['seq_mask'].shape[-1]  # Last dim after recycling
+            if actual_seq_len < padded_len:
+                # Create mask: 1 for actual sequence, 0 for padding
+                # Shape should match seq_mask: [..., N] where last dim is sequence length
+                mask = torch.zeros_like(student_batch['seq_mask'])
+                mask[..., :actual_seq_len] = 1.0
+                student_batch['seq_mask'] = mask
         
         # Return batch dict with targets
         return {
@@ -632,7 +654,7 @@ _atom_site.pdbx_PDB_model_num 1
             'target_s': target_s,
             'target_z': target_z,
             'seq_id': seq_id,
-            'seq_length': len(sequence),
+            'seq_length': actual_seq_len,
         }
     
     def train_dataloader(self):
@@ -697,7 +719,6 @@ class RepresentationDistillationModule(pl.LightningModule):
         self.student_model = AlphaFold(config)
         
         self.adaptive_setup_done = False
-        self.optimizer_configured = False
     
     def on_fit_start(self):
         """Setup adaptive training after model is created"""
@@ -728,68 +749,81 @@ class RepresentationDistillationModule(pl.LightningModule):
             print("="*80 + "\n")
             
             self.adaptive_setup_done = True
-            
-            # Reconfigure optimizer after model structure changes
-            self._reconfigure_optimizer()
-            self.optimizer_configured = True
     
     def _reconfigure_optimizer(self):
         """Reconfigure optimizer after adaptive blocks are applied"""
-        if not hasattr(self, 'trainer') or self.trainer is None:
-            return
-        
-        if not hasattr(self.trainer, 'optimizers') or not self.trainer.optimizers:
-            return
-        
-        # Get trainable parameters after adaptive setup
-        trainable_params = [p for p in self.student_model.parameters() if p.requires_grad]
-        
-        # Create new optimizer
-        new_optimizer = torch.optim.AdamW(
-            trainable_params,
-            lr=self.learning_rate,
-            weight_decay=self.weight_decay,
-        )
-        
-        # Replace in trainer
-        self.trainer.optimizers = [new_optimizer]
-        
-        # Recreate scheduler
-        def lr_lambda(current_step):
-            if current_step < self.warmup_steps:
-                return float(current_step) / float(max(1, self.warmup_steps))
-            return 1.0
-        
-        scheduler = torch.optim.lr_scheduler.LambdaLR(new_optimizer, lr_lambda)
-        
-        # Replace scheduler in trainer
-        self.trainer.lr_scheduler_configs = [{
-            'scheduler': scheduler,
-            'interval': 'step',
-            'frequency': 1,
-        }]
-        
-        print("Optimizer reconfigured with trainable parameters after adaptive setup")
+        # We can't reconfigure the optimizer here because PyTorch Lightning
+        # hasn't set up the trainer fully yet. We'll handle this in configure_optimizers
+        # by checking if adaptive setup is done.
+        print("Optimizer will be configured in configure_optimizers() with adaptive parameters")
     
     def forward(self, batch):
         """Forward pass through student model"""
         return self.student_model(batch)
     
-    def _compute_loss(self, pred_s, pred_z, target_s, target_z):
+    def _compute_loss(self, pred_s, pred_z, target_s, target_z, seq_mask=None):
         """
         Compute MSE loss between predicted and target representations.
         
         Args:
-            pred_s: Predicted single representation [N, C_s]
-            pred_z: Predicted pair representation [N, N, C_z]
-            target_s: Target single representation [N, C_s]
-            target_z: Target pair representation [N, N, C_z]
+            pred_s: Predicted single representation [batch, N, C_s] or [N, C_s]
+            pred_z: Predicted pair representation [batch, N, N, C_z] or [N, N, C_z]
+            target_s: Target single representation [batch, N, C_s] or [N, C_s]
+            target_z: Target pair representation [batch, N, N, C_z] or [N, N, C_z]
+            seq_mask: Optional mask for valid positions
+                     Can be [N], [N, recycle], [batch, N], or [batch, N, recycle]
         """
-        # MSE loss on single representation
-        loss_s = F.mse_loss(pred_s, target_s)
+        # Ensure both have batch dimension
+        if pred_s.ndim == 2:
+            pred_s = pred_s.unsqueeze(0)
+        if target_s.ndim == 2:
+            target_s = target_s.unsqueeze(0)
+        if pred_z.ndim == 3:
+            pred_z = pred_z.unsqueeze(0)
+        if target_z.ndim == 3:
+            target_z = target_z.unsqueeze(0)
         
-        # MSE loss on pair representation
-        loss_z = F.mse_loss(pred_z, target_z)
+        # MSE loss on single representation with optional masking
+        if seq_mask is not None:
+            # Handle seq_mask which might have recycling dimension
+            # seq_mask could be: [N], [N, recycle], [batch, N], or [batch, N, recycle]
+            
+            # First, handle recycling dimension if present
+            if seq_mask.ndim >= 2 and seq_mask.shape[-1] <= 10:  # Heuristic: recycling dim is small
+                if seq_mask.ndim == 2 and seq_mask.shape[0] > seq_mask.shape[1]:
+                    # [N, recycle_dim] -> [N]
+                    seq_mask = seq_mask[:, 0]
+                elif seq_mask.ndim == 3:
+                    # [batch, N, recycle_dim] -> [batch, N]
+                    seq_mask = seq_mask[..., 0]
+            
+            # Now handle batch dimension
+            if seq_mask.ndim == 1:
+                seq_mask = seq_mask.unsqueeze(0)  # [N] -> [1, N]
+            
+            # Now seq_mask is [batch, N]
+            mask_s = seq_mask.unsqueeze(-1)  # [batch, N, 1]
+            
+            # Compute masked MSE
+            diff_s = (pred_s - target_s) ** 2  # [batch, N, C_s]
+            masked_diff_s = diff_s * mask_s
+            loss_s = masked_diff_s.sum() / (mask_s.sum() * pred_s.shape[-1] + 1e-8)
+        else:
+            loss_s = F.mse_loss(pred_s, target_s)
+        
+        # MSE loss on pair representation with optional masking
+        if seq_mask is not None:
+            # seq_mask is already [batch, N] from above
+            # Create pair mask: [batch, N, N]
+            mask_z = seq_mask.unsqueeze(-1) * seq_mask.unsqueeze(-2)  # [batch, N, N]
+            mask_z = mask_z.unsqueeze(-1)  # [batch, N, N, 1]
+            
+            # Compute masked MSE
+            diff_z = (pred_z - target_z) ** 2  # [batch, N, N, C_z]
+            masked_diff_z = diff_z * mask_z
+            loss_z = masked_diff_z.sum() / (mask_z.sum() * pred_z.shape[-1] + 1e-8)
+        else:
+            loss_z = F.mse_loss(pred_z, target_z)
         
         # Total loss (simple sum, can adjust weights if needed)
         total_loss = loss_s + loss_z
@@ -798,11 +832,6 @@ class RepresentationDistillationModule(pl.LightningModule):
     
     def training_step(self, batch_dict, batch_idx):
         """Training step"""
-        # Fallback: ensure optimizer is configured (safety check)
-        if self.adaptive_setup_done and not self.optimizer_configured:
-            self._reconfigure_optimizer()
-            self.optimizer_configured = True
-        
         student_batch = batch_dict['student_batch']
         target_s = batch_dict['target_s']
         target_z = batch_dict['target_z']
@@ -815,8 +844,11 @@ class RepresentationDistillationModule(pl.LightningModule):
         pred_s = outputs['single']
         pred_z = outputs['pair']
         
-        # Compute base loss (MSE on representations)
-        base_loss, loss_s, loss_z = self._compute_loss(pred_s, pred_z, target_s, target_z)
+        # Get sequence mask from batch (accounts for padding)
+        seq_mask = student_batch.get('seq_mask', None)
+        
+        # Compute base loss (MSE on representations with masking)
+        base_loss, loss_s, loss_z = self._compute_loss(pred_s, pred_z, target_s, target_z, seq_mask=seq_mask)
         
         # Add adaptive replace loss if applicable
         if self.adaptive_setup_done and self.replace_loss_scaler > 0:
@@ -855,8 +887,11 @@ class RepresentationDistillationModule(pl.LightningModule):
         pred_s = outputs['single']
         pred_z = outputs['pair']
         
-        # Compute base loss (MSE on representations)
-        base_loss, loss_s, loss_z = self._compute_loss(pred_s, pred_z, target_s, target_z)
+        # Get sequence mask from batch (accounts for padding)
+        seq_mask = student_batch.get('seq_mask', None)
+        
+        # Compute base loss (MSE on representations with masking)
+        base_loss, loss_s, loss_z = self._compute_loss(pred_s, pred_z, target_s, target_z, seq_mask=seq_mask)
         
         # Add adaptive replace loss if applicable
         if self.adaptive_setup_done and self.replace_loss_scaler > 0:
@@ -883,8 +918,12 @@ class RepresentationDistillationModule(pl.LightningModule):
     
     def configure_optimizers(self):
         """Configure optimizer with warmup"""
-        # Only optimize trainable parameters
+        # Only optimize trainable parameters (after adaptive setup, these will be only adaptive components)
         trainable_params = [p for p in self.student_model.parameters() if p.requires_grad]
+        
+        num_trainable = sum(p.numel() for p in trainable_params)
+        total_params = sum(p.numel() for p in self.student_model.parameters())
+        print(f"Configuring optimizer with {num_trainable:,} / {total_params:,} trainable parameters")
         
         optimizer = torch.optim.AdamW(
             trainable_params,
@@ -921,7 +960,7 @@ def main():
                        help='Path to YAML config file (follows AFdistill/configs/ pattern)')
     
     # Data arguments
-    parser.add_argument('--dataset_path', type=str, required=True,
+    parser.add_argument('--dataset_path', type=str, required=False,
                        help='Path to the dataset file containing sequences; can be a FASTA file or a TSV file')
     parser.add_argument('--max_length', type=int, default=256,
                        help='Maximum sequence length')
@@ -979,14 +1018,17 @@ def main():
                        help='Data loading strategy (on_demand only for repr distill - targets generated on-the-fly)')
     
     # Hardware arguments
-    parser.add_argument('--gpus', type=int, default=1,
+    parser.add_argument('--gpus', type=int,
                        help='Number of GPUs')
-    parser.add_argument('--precision', type=str, default='bf16-mixed',
+    parser.add_argument('--precision', type=str,
                        choices=['16', '32', 'bf16', 'bf16-mixed'],
                        help='Training precision')
-    parser.add_argument('--strategy', type=str, default='ddp',
+    parser.add_argument('--strategy', type=str,
                        choices=['ddp', 'ddp_spawn', 'dp', None],
                        help='Distributed training strategy')
+    parser.add_argument('--distributed_backend', type=str,
+                       choices=['nccl', 'gloo', 'mpi'],
+                       help='Distributed backend (nccl for GPU, gloo for CPU/compatibility)')
     
     # Logging arguments
     parser.add_argument('--output_dir', type=str, required=False,
@@ -1030,6 +1072,7 @@ def main():
             if key not in provided_args:
                 if hasattr(args, key):
                     setattr(args, key, value)
+            # If command line arg was provided, it takes precedence (already set by argparse)
     
     # Convert relative paths to absolute (relative to home directory)
     home_dir = Path.home()
@@ -1047,6 +1090,14 @@ def main():
     # Set split_seed to seed if not specified
     if args.split_seed is None:
         args.split_seed = args.seed
+    
+    # Set defaults for required fields if not provided
+    if not hasattr(args, 'gpus') or args.gpus is None:
+        args.gpus = 1
+    if not hasattr(args, 'precision') or args.precision is None:
+        args.precision = 'bf16-mixed'
+    if not hasattr(args, 'strategy') or args.strategy is None:
+        args.strategy = 'ddp'
     
     # Note about data_loading_strategy
     # For representation distillation:
@@ -1156,9 +1207,10 @@ def main():
     )
     callbacks.append(checkpoint_callback)
     
-    # Learning rate monitor
-    lr_monitor = LearningRateMonitor(logging_interval='step')
-    callbacks.append(lr_monitor)
+    # Learning rate monitor (only if logger is configured)
+    if args.wandb:
+        lr_monitor = LearningRateMonitor(logging_interval='step')
+        callbacks.append(lr_monitor)
     
     # Setup logger
     loggers = []
@@ -1171,11 +1223,23 @@ def main():
         )
         loggers.append(wandb_logger)
     
-    # Setup strategy for DDP
+    # IMPORTANT: Force num_workers=0 to avoid CUDA forking issues with teacher model
+    # The teacher model needs to run on GPU, but dataloader workers + CUDA + fork don't work together
+    if args.num_workers > 0:
+        print(f"WARNING: Forcing num_workers=0 (was {args.num_workers}) to avoid CUDA forking issues")
+        print("         Teacher model must run on GPU, which is incompatible with forked workers")
+        args.num_workers = 0
+    
+    # Setup strategy for DDP with proper backend
     if args.gpus > 1:
-        strategy = args.strategy
+        # Get distributed backend from config (defaults to nccl for GPU)
+        distributed_backend = getattr(args, 'distributed_backend', 'nccl')
+        if args.strategy == 'ddp':
+            strategy = DDPStrategy(process_group_backend=distributed_backend)
+        else:
+            strategy = args.strategy
     else:
-        strategy = None  # Single GPU doesn't need strategy
+        strategy = 'auto'  # Single GPU uses auto strategy
     
     # Create trainer
     trainer = pl.Trainer(
