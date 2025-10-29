@@ -65,14 +65,16 @@ class SequenceDataset(Dataset):
     - on_demand: Load sequences on-the-fly from file (slower, lower memory)
     """
     
-    def __init__(self, dataset_file: str, max_length: Optional[int] = None, preload: bool = True):
+    def __init__(self, dataset_file: str, min_length: Optional[int] = None, max_length: Optional[int] = None, preload: bool = True):
         """
         Args:
             dataset_file: Path to FASTA or TSV file
+            min_length: Minimum sequence length (sequences shorter than this are filtered)
             max_length: Maximum sequence length (sequences longer than this are filtered)
             preload: If True, load all sequences into memory. If False, load on-demand.
         """
         self.dataset_file = dataset_file
+        self.min_length = min_length
         self.max_length = max_length
         self.preload = preload
         
@@ -84,6 +86,11 @@ class SequenceDataset(Dataset):
             # Preload all sequences into memory
             self.sequences = self._load_sequences(dataset_file)
             # Filter by length if specified
+            if min_length:
+                original_count = len(self.sequences)
+                self.sequences = [s for s in self.sequences if len(s['sequence']) >= min_length]
+                if original_count > len(self.sequences):
+                    print(f"Filtered {original_count - len(self.sequences)} sequences shorter than {min_length}")
             if max_length:
                 original_count = len(self.sequences)
                 self.sequences = [s for s in self.sequences if len(s['sequence']) <= max_length]
@@ -93,6 +100,14 @@ class SequenceDataset(Dataset):
             # On-demand mode: just index the file
             self.sequence_offsets = self._index_file(dataset_file)
             # Filter by length if specified (requires reading sequences)
+            if min_length:
+                original_count = len(self.sequence_offsets)
+                self.sequence_offsets = [
+                    offset for offset in self.sequence_offsets
+                    if len(self._read_sequence_at_offset(offset)['sequence']) >= min_length
+                ]
+                if original_count > len(self.sequence_offsets):
+                    print(f"Filtered {original_count - len(self.sequence_offsets)} sequences shorter than {min_length}")
             if max_length:
                 original_count = len(self.sequence_offsets)
                 self.sequence_offsets = [
@@ -304,6 +319,7 @@ class RepresentationDistillationDataModule(pl.LightningDataModule):
         dataset_path: str,
         batch_size: int = 1,
         num_workers: int = 0,
+        min_length: Optional[int] = None,
         max_length: Optional[int] = 256,
         config_preset: str = "model_2_ptm",
         weights_path: str = None,
@@ -318,6 +334,7 @@ class RepresentationDistillationDataModule(pl.LightningDataModule):
         self.dataset_path = dataset_path
         self.batch_size = batch_size
         self.num_workers = num_workers
+        self.min_length = min_length
         self.max_length = max_length
         self.config_preset = config_preset
         self.weights_path = weights_path
@@ -345,7 +362,7 @@ class RepresentationDistillationDataModule(pl.LightningDataModule):
     def setup(self, stage=None):
         """Setup datasets with train/val split"""
         # Load full dataset from single FASTA file
-        full_dataset = SequenceDataset(self.dataset_path, self.max_length, preload=self.preload_sequences)
+        full_dataset = SequenceDataset(self.dataset_path, self.min_length, self.max_length, preload=self.preload_sequences)
         
         # Split from training data
         random.seed(self.split_seed)
@@ -1083,6 +1100,8 @@ def main():
     # Data arguments
     parser.add_argument('--dataset_path', type=str, required=False,
                        help='Path to the dataset file containing sequences; can be a FASTA file or a TSV file')
+    parser.add_argument('--min_length', type=int, default=50,
+                       help='Minimum sequence length')
     parser.add_argument('--max_length', type=int, default=256,
                        help='Maximum sequence length')
     
@@ -1275,6 +1294,7 @@ def main():
     print("REPRESENTATION DISTILLATION TRAINING")
     print("="*80)
     print(f"dataset path: {args.dataset_path}")
+    print(f"Min length: {args.min_length}")
     print(f"Max length: {args.max_length}")
     print(f"Weights path: {args.weights_path}")
     print(f"Adaptive config: {args.adaptive_config_path}")
@@ -1293,6 +1313,7 @@ def main():
         dataset_path=args.dataset_path,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
+        min_length=args.min_length,
         max_length=args.max_length,
         config_preset=args.config_preset,
         weights_path=args.weights_path,
