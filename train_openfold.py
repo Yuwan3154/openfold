@@ -41,14 +41,14 @@ from openfold.utils.import_weights import (
     import_openfold_weights_
 )
 from openfold.utils.logger import PerformanceLoggingCallback
-from block_replacement_scripts.custom_evoformer_replacement import (
+from openfold.block_replacement_scripts.custom_evoformer_replacement import (
     replace_evoformer_block, 
     freeze_all_except_replaced_block
 )
 
 # Import AdaptiveOpenFoldWrapper for adaptive training
 try:
-    from block_replacement_scripts.custom_openfold_wrapper import AdaptiveOpenFoldWrapper
+    from openfold.block_replacement_scripts.custom_openfold_wrapper import AdaptiveOpenFoldWrapper
     ADAPTIVE_WRAPPER_AVAILABLE = True
 except ImportError:
     ADAPTIVE_WRAPPER_AVAILABLE = False

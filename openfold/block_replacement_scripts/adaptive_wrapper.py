@@ -97,16 +97,16 @@ def compute_adaptive_replace_loss(
     """
     # Collect all predicted weights from adaptive blocks
     all_weights = []
-    
-    # Find all AdaptiveEvoformerBlock instances and collect their predicted weights
+
+    # Find all AdaptiveEvoformerBlock instances and get their predicted weights
     for name, module in model.named_modules():
-        # Check if this is an AdaptiveEvoformerBlock with stored weights
-        if hasattr(module, '_predicted_weights') and hasattr(module, 'block_idx'):
-            if module.block_idx in module._predicted_weights:
-                weight = module._predicted_weights[module.block_idx]
-                # Average over batch dimension
-                all_weights.append(weight.mean())
-    
+        # Check if this module has stored predicted weights from forward pass
+        if hasattr(module, '_predicted_weights') and module._predicted_weights:
+            for block_idx, weight in module._predicted_weights.items():
+                # Flatten weight to scalar (take mean if batch dimension exists)
+                weight_scalar = weight.mean()
+                all_weights.append(weight_scalar)
+
     if not all_weights:
         return torch.tensor(0.0, device=device, requires_grad=True)
     
@@ -124,19 +124,20 @@ def compute_adaptive_replace_loss(
 def freeze_model_except_adaptive_components(model: nn.Module) -> int:
     """
     Freeze all model parameters except adaptive weight predictors and replacement blocks.
-    
+
     Args:
         model: The model to freeze
-        
+
     Returns:
         Number of trainable parameters
     """
     # First, freeze everything
     for param in model.parameters():
         param.requires_grad = False
-    
+
     # Then unfreeze adaptive components (weight predictors and replacement blocks)
     trainable_params = 0
+
     for name, module in model.named_modules():
         if isinstance(module, AdaptiveWeightPredictor):
             # Unfreeze weight predictors
@@ -144,12 +145,9 @@ def freeze_model_except_adaptive_components(model: nn.Module) -> int:
                 param.requires_grad = True
                 trainable_params += param.numel()
         elif hasattr(module, 'replacement_block'):
-            # Unfreeze replacement blocks (already handled in AdaptiveEvoformerBlock.__init__)
+            # Unfreeze replacement blocks
             for param in module.replacement_block.parameters():
                 param.requires_grad = True
                 trainable_params += param.numel()
-    
-    total_params = sum(p.numel() for p in model.parameters())
-    # Print is handled in wrapper
-    
+
     return trainable_params

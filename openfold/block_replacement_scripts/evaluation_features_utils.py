@@ -164,7 +164,7 @@ def create_single_sequence_features(sequence: str) -> Dict[str, torch.Tensor]:
 def features_from_chain_id(chain_id: str, pdb_dir: str) -> Dict[str, torch.Tensor]:
     """Create features for a protein chain given its ID and structure directory"""
     
-    from enhanced_data_utils import EnhancedStructureFinder
+    from openfold.block_replacement_scripts.enhanced_data_utils import EnhancedStructureFinder
     
     # Find structure file
     structure_finder = EnhancedStructureFinder(

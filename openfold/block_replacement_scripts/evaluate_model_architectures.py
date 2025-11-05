@@ -54,15 +54,15 @@ from openfold.utils.tensor_utils import (
 )
 
 # Import our custom modules
-from custom_evoformer_replacement import (
+from openfold.block_replacement_scripts.custom_evoformer_replacement import (
     replace_evoformer_block,
     freeze_all_except_replaced_block
 )
-from enhanced_data_utils import (
+from openfold.block_replacement_scripts.enhanced_data_utils import (
     EnhancedStructureFinder,
     build_chain_ids_from_structures_and_list
 )
-from evaluation_features_utils import features_from_chain_id
+from openfold.block_replacement_scripts.evaluation_features_utils import features_from_chain_id
 
 
 class ModelArchitectureEvaluator:

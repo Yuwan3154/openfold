@@ -25,14 +25,20 @@ from openfold.block_replacement_scripts.custom_evoformer_replacement import Simp
 class AdaptiveWeightPredictor(nn.Module):
     """Predicts weights for adaptive Evoformer-replacement mixing"""
     
-    def __init__(self, c_m: int):
+    def __init__(self, c_m: int, initial_bias: float = 2.0):
+        """
+        Args:
+            c_m: MSA channel dimension
+            initial_bias: Initial bias for weight predictor (default 2.0 -> sigmoid ≈ 0.88)
+                         Use higher values (e.g., 5.0) for sigmoid ≈ 0.99
+        """
         super().__init__()
         self.linear = nn.Linear(c_m, 1)
         
-        # Initialize bias to 5.0 so that initial sigmoid(logit) ≈ 0.99
-        # This makes the model initially use ~99% original Evoformer
-        # and gradually learn to trust replacement blocks during training
-        self.linear.bias.data.fill_(5.0)
+        # Initialize bias to make model initially prefer original Evoformer
+        # This allows gradual learning to trust replacement blocks during training
+        self.linear.weight.data.fill_(0.0)
+        self.linear.bias.data.fill_(initial_bias)
         
     def forward(self, msa_representation):
         """
@@ -48,11 +54,11 @@ class AdaptiveWeightPredictor(nn.Module):
         pooled = torch.mean(single_rep, dim=-2)
         
         # Apply linear transformation: [batch, c_m] -> [batch, 1]
-        weight = self.linear(pooled)
-        
+        logit = self.linear(pooled)
+
         # Apply sigmoid to get weight in [0, 1]
-        weight = torch.sigmoid(weight)
-        
+        weight = torch.sigmoid(logit)
+
         return weight
 
 
@@ -80,11 +86,11 @@ class AdaptiveEvoformerBlock(nn.Module):
         self.replacement_block = replacement_block
         self.weight_predictor = weight_predictor
         self.block_idx = block_idx
-        
+
         # Freeze original block parameters
         for param in self.original_block.parameters():
             param.requires_grad = False
-            
+
         # Keep replacement block parameters trainable (we want to fine-tune them)
         for param in self.replacement_block.parameters():
             param.requires_grad = True
@@ -178,11 +184,11 @@ class AdaptiveEvoformerBlock(nn.Module):
                 pair_mask
             )
         
-        # 3. Predict adaptive weight from MSA representation
+        # 3. Predict adaptive weight from MSA representation INPUT (before blocks)
+        # This is key: use m_input (not m_orig or m_replace) for weight prediction
         weight = self.weight_predictor(m_input)  # [batch, 1]
-        
-        # Store the predicted weight for loss computation (attach to m_out)
-        # This allows the loss function to access the actual predicted weights
+
+        # Store the predicted weight for loss computation
         if not hasattr(self, '_predicted_weights'):
             self._predicted_weights = {}
         self._predicted_weights[self.block_idx] = weight
@@ -272,6 +278,7 @@ def replace_evoformer_blocks_with_adaptive(
     c_z: int = 128,
     hidden_dim: Optional[int] = None,
     replace_blocks: Optional[list] = None,
+    initial_bias: float = 2.0,
 ) -> Tuple[nn.Module, Dict[int, AdaptiveWeightPredictor]]:
     """
     Replace specified Evoformer blocks with adaptive versions.
@@ -284,6 +291,7 @@ def replace_evoformer_blocks_with_adaptive(
         c_z: Pair channel dimension
         hidden_dim: Hidden dimension for replacement blocks
         replace_blocks: List of block indices to replace (if None, replaces all available)
+        initial_bias: Initial bias for weight predictors (default 2.0 -> sigmoid ≈ 0.88)
         
     Returns:
         model: Modified model with adaptive blocks
@@ -339,8 +347,8 @@ def replace_evoformer_blocks_with_adaptive(
         replacement_block = replacement_block.to(device)
         original_block_copy = original_block_copy.to(device)
         
-        # Create weight predictor for this block and move to device
-        weight_predictor = AdaptiveWeightPredictor(c_m=c_m)
+        # Create weight predictor for this block with specified initial bias
+        weight_predictor = AdaptiveWeightPredictor(c_m=c_m, initial_bias=initial_bias)
         weight_predictor = weight_predictor.to(device)
         weight_predictors[block_idx] = weight_predictor
         

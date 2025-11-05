@@ -467,7 +467,14 @@ class RepresentationDistillationDataModule(pl.LightningDataModule):
             teacher_model.load_state_dict(state_dict, strict=False)
         
         # Move to GPU and set to eval mode
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # In DDP, use the current process's device (cuda:0 for rank 0, cuda:1 for rank 1, etc.)
+        if torch.cuda.is_available():
+            # Get device from LOCAL_RANK environment variable (set by DDP)
+            # Fall back to current_device() if LOCAL_RANK not set
+            local_rank = int(os.environ.get('LOCAL_RANK', 0))
+            device = torch.device(f'cuda:{local_rank}')
+        else:
+            device = torch.device('cpu')
         teacher_model = teacher_model.to(device)
         teacher_model.eval()
         
@@ -624,8 +631,14 @@ _atom_site.pdbx_PDB_model_num 1
         # Create features from sequence
         feature_dict = self._create_features_from_sequence(sequence, seq_id)
         
-        # Determine device
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # Determine device - use current device for DDP compatibility
+        if torch.cuda.is_available():
+            # Get device from LOCAL_RANK environment variable (set by DDP)
+            # Fall back to 0 if LOCAL_RANK not set (single GPU case)
+            local_rank = int(os.environ.get('LOCAL_RANK', 0))
+            device = torch.device(f'cuda:{local_rank}')
+        else:
+            device = torch.device('cpu')
         
         # Process features once for both teacher and student
         # IMPORTANT: Use same mode to ensure identical feature processing
@@ -639,15 +652,14 @@ _atom_site.pdbx_PDB_model_num 1
             k: torch.as_tensor(v, device=device)
             for k, v in processed_features.items()
         }
-        
+        # Prepare student batch (copy of processed features)
+        student_batch = processed_batch.copy()
+                
         # Generate target representations using teacher model
         # Teacher uses the same processed features as student
         target_s, target_z = self._generate_target_representations_from_processed(
             processed_batch, device
         )
-        
-        # Prepare student batch (copy of processed features)
-        student_batch = processed_batch.copy()
         
         # Add flag to request representations only (skip structure module)
         student_batch['return_representations'] = True
@@ -721,6 +733,7 @@ class RepresentationDistillationModule(pl.LightningModule):
         weight_decay: float = 1e-4,
         warmup_steps: int = 1000,
         replace_loss_scaler: float = 0.0,
+        weights_path: str = None,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -731,9 +744,32 @@ class RepresentationDistillationModule(pl.LightningModule):
         self.weight_decay = weight_decay
         self.warmup_steps = warmup_steps
         self.replace_loss_scaler = replace_loss_scaler
+        self.weights_path = weights_path
         
         # Create student model (will be modified with adaptive blocks in on_fit_start)
         self.student_model = AlphaFold(config)
+        
+        # Load pretrained weights BEFORE applying adaptive blocks
+        if weights_path:
+            print(f"Loading pretrained weights for student model: {weights_path}")
+            if weights_path.endswith('.npz'):
+                model_basename = Path(weights_path).stem
+                model_version = "_".join(model_basename.split("_")[1:])
+                import_jax_weights_(self.student_model, weights_path, version=model_version)
+            else:
+                checkpoint = torch.load(weights_path, map_location='cpu')
+                if 'state_dict' in checkpoint:
+                    state_dict = checkpoint['state_dict']
+                elif 'model' in checkpoint:
+                    state_dict = checkpoint['model']
+                else:
+                    state_dict = checkpoint
+                
+                if any(k.startswith('model.') for k in state_dict.keys()):
+                    state_dict = {k[6:]: v for k, v in state_dict.items() if k.startswith('model.')}
+                
+                self.student_model.load_state_dict(state_dict, strict=False)
+            print("Student model weights loaded successfully")
         
         self.adaptive_setup_done = False
         self.optimizer_configured = False  # Track if optimizer has been reconfigured
@@ -745,12 +781,6 @@ class RepresentationDistillationModule(pl.LightningModule):
             print("Setting up adaptive training for representation distillation")
             print("="*80)
             
-            # Import here to avoid circular dependencies
-            from openfold.block_replacement_scripts.adaptive_wrapper import (
-                setup_adaptive_training_model,
-                freeze_model_except_adaptive_components
-            )
-            
             # Apply adaptive blocks
             self.student_model, training_info = setup_adaptive_training_model(
                 model=self.student_model,
@@ -761,28 +791,23 @@ class RepresentationDistillationModule(pl.LightningModule):
             # Freeze all except adaptive components
             trainable_params = freeze_model_except_adaptive_components(self.student_model)
             total_params = sum(p.numel() for p in self.student_model.parameters())
-            
+
             print(f"Adaptive blocks: {len(training_info['weight_predictors'])}")
             print(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({trainable_params/total_params*100:.2f}%)")
             print("="*80 + "\n")
             
             self.adaptive_setup_done = True
             
-            # CRITICAL: Reconfigure optimizer after adaptive blocks are applied
+            # Reconfigure optimizer after adaptive blocks are applied
             self._reconfigure_optimizer()
     
     def _reconfigure_optimizer(self):
         """Reconfigure optimizer after adaptive blocks are applied"""
         if not hasattr(self, 'trainer') or self.trainer is None:
-            print("WARNING: Trainer not available yet, optimizer will be reconfigured in training_step")
             return
         
         # Get trainable parameters (now includes adaptive components)
         params_to_optimize = [p for p in self.student_model.parameters() if p.requires_grad]
-        num_trainable = sum(p.numel() for p in params_to_optimize)
-        total_params = sum(p.numel() for p in self.student_model.parameters())
-        
-        print(f"\nReconfiguring optimizer with {num_trainable:,} / {total_params:,} trainable parameters")
         
         # Create new optimizer with correct parameters
         new_optimizer = torch.optim.AdamW(
@@ -806,14 +831,13 @@ class RepresentationDistillationModule(pl.LightningModule):
                 scheduler = torch.optim.lr_scheduler.LambdaLR(new_optimizer, lr_lambda)
                 self.trainer.lr_schedulers = [{'scheduler': scheduler, 'interval': 'step', 'frequency': 1}]
             
-            print("Optimizer reconfigured successfully\n")
             self.optimizer_configured = True
     
     def forward(self, batch):
         """Forward pass through student model"""
         return self.student_model(batch)
     
-    def _compute_loss(self, pred_s, pred_z, target_s, target_z, seq_mask=None, log_details=False):
+    def _compute_loss(self, pred_s, pred_z, target_s, target_z, seq_mask=None):
         """
         Compute MSE loss between predicted and target representations.
         
@@ -824,17 +848,7 @@ class RepresentationDistillationModule(pl.LightningModule):
             target_z: Target pair representation [batch, N, N, C_z] or [N, N, C_z]
             seq_mask: Optional mask for valid positions
                      Can be [N], [N, recycle], [batch, N], or [batch, N, recycle]
-            log_details: If True, log detailed information about loss computation
         """
-        if log_details:
-            print(f"\n{'='*70}")
-            print("LOSS COMPUTATION DETAILS:")
-            print(f"  Initial shapes:")
-            print(f"    pred_s: {pred_s.shape}, target_s: {target_s.shape}")
-            print(f"    pred_z: {pred_z.shape}, target_z: {target_z.shape}")
-            if seq_mask is not None:
-                print(f"    seq_mask: {seq_mask.shape}, sum: {seq_mask.sum().item():.1f}")
-        
         # Ensure both have batch dimension
         if pred_s.ndim == 2:
             pred_s = pred_s.unsqueeze(0)
@@ -866,35 +880,16 @@ class RepresentationDistillationModule(pl.LightningModule):
             # Now seq_mask is [batch, N]
             mask_s = seq_mask.unsqueeze(-1)  # [batch, N, 1]
             
-            if log_details:
-                print(f"  After mask processing:")
-                print(f"    seq_mask: {seq_mask.shape}, sum: {seq_mask.sum().item():.1f}")
-                print(f"    mask_s: {mask_s.shape}, sum: {mask_s.sum().item():.1f}")
-                print(f"    Number of valid positions: {seq_mask.sum().item()}")
-            
             # Compute masked MSE
             diff_s = (pred_s - target_s) ** 2  # [batch, N, C_s]
             masked_diff_s = diff_s * mask_s
             
-            # IMPORTANT: Ensure we're averaging correctly
             # Sum over all dimensions, then divide by (num_valid_positions * num_channels)
             num_valid_positions = mask_s.sum()
             num_channels = pred_s.shape[-1]
             loss_s = masked_diff_s.sum() / (num_valid_positions * num_channels + 1e-8)
-            
-            if log_details:
-                print(f"  Single representation loss:")
-                print(f"    diff_s range: [{diff_s.min():.4f}, {diff_s.max():.4f}]")
-                print(f"    masked_diff_s sum: {masked_diff_s.sum():.4f}")
-                print(f"    num_valid_positions: {num_valid_positions:.0f}")
-                print(f"    num_channels: {num_channels}")
-                print(f"    loss_s: {loss_s:.6f}")
-                # Check if loss requires grad
-                print(f"    loss_s.requires_grad: {loss_s.requires_grad}")
         else:
             loss_s = F.mse_loss(pred_s, target_s)
-            if log_details:
-                print(f"  Single representation loss (unmasked): {loss_s:.6f}")
         
         # MSE loss on pair representation with optional masking
         if seq_mask is not None:
@@ -903,71 +898,31 @@ class RepresentationDistillationModule(pl.LightningModule):
             mask_z = seq_mask.unsqueeze(-1) * seq_mask.unsqueeze(-2)  # [batch, N, N]
             mask_z = mask_z.unsqueeze(-1)  # [batch, N, N, 1]
             
-            if log_details:
-                print(f"  Pair mask:")
-                print(f"    mask_z: {mask_z.shape}, sum: {mask_z.sum().item():.1f}")
-            
             # Compute masked MSE
             diff_z = (pred_z - target_z) ** 2  # [batch, N, N, C_z]
             masked_diff_z = diff_z * mask_z
             
-            # IMPORTANT: Ensure we're averaging correctly
             num_valid_pairs = mask_z.sum()
             num_channels_z = pred_z.shape[-1]
             loss_z = masked_diff_z.sum() / (num_valid_pairs * num_channels_z + 1e-8)
-            
-            if log_details:
-                print(f"  Pair representation loss:")
-                print(f"    diff_z range: [{diff_z.min():.4f}, {diff_z.max():.4f}]")
-                print(f"    masked_diff_z sum: {masked_diff_z.sum():.4f}")
-                print(f"    num_valid_pairs: {num_valid_pairs:.0f}")
-                print(f"    num_channels_z: {num_channels_z}")
-                print(f"    loss_z: {loss_z:.6f}")
-                print(f"    loss_z.requires_grad: {loss_z.requires_grad}")
         else:
             loss_z = F.mse_loss(pred_z, target_z)
-            if log_details:
-                print(f"  Pair representation loss (unmasked): {loss_z:.6f}")
         
         # Total loss (simple sum, can adjust weights if needed)
         total_loss = loss_s + loss_z
-        
-        if log_details:
-            print(f"  Total loss: {total_loss:.6f}")
-            print(f"  total_loss.requires_grad: {total_loss.requires_grad}")
-            print(f"{'='*70}\n")
         
         return total_loss, loss_s, loss_z
     
     def training_step(self, batch_dict, batch_idx):
         """Training step"""
-        # CRITICAL: Ensure optimizer is reconfigured if adaptive training is enabled
-        # This is a backup in case on_fit_start didn't have access to trainer yet
+        # Backup optimizer reconfiguration in case on_fit_start didn't have access to trainer yet
         if self.adaptive_setup_done and not self.optimizer_configured:
-            print("Reconfiguring optimizer in training_step (backup)")
             self._reconfigure_optimizer()
         
         student_batch = batch_dict['student_batch']
         target_s = batch_dict['target_s']
         target_z = batch_dict['target_z']
         seq_length = batch_dict['seq_length']
-        
-        # Log details for first few batches
-        log_details = (batch_idx < 3)
-        
-        if log_details:
-            print(f"\n{'='*70}")
-            print(f"TRAINING STEP {batch_idx}:")
-            print(f"  seq_length: {seq_length}")
-            print(f"  student_batch keys: {student_batch.keys()}")
-            print(f"  target_s: {target_s.shape}")
-            print(f"  target_z: {target_z.shape}")
-            
-            # Check if parameters require grad
-            num_params_with_grad = sum(1 for p in self.student_model.parameters() if p.requires_grad)
-            total_params = sum(1 for p in self.student_model.parameters())
-            print(f"  Parameters requiring grad: {num_params_with_grad} / {total_params}")
-            print(f"{'='*70}")
         
         # Forward pass through student model
         outputs = self(student_batch)
@@ -981,7 +936,7 @@ class RepresentationDistillationModule(pl.LightningModule):
         
         # Compute base loss (MSE on representations with masking)
         base_loss, loss_s, loss_z = self._compute_loss(
-            pred_s, pred_z, target_s, target_z, seq_mask=seq_mask, log_details=log_details
+            pred_s, pred_z, target_s, target_z, seq_mask=seq_mask
         )
         
         # Add adaptive replace loss if applicable
@@ -994,24 +949,20 @@ class RepresentationDistillationModule(pl.LightningModule):
             scaled_replace_loss = raw_replace_loss * self.replace_loss_scaler
             total_loss = base_loss + scaled_replace_loss
             
-            if log_details:
-                print(f"  Replace loss (raw): {raw_replace_loss:.6f}")
-                print(f"  Replace loss (scaled): {scaled_replace_loss:.6f}")
-            
-            # Log replace loss with explicit batch_size
+            # Log replace loss
             self.log('train/replace_loss_raw', raw_replace_loss, on_step=True, on_epoch=True, batch_size=1)
             self.log('train/replace_loss_scaled', scaled_replace_loss, on_step=True, on_epoch=True, batch_size=1)
         else:
             total_loss = base_loss
         
-        # Log metrics with explicit batch_size to avoid ambiguity warning
+        # Log metrics
         self.log('train/loss', total_loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=1)
         self.log('train/loss_single', loss_s, on_step=True, on_epoch=True, batch_size=1)
         self.log('train/loss_pair', loss_z, on_step=True, on_epoch=True, batch_size=1)
         self.log('train/seq_length', float(seq_length), on_step=False, on_epoch=True, batch_size=1)
         
         return total_loss
-    
+
     def validation_step(self, batch_dict, batch_idx):
         """Validation step"""
         student_batch = batch_dict['student_batch']
@@ -1055,7 +1006,22 @@ class RepresentationDistillationModule(pl.LightningModule):
         return total_loss
     
     def configure_optimizers(self):
-        """Configure optimizer with warmup"""
+        """Configure optimizer with warmup and special handling for adaptive training"""
+        
+        # CRITICAL: For adaptive training, defer optimizer configuration until after adaptive blocks are applied
+        # PyTorch Lightning calls this BEFORE on_fit_start(), so we return a placeholder that gets replaced
+        if self.adaptive_config_path and not self.adaptive_setup_done:
+            print("configure_optimizers() called BEFORE adaptive setup - returning placeholder optimizer")
+            # Return a placeholder optimizer that will be replaced in _reconfigure_optimizer()
+            placeholder_params = [p for p in self.student_model.parameters() if p.requires_grad]
+            placeholder_optimizer = torch.optim.AdamW(
+                placeholder_params,
+                lr=self.learning_rate,
+                weight_decay=self.weight_decay,
+            )
+            # Return without scheduler to keep it simple
+            return placeholder_optimizer
+        
         # Only optimize trainable parameters (after adaptive setup, these will be only adaptive components)
         trainable_params = [p for p in self.student_model.parameters() if p.requires_grad]
         
@@ -1284,6 +1250,12 @@ def main():
     if not args.output_dir:
         raise ValueError("--output_dir is required (or provide via --config)")
     
+    # Set float32 matmul precision for Tensor Cores (addresses warning about bf16-mixed)
+    # This is recommended when using bf16-mixed precision
+    if args.precision in ["bf16-mixed", "bf16"]:
+        torch.set_float32_matmul_precision('medium')  # or 'high' for more performance
+        print("Set torch.set_float32_matmul_precision('medium') for Tensor Cores")
+    
     # Set seed
     pl.seed_everything(args.seed, workers=True)
     
@@ -1333,6 +1305,7 @@ def main():
         weight_decay=args.weight_decay,
         warmup_steps=args.warmup_steps,
         replace_loss_scaler=args.replace_loss_scaler,
+        weights_path=args.weights_path,  # Pass weights path for initialization
     )
     
     # Setup callbacks
@@ -1381,7 +1354,12 @@ def main():
         else:
             strategy = args.strategy
     else:
-        strategy = 'auto'  # Single GPU uses auto strategy
+        # Single GPU: Force 'auto' strategy to avoid unnecessary DDP overhead
+        # DDP with 1 GPU spawns extra worker processes that waste memory
+        if args.strategy in ['ddp', 'ddp_spawn']:
+            print(f"WARNING: Changing strategy from '{args.strategy}' to 'auto' for single GPU")
+            print("         DDP with 1 GPU creates unnecessary worker processes")
+        strategy = 'auto'
     
     # Create trainer
     trainer = pl.Trainer(

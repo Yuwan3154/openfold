@@ -279,7 +279,7 @@ class OpenFoldSingleDataset(torch.utils.data.Dataset):
                             break
 
                     if ext is None:
-                        raise ValueError("Invalid file type")
+                        raise ValueError("Invalid file type: " + path)
 
                 path += ext
             if ext == ".cif":
