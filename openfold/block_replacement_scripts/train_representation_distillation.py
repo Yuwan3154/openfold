@@ -729,12 +729,13 @@ class RepresentationDistillationModule(pl.LightningModule):
     def __init__(
         self,
         config,
-        adaptive_config_path: str,
+        adaptive_config_path: str = None,
         learning_rate: float = 1e-3,
         weight_decay: float = 1e-4,
         warmup_steps: int = 1000,
         replace_loss_scaler: float = 0.0,
         weights_path: str = None,
+        resume_adaptive_checkpoint: str = None,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -746,93 +747,99 @@ class RepresentationDistillationModule(pl.LightningModule):
         self.warmup_steps = warmup_steps
         self.replace_loss_scaler = replace_loss_scaler
         self.weights_path = weights_path
+        self.resume_adaptive_checkpoint = resume_adaptive_checkpoint
         
-        # Create student model (will be modified with adaptive blocks in on_fit_start)
+        # Create base student model
         self.student_model = AlphaFold(config)
         
-        # Load pretrained weights BEFORE applying adaptive blocks
-        if weights_path:
-            print(f"Loading pretrained weights for student model: {weights_path}")
-            if weights_path.endswith('.npz'):
-                model_basename = Path(weights_path).stem
-                model_version = "_".join(model_basename.split("_")[1:])
-                import_jax_weights_(self.student_model, weights_path, version=model_version)
-            else:
-                checkpoint = torch.load(weights_path, map_location='cpu')
-                if 'state_dict' in checkpoint:
-                    state_dict = checkpoint['state_dict']
-                elif 'model' in checkpoint:
-                    state_dict = checkpoint['model']
-                else:
-                    state_dict = checkpoint
-                
-                if any(k.startswith('model.') for k in state_dict.keys()):
-                    state_dict = {k[6:]: v for k, v in state_dict.items() if k.startswith('model.')}
-                
-                self.student_model.load_state_dict(state_dict, strict=False)
-            print("Student model weights loaded successfully")
-        
-        self.adaptive_setup_done = False
-        self.optimizer_configured = False  # Track if optimizer has been reconfigured
-    
-    def on_fit_start(self):
-        """Setup adaptive training after model is created"""
-        if not self.adaptive_setup_done and self.adaptive_config_path:
-            print("\n" + "="*80)
-            print("Setting up adaptive training for representation distillation")
-            print("="*80)
+        # Determine initialization path
+        # Priority: resume_adaptive_checkpoint > weights_path + adaptive_config_path
+        if resume_adaptive_checkpoint:
+            # Path 2: Resume from checkpoint with adaptive blocks already applied
+            print(f"\n{'='*80}")
+            print(f"Resuming from adaptive checkpoint: {resume_adaptive_checkpoint}")
+            print(f"{'='*80}")
             
-            # Apply adaptive blocks
+            # Apply adaptive blocks (structure only, weights loaded by Lightning)
+            if not adaptive_config_path:
+                raise ValueError("adaptive_config_path is required when resuming from checkpoint")
+            
             self.student_model, training_info = setup_adaptive_training_model(
                 model=self.student_model,
-                config_path=Path(self.adaptive_config_path),
+                config_path=Path(adaptive_config_path),
                 model_config=self.config,
             )
             
             # Freeze all except adaptive components
             trainable_params = freeze_model_except_adaptive_components(self.student_model)
             total_params = sum(p.numel() for p in self.student_model.parameters())
-
+            
             print(f"Adaptive blocks: {len(training_info['weight_predictors'])}")
             print(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({trainable_params/total_params*100:.2f}%)")
-            print("="*80 + "\n")
+            print(f"Note: Weights will be loaded from checkpoint by Lightning")
+            print(f"{'='*80}\n")
             
             self.adaptive_setup_done = True
             
-            # Reconfigure optimizer after adaptive blocks are applied
-            self._reconfigure_optimizer()
+        elif weights_path and adaptive_config_path:
+            # Path 1: Initial training from base weights
+            print(f"\n{'='*80}")
+            print(f"Initial training: Loading base weights and applying adaptive blocks")
+            print(f"{'='*80}")
+            
+            # Load base weights first
+            self._load_base_weights(weights_path)
+            
+            # Apply adaptive blocks immediately
+            self.student_model, training_info = setup_adaptive_training_model(
+                model=self.student_model,
+                config_path=Path(adaptive_config_path),
+                model_config=self.config,
+            )
+            
+            # Freeze all except adaptive components
+            trainable_params = freeze_model_except_adaptive_components(self.student_model)
+            total_params = sum(p.numel() for p in self.student_model.parameters())
+            
+            print(f"Adaptive blocks: {len(training_info['weight_predictors'])}")
+            print(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({trainable_params/total_params*100:.2f}%)")
+            print(f"{'='*80}\n")
+            
+            self.adaptive_setup_done = True
+            
+        else:
+            raise ValueError(
+                "Must provide either:\n"
+                "  1. --resume_adaptive_checkpoint (for resuming training), OR\n"
+                "  2. --weights_path AND --adaptive_config_path (for initial training)"
+            )
     
-    def _reconfigure_optimizer(self):
-        """Reconfigure optimizer after adaptive blocks are applied"""
-        if not hasattr(self, 'trainer') or self.trainer is None:
-            return
+    def _load_base_weights(self, weights_path: str):
+        """Load base model weights (JAX or PyTorch)"""
+        print(f"Loading base weights: {weights_path}")
         
-        # Get trainable parameters (now includes adaptive components)
-        params_to_optimize = [p for p in self.student_model.parameters() if p.requires_grad]
-        
-        # Create new optimizer with correct parameters
-        new_optimizer = torch.optim.AdamW(
-            params_to_optimize,
-            lr=self.learning_rate,
-            weight_decay=self.weight_decay,
-        )
-        
-        # Replace optimizer in trainer
-        if hasattr(self.trainer, 'optimizers') and self.trainer.optimizers:
-            self.trainer.optimizers = [new_optimizer]
+        if weights_path.endswith('.npz'):
+            # JAX weights
+            model_basename = Path(weights_path).stem
+            model_version = "_".join(model_basename.split("_")[1:])
+            import_jax_weights_(self.student_model, weights_path, version=model_version)
+        else:
+            # PyTorch weights
+            checkpoint = torch.load(weights_path, map_location='cpu')
+            if 'state_dict' in checkpoint:
+                state_dict = checkpoint['state_dict']
+            elif 'model' in checkpoint:
+                state_dict = checkpoint['model']
+            else:
+                state_dict = checkpoint
             
-            # Also update lr_schedulers if they exist
-            if hasattr(self.trainer, 'lr_schedulers') and self.trainer.lr_schedulers:
-                # Recreate scheduler with new optimizer
-                def lr_lambda(current_step):
-                    if current_step < self.warmup_steps:
-                        return float(current_step) / float(max(1, self.warmup_steps))
-                    return 1.0
-                
-                scheduler = torch.optim.lr_scheduler.LambdaLR(new_optimizer, lr_lambda)
-                self.trainer.lr_schedulers = [{'scheduler': scheduler, 'interval': 'step', 'frequency': 1}]
+            # Remove 'model.' prefix if present
+            if any(k.startswith('model.') for k in state_dict.keys()):
+                state_dict = {k[6:]: v for k, v in state_dict.items() if k.startswith('model.')}
             
-            self.optimizer_configured = True
+            self.student_model.load_state_dict(state_dict, strict=False)
+        
+        print("Base weights loaded successfully")
     
     def forward(self, batch):
         """Forward pass through student model"""
@@ -916,10 +923,6 @@ class RepresentationDistillationModule(pl.LightningModule):
     
     def training_step(self, batch_dict, batch_idx):
         """Training step"""
-        # Backup optimizer reconfiguration in case on_fit_start didn't have access to trainer yet
-        if self.adaptive_setup_done and not self.optimizer_configured:
-            self._reconfigure_optimizer()
-        
         student_batch = batch_dict['student_batch']
         target_s = batch_dict['target_s']
         target_z = batch_dict['target_z']
@@ -1032,23 +1035,9 @@ class RepresentationDistillationModule(pl.LightningModule):
         return total_loss
     
     def configure_optimizers(self):
-        """Configure optimizer with warmup and special handling for adaptive training"""
+        """Configure optimizer with warmup scheduler"""
         
-        # CRITICAL: For adaptive training, defer optimizer configuration until after adaptive blocks are applied
-        # PyTorch Lightning calls this BEFORE on_fit_start(), so we return a placeholder that gets replaced
-        if self.adaptive_config_path and not self.adaptive_setup_done:
-            print("configure_optimizers() called BEFORE adaptive setup - returning placeholder optimizer")
-            # Return a placeholder optimizer that will be replaced in _reconfigure_optimizer()
-            placeholder_params = [p for p in self.student_model.parameters() if p.requires_grad]
-            placeholder_optimizer = torch.optim.AdamW(
-                placeholder_params,
-                lr=self.learning_rate,
-                weight_decay=self.weight_decay,
-            )
-            # Return without scheduler to keep it simple
-            return placeholder_optimizer
-        
-        # Only optimize trainable parameters (after adaptive setup, these will be only adaptive components)
+        # Collect trainable parameters (adaptive components only after freezing)
         trainable_params = [p for p in self.student_model.parameters() if p.requires_grad]
         
         num_trainable = sum(p.numel() for p in trainable_params)
@@ -1180,6 +1169,10 @@ def main():
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed')
     
+    # Checkpoint resuming
+    parser.add_argument('--resume_adaptive_checkpoint', type=str, default=None,
+                       help='Path to Lightning checkpoint (.ckpt) with adaptive blocks already applied. Takes priority over --weights_path.')
+    
     args = parser.parse_args()
     
     # CRITICAL: Determine which args were explicitly provided on command line
@@ -1209,7 +1202,7 @@ def main():
     # Convert relative paths to absolute (relative to home directory)
     home_dir = Path.home()
     path_args = ['dataset_path', 'weights_path', 'adaptive_config_path', 
-                'trained_models_dir', 'output_dir', 'config']
+                'trained_models_dir', 'output_dir', 'config', 'resume_adaptive_checkpoint']
     
     for path_arg in path_args:
         if hasattr(args, path_arg):
@@ -1241,40 +1234,74 @@ def main():
         print("  - Sequences: {'preloaded to memory' if args.data_loading_strategy in ['preload_cpu', 'preload_gpu'] else 'loaded on-demand'}")
         print("  - Targets (representations): Always generated on-the-fly by teacher model")
     
-    # Create adaptive_config_path if not provided (like train_adaptive_weighting.py does)
-    if not hasattr(args, 'adaptive_config_path') or not args.adaptive_config_path:
-        if not hasattr(args, 'trained_models_dir') or not args.trained_models_dir:
-            raise ValueError("Either --adaptive_config_path OR --trained_models_dir is required")
-        if not hasattr(args, 'linear_type') or not args.linear_type:
-            raise ValueError("--linear_type is required when trained_models_dir is provided")
-        
-        # Create adaptive training config file (same format as train_adaptive_weighting.py)
-        adaptive_config_data = {
-            "trained_models_dir": args.trained_models_dir,
-            "linear_type": args.linear_type,
-            "replace_loss_scaler": getattr(args, 'replace_loss_scaler', 0.0),
-            "log_structure_every_k_epoch": 0,  # Not used in repr distill (no structure prediction)
-            "disable_per_block_logging": True,  # Not used in repr distill
-            "adaptive_training": True
-        }
-        
-        # Create output directory if needed
-        os.makedirs(args.output_dir, exist_ok=True)
-        
-        # Save adaptive config
-        args.adaptive_config_path = os.path.join(args.output_dir, 'adaptive_training_cmd.json')
-        with open(args.adaptive_config_path, 'w') as f:
-            json.dump(adaptive_config_data, f, indent=2)
-        
-        print(f"Created adaptive config file: {args.adaptive_config_path}")
-    
-    # Validate required arguments
+    # Validate required arguments based on training mode
     if not args.dataset_path:
         raise ValueError("--dataset_path is required (or provide via --config)")
-    if not args.weights_path:
-        raise ValueError("--weights_path is required (or provide via --config)")
     if not args.output_dir:
         raise ValueError("--output_dir is required (or provide via --config)")
+    
+    # Two paths: resume from checkpoint OR initial training
+    if args.resume_adaptive_checkpoint:
+        # Path 2: Resuming from checkpoint
+        print(f"\n{'='*60}")
+        print("Mode: Resuming from adaptive checkpoint")
+        print(f"Checkpoint: {args.resume_adaptive_checkpoint}")
+        print(f"{'='*60}\n")
+        
+        # Still need adaptive_config_path to know the model structure
+        if not hasattr(args, 'adaptive_config_path') or not args.adaptive_config_path:
+            if not hasattr(args, 'trained_models_dir') or not args.trained_models_dir:
+                raise ValueError("When resuming, either --adaptive_config_path OR --trained_models_dir is required")
+            if not hasattr(args, 'linear_type') or not args.linear_type:
+                raise ValueError("--linear_type is required when trained_models_dir is provided")
+            
+            # Create adaptive training config file
+            adaptive_config_data = {
+                "trained_models_dir": args.trained_models_dir,
+                "linear_type": args.linear_type,
+                "replace_loss_scaler": getattr(args, 'replace_loss_scaler', 0.0),
+                "log_structure_every_k_epoch": 0,
+                "disable_per_block_logging": True,
+                "adaptive_training": True
+            }
+            
+            os.makedirs(args.output_dir, exist_ok=True)
+            args.adaptive_config_path = os.path.join(args.output_dir, 'adaptive_training_cmd.json')
+            with open(args.adaptive_config_path, 'w') as f:
+                json.dump(adaptive_config_data, f, indent=2)
+            print(f"Created adaptive config file: {args.adaptive_config_path}")
+        
+    else:
+        # Path 1: Initial training from base weights
+        print(f"\n{'='*60}")
+        print("Mode: Initial training from base weights")
+        print(f"{'='*60}\n")
+        
+        if not args.weights_path:
+            raise ValueError("--weights_path is required for initial training (or provide via --config)")
+        
+        # Create adaptive_config_path if not provided
+        if not hasattr(args, 'adaptive_config_path') or not args.adaptive_config_path:
+            if not hasattr(args, 'trained_models_dir') or not args.trained_models_dir:
+                raise ValueError("Either --adaptive_config_path OR --trained_models_dir is required")
+            if not hasattr(args, 'linear_type') or not args.linear_type:
+                raise ValueError("--linear_type is required when trained_models_dir is provided")
+            
+            # Create adaptive training config file
+            adaptive_config_data = {
+                "trained_models_dir": args.trained_models_dir,
+                "linear_type": args.linear_type,
+                "replace_loss_scaler": getattr(args, 'replace_loss_scaler', 0.0),
+                "log_structure_every_k_epoch": 0,
+                "disable_per_block_logging": True,
+                "adaptive_training": True
+            }
+            
+            os.makedirs(args.output_dir, exist_ok=True)
+            args.adaptive_config_path = os.path.join(args.output_dir, 'adaptive_training_cmd.json')
+            with open(args.adaptive_config_path, 'w') as f:
+                json.dump(adaptive_config_data, f, indent=2)
+            print(f"Created adaptive config file: {args.adaptive_config_path}")
     
     # Set float32 matmul precision for Tensor Cores (addresses warning about bf16-mixed)
     # This is recommended when using bf16-mixed precision
@@ -1331,7 +1358,8 @@ def main():
         weight_decay=args.weight_decay,
         warmup_steps=args.warmup_steps,
         replace_loss_scaler=args.replace_loss_scaler,
-        weights_path=args.weights_path,  # Pass weights path for initialization
+        weights_path=args.weights_path,
+        resume_adaptive_checkpoint=args.resume_adaptive_checkpoint,
     )
     
     # Setup callbacks
@@ -1403,7 +1431,11 @@ def main():
     
     # Train
     print("\nStarting training...")
-    trainer.fit(model, datamodule=datamodule)
+    trainer.fit(
+        model, 
+        datamodule=datamodule,
+        ckpt_path=args.resume_adaptive_checkpoint if args.resume_adaptive_checkpoint else None
+    )
     
     print("\n" + "="*80)
     print("Training complete!")
