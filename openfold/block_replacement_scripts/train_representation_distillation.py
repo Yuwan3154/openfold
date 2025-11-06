@@ -49,6 +49,7 @@ from openfold.utils.tensor_utils import tensor_tree_map
 from openfold.block_replacement_scripts.adaptive_wrapper import (
     setup_adaptive_training_model,
     compute_adaptive_replace_loss,
+    compute_block_match_loss,
     freeze_model_except_adaptive_components
 )
 
@@ -939,19 +940,32 @@ class RepresentationDistillationModule(pl.LightningModule):
             pred_s, pred_z, target_s, target_z, seq_mask=seq_mask
         )
         
-        # Add adaptive replace loss if applicable
+        # Add adaptive losses if applicable
         if self.adaptive_setup_done and self.replace_loss_scaler > 0:
+            # Compute replace loss (penalizes mean adaptive weights)
             raw_replace_loss = compute_adaptive_replace_loss(
                 model=self.student_model,
                 replace_loss_scaler=1.0,  # Get raw loss
                 device=base_loss.device,
             )
-            scaled_replace_loss = raw_replace_loss * self.replace_loss_scaler
-            total_loss = base_loss + scaled_replace_loss
             
-            # Log replace loss
+            # Compute block match loss (encourages replacement to match original)
+            block_match_loss = compute_block_match_loss(
+                model=self.student_model,
+                device=base_loss.device,
+            )
+            
+            # Scale and combine losses
+            # Both replace_loss and block_match_loss are scaled by replace_loss_scaler
+            scaled_replace_loss = raw_replace_loss * self.replace_loss_scaler
+            scaled_block_match_loss = block_match_loss * self.replace_loss_scaler
+            total_loss = base_loss + scaled_replace_loss + scaled_block_match_loss
+            
+            # Log losses
             self.log('train/replace_loss_raw', raw_replace_loss, on_step=True, on_epoch=True, batch_size=1)
             self.log('train/replace_loss_scaled', scaled_replace_loss, on_step=True, on_epoch=True, batch_size=1)
+            self.log('train/block_match_loss_raw', block_match_loss, on_step=True, on_epoch=True, batch_size=1)
+            self.log('train/block_match_loss_scaled', scaled_block_match_loss, on_step=True, on_epoch=True, batch_size=1)
         else:
             total_loss = base_loss
         
@@ -982,19 +996,31 @@ class RepresentationDistillationModule(pl.LightningModule):
         # Compute base loss (MSE on representations with masking)
         base_loss, loss_s, loss_z = self._compute_loss(pred_s, pred_z, target_s, target_z, seq_mask=seq_mask)
         
-        # Add adaptive replace loss if applicable
+        # Add adaptive losses if applicable
         if self.adaptive_setup_done and self.replace_loss_scaler > 0:
+            # Compute replace loss (penalizes mean adaptive weights)
             raw_replace_loss = compute_adaptive_replace_loss(
                 model=self.student_model,
                 replace_loss_scaler=1.0,  # Get raw loss
                 device=base_loss.device,
             )
-            scaled_replace_loss = raw_replace_loss * self.replace_loss_scaler
-            total_loss = base_loss + scaled_replace_loss
             
-            # Log replace loss with explicit batch_size
+            # Compute block match loss (encourages replacement to match original)
+            block_match_loss = compute_block_match_loss(
+                model=self.student_model,
+                device=base_loss.device,
+            )
+            
+            # Scale and combine losses
+            scaled_replace_loss = raw_replace_loss * self.replace_loss_scaler
+            scaled_block_match_loss = block_match_loss * self.replace_loss_scaler
+            total_loss = base_loss + scaled_replace_loss + scaled_block_match_loss
+            
+            # Log losses with explicit batch_size
             self.log('val/replace_loss_raw', raw_replace_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
             self.log('val/replace_loss_scaled', scaled_replace_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+            self.log('val/block_match_loss_raw', block_match_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+            self.log('val/block_match_loss_scaled', scaled_block_match_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         else:
             total_loss = base_loss
         

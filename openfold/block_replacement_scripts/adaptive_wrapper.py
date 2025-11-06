@@ -121,6 +121,48 @@ def compute_adaptive_replace_loss(
     return replace_loss * replace_loss_scaler
 
 
+def compute_block_match_loss(
+    model: torch.nn.Module,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Compute per-block matching loss between original and replacement block outputs.
+    
+    This encourages the replacement block to match the original block's output,
+    making learning easier by providing direct supervision at each block.
+    
+    Args:
+        model: The model containing adaptive blocks with stored outputs
+        device: Device to create tensors on
+        
+    Returns:
+        Sum of MSE losses across all blocks (for both m and z)
+    """
+    total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+    num_blocks = 0
+
+    # Find all AdaptiveEvoformerBlock instances and get their stored outputs
+    for name, module in model.named_modules():
+        if hasattr(module, '_block_outputs') and module._block_outputs:
+            for block_idx, outputs in module._block_outputs.items():
+                original_m = outputs['original_m']
+                original_z = outputs['original_z']
+                replacement_m = outputs['replacement_m']
+                replacement_z = outputs['replacement_z']
+                
+                # Compute MSE loss for MSA representation (m)
+                loss_m = torch.nn.functional.mse_loss(replacement_m, original_m)
+                
+                # Compute MSE loss for pair representation (z)
+                loss_z = torch.nn.functional.mse_loss(replacement_z, original_z)
+                
+                # Add both losses
+                total_loss = total_loss + loss_m + loss_z
+                num_blocks += 1
+
+    return total_loss
+
+
 def freeze_model_except_adaptive_components(model: nn.Module) -> int:
     """
     Freeze all model parameters except adaptive weight predictors and replacement blocks.

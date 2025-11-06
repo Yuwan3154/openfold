@@ -193,6 +193,16 @@ class AdaptiveEvoformerBlock(nn.Module):
             self._predicted_weights = {}
         self._predicted_weights[self.block_idx] = weight
         
+        # Store original and replacement outputs for per-block matching loss
+        if not hasattr(self, '_block_outputs'):
+            self._block_outputs = {}
+        self._block_outputs[self.block_idx] = {
+            'original_m': m_orig,
+            'original_z': z_orig,
+            'replacement_m': m_replace,
+            'replacement_z': z_replace,
+        }
+        
         # Reshape weight for broadcasting
         # m: [batch, N_seq, N_res, C_m] -> weight: [batch, 1, 1, 1]
         # z: [batch, N_res, N_res, C_z] -> weight: [batch, 1, 1, 1]
