@@ -76,7 +76,6 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
         self.replace_loss_scaler = 0.0
         self.is_adaptive_training = False
         self.adaptive_setup_done = False
-        self.optimizer_configured = False
         
         # Structure logging attributes
         self.log_structure_every_k_epoch = 1  # Default to logging every epoch
@@ -142,28 +141,6 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
         total_params = sum(p.numel() for p in self.model.parameters())
         rank_zero_info(f"Successfully set up adaptive training with {len(self.weight_predictors)} blocks")
         rank_zero_info(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({trainable_params/total_params*100:.2f}%)")
-        
-        # CRITICAL: Reconfigure optimizer after adaptive blocks are applied
-        self._reconfigure_optimizer()
-    
-    def _reconfigure_optimizer(self):
-        """Reconfigure optimizer after adaptive blocks are applied"""
-
-        if not hasattr(self, 'trainer') or self.trainer is None:
-            return
-            
-        # Get the current optimizer from trainer
-        if hasattr(self.trainer, 'optimizers') and self.trainer.optimizers:
-            # Create new optimizer with correct parameters
-            params_to_optimize = [p for p in self.model.parameters() if p.requires_grad]
-            new_optimizer = torch.optim.Adam(
-                params_to_optimize,
-                lr=self.learning_rate,
-                eps=1e-5
-            )
-            
-            # Replace optimizer in trainer
-            self.trainer.optimizers = [new_optimizer]
     
     def _log_structure_to_wandb(self, pdb_string, name, step, ground_truth_pdb_path=None, chain_id=None):
         """Log structure to wandb using temporary file"""
@@ -195,16 +172,6 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
             # Clean up temporary prediction file
             os.unlink(temp_pdb_path)
 
-    def training_step(self, batch, batch_idx):
-        """Override training step to ensure optimizer is reconfigured for adaptive training"""
-
-        # Ensure optimizer is reconfigured if needed
-        if self.is_adaptive_training and not self.optimizer_configured:
-            self._reconfigure_optimizer()
-            self.optimizer_configured = True
-        
-        # Call parent training step
-        return super().training_step(batch, batch_idx)
     
     def _compute_adaptive_metrics(self, batch: Dict[str, torch.Tensor], log_per_block: bool = False) -> Dict[str, float]:
         """
@@ -779,25 +746,14 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
         self._log(loss_breakdown, batch, outputs, train=False)
     
     def configure_optimizers(self, learning_rate: float = None, eps: float = 1e-5):
-        """Configure optimizer with special handling for adaptive training"""
-        
-        # For adaptive training, defer optimizer configuration until after adaptive blocks are applied
-        if self.adaptive_config_path and not self.adaptive_setup_done:
-            # Return a placeholder optimizer that will be replaced later
-            placeholder_params = [p for p in self.model.parameters() if p.requires_grad]
-            return torch.optim.Adam(placeholder_params, lr=1e-3)
+        """Configure optimizer - uses AlphaFoldLRScheduler with warmup and decay"""
         
         # Use learning rate from args if provided
         if learning_rate is None:
             learning_rate = getattr(self, 'learning_rate', 1e-3)
         
-        # For adaptive training, optimize both weight predictors and replacement blocks
-        if self.is_adaptive_training:
-            # Collect trainable parameters
-            params_to_optimize = [p for p in self.model.parameters() if p.requires_grad]
-        else:
-            # Standard optimization
-            params_to_optimize = self.model.parameters()
+        # Collect trainable parameters (works for both standard and adaptive training)
+        params_to_optimize = [p for p in self.model.parameters() if p.requires_grad]
         
         optimizer = torch.optim.Adam(
             params_to_optimize,
@@ -810,37 +766,17 @@ class AdaptiveOpenFoldWrapper(OpenFoldWrapper):
                 if 'initial_lr' not in group:
                     group['initial_lr'] = learning_rate
         
-        # Use a simpler scheduler for adaptive training
-        if self.is_adaptive_training:
-            # Use ReduceLROnPlateau for adaptive training to avoid step order issues
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer,
-                mode='min',
-                factor=0.5,
-                patience=10,
-                verbose=True
-            )
-            return {
-                "optimizer": optimizer,
-                "lr_scheduler": {
-                    "scheduler": scheduler,
-                    "monitor": "train/loss",  # Monitor training loss
-                    "interval": "epoch",
-                    "frequency": 1,
-                    "name": "ReduceLROnPlateau",
-                }
+        # Use standard AlphaFold scheduler (has warmup + plateau + exponential decay)
+        lr_scheduler = AlphaFoldLRScheduler(
+            optimizer,
+            last_epoch=self.last_lr_step
+        )
+        
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": lr_scheduler,
+                "interval": "step",
+                "name": "AlphaFoldLRScheduler",
             }
-        else:
-            # Use standard AlphaFold scheduler
-            lr_scheduler = AlphaFoldLRScheduler(
-                optimizer,
-                last_epoch=self.last_lr_step
-            )
-            return {
-                "optimizer": optimizer,
-                "lr_scheduler": {
-                    "scheduler": lr_scheduler,
-                    "interval": "step",
-                    "name": "AlphaFoldLRScheduler",
-                }
-            }
+        }

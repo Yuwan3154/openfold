@@ -188,7 +188,8 @@ def split_chains_for_validation(chain_list, val_fraction, output_dir, seed=42):
     return train_chains, val_chains, train_list_path, val_list_path
 
 
-def create_adaptive_training_command_file(output_dir, trained_models_dir, linear_type, replace_loss_scaler, log_structure_every_k_epoch=1, disable_per_block_logging=False):
+def create_adaptive_training_command_file(output_dir, trained_models_dir, linear_type, replace_loss_scaler, 
+                                         log_structure_every_k_epoch=1, disable_per_block_logging=False):
     """Create the adaptive training command file for custom loading"""
     adaptive_cmd_file = output_dir / "adaptive_training_cmd.json"
     
@@ -296,6 +297,11 @@ def run_adaptive_training(args):
     trained_models_dir = home_dir / config['trained_models_dir']
     output_dir = home_dir / config['output_dir']
     
+    # Handle resume_adaptive_checkpoint if provided
+    resume_adaptive_checkpoint = None
+    if args.resume_adaptive_checkpoint:
+        resume_adaptive_checkpoint = home_dir / args.resume_adaptive_checkpoint if not Path(args.resume_adaptive_checkpoint).is_absolute() else Path(args.resume_adaptive_checkpoint)
+    
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
     
@@ -313,6 +319,17 @@ def run_adaptive_training(args):
         print(f"  WORLD_SIZE: {world_size}")
     else:
         print("🔄 Running as single process (not distributed)")
+
+    # Determine training mode
+    if resume_adaptive_checkpoint:
+        rank_zero_info(f"\n{'='*60}")
+        rank_zero_info("Mode: Resuming from adaptive checkpoint")
+        rank_zero_info(f"Checkpoint: {resume_adaptive_checkpoint}")
+        rank_zero_info(f"{'='*60}\n")
+    else:
+        rank_zero_info(f"\n{'='*60}")
+        rank_zero_info("Mode: Initial training from base weights")
+        rank_zero_info(f"{'='*60}\n")
 
     rank_zero_info(f"Configuration:")
     rank_zero_info(f"  CSV path: {csv_path}")
@@ -408,9 +425,9 @@ def run_adaptive_training(args):
         "--enable_recursive_search",     # Search subdirectories
         "--enable_single_seq_mode",      # No MSAs or templates
         
-        # Load pre-trained weights
-        "--resume_from_jax_params" if str(checkpoint_path).endswith(".npz") else "--resume_from_ckpt", str(checkpoint_path),
-        "--resume_model_weights_only", "True",
+        # Adaptive training configuration
+        "--adaptive_config_path", str(adaptive_cmd_file),
+        "--apply_adaptive_blocks_immediately",  # Apply blocks after weight loading
         
         # Training configuration  
         "--config_preset", "finetuning_no_templ_ptm",  # Use no-template preset for single seq mode
@@ -425,14 +442,24 @@ def run_adaptive_training(args):
 
         # Gradient accumulation
         "--grad_accum_steps", str(config.get('grad_accum_steps', 1)),
-
-        # Adaptive training configuration
-        "--adaptive_config_path", str(adaptive_cmd_file),
         
         # Logging
         "--log_lr",
         "--log_every_n_steps", "10",
     ]
+    
+    # Load pre-trained weights with priority: resume_adaptive_checkpoint > checkpoint_path
+    if resume_adaptive_checkpoint:
+        cmd.extend(["--resume_from_ckpt", str(resume_adaptive_checkpoint)])
+        rank_zero_info(f"  ✓ Resuming from adaptive checkpoint: {resume_adaptive_checkpoint}")
+    elif checkpoint_path:
+        if str(checkpoint_path).endswith(".npz"):
+            cmd.extend(["--resume_from_jax_params", str(checkpoint_path)])
+            rank_zero_info(f"  ✓ Loading JAX weights: {checkpoint_path}")
+        else:
+            cmd.extend(["--resume_from_ckpt", str(checkpoint_path)])
+            rank_zero_info(f"  ✓ Loading PyTorch weights: {checkpoint_path}")
+        cmd.extend(["--resume_model_weights_only", "True"])
 
     # Add distributed backend if specified
     if distributed_backend:
@@ -595,6 +622,10 @@ def main():
                        help="Disable per-block weight logging for faster training")
     parser.add_argument("--max_template_date", type=str, default="2025-01-01",
                        help="Cutoff date for templates (YYYY-MM-DD)")
+    
+    # Checkpoint resuming
+    parser.add_argument("--resume_adaptive_checkpoint", type=str, default=None,
+                       help="Path to Lightning checkpoint with adaptive blocks. Takes priority over --checkpoint_path.")
     
     # Checkpoint configuration
     parser.add_argument("--checkpoint_every_epoch", action="store_true", default=False,
