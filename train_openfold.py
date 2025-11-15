@@ -49,7 +49,6 @@ from openfold.block_replacement_scripts.custom_evoformer_replacement import (
 # Import AdaptiveOpenFoldWrapper for adaptive training
 try:
     from openfold.block_replacement_scripts.custom_openfold_wrapper import AdaptiveOpenFoldWrapper
-    from openfold.block_replacement_scripts.adaptive_evoformer_blocks import replace_evoformer_blocks_with_adaptive
     ADAPTIVE_WRAPPER_AVAILABLE = True
 except ImportError:
     ADAPTIVE_WRAPPER_AVAILABLE = False
@@ -347,36 +346,6 @@ def get_model_state_dict_from_ds_checkpoint(checkpoint_dir):
     state_file = zero_to_fp32.get_model_state_file(ds_checkpoint_dir, _DS_CHECKPOINT_VERSION)
     return torch.load(state_file)
 
-def apply_adaptive_blocks_to_model(model_module, adaptive_config_path):
-    """
-    Apply adaptive blocks to an already-initialized model.
-    This is called after weights are loaded for cleaner initialization.
-    """
-    # Import here to avoid issues with global ADAPTIVE_WRAPPER_AVAILABLE
-    try:
-        from openfold.block_replacement_scripts.adaptive_evoformer_blocks import replace_evoformer_blocks_with_adaptive
-        from pathlib import Path
-    except ImportError as e:
-        raise ImportError(f"Adaptive wrapper not available: {e}")
-    
-    # Load adaptive config
-    with open(adaptive_config_path, 'r') as f:
-        adaptive_config = json.load(f)
-    
-    # Get parameters from config
-    linear_type = adaptive_config.get('linear_type', 'full')
-    trained_models_dir = Path(adaptive_config.get('trained_models_dir', ''))
-    
-    # Apply adaptive blocks to the model
-    rank_zero_info(f"Applying adaptive blocks with linear_type={linear_type}")
-    replace_evoformer_blocks_with_adaptive(
-        model_module.model,
-        trained_models_dir=trained_models_dir,
-        linear_type=linear_type,
-        initial_bias=2.0
-    )
-    rank_zero_info("✓ Adaptive blocks applied successfully")
-
 def main(args):
     # Set float32 matmul precision for Tensor Cores
     torch.set_float32_matmul_precision("medium")
@@ -419,8 +388,7 @@ def main(args):
     # Use AdaptiveOpenFoldWrapper if adaptive_config_path is provided
     adaptive_config_path = getattr(args, 'adaptive_config_path', None)
     
-    # If apply_adaptive_blocks_immediately is set, use OpenFoldWrapper and apply blocks later
-    if adaptive_config_path and ADAPTIVE_WRAPPER_AVAILABLE and not args.apply_adaptive_blocks_immediately:
+    if adaptive_config_path and ADAPTIVE_WRAPPER_AVAILABLE:
         model_module = AdaptiveOpenFoldWrapper(
             config,
             adaptive_config_path=adaptive_config_path,
@@ -485,7 +453,7 @@ def main(args):
             config.model.template.enabled = True
             
             # Recreate model with templates enabled for JAX loading
-            if adaptive_config_path and ADAPTIVE_WRAPPER_AVAILABLE and not args.apply_adaptive_blocks_immediately:
+            if adaptive_config_path and ADAPTIVE_WRAPPER_AVAILABLE:
                 model_module = AdaptiveOpenFoldWrapper(
                     config,
                     adaptive_config_path=adaptive_config_path,
@@ -515,14 +483,6 @@ def main(args):
             # Normal JAX loading when templates are enabled
             model_module.load_from_jax(args.resume_from_jax_params)
             logging.info(f"Successfully loaded JAX parameters at {args.resume_from_jax_params}...")
-    
-    # Apply adaptive blocks immediately after weight loading if requested
-    if args.apply_adaptive_blocks_immediately and adaptive_config_path:
-        rank_zero_info("\n" + "="*60)
-        rank_zero_info("Applying adaptive blocks after weight loading...")
-        rank_zero_info("="*60)
-        apply_adaptive_blocks_to_model(model_module, adaptive_config_path)
-        rank_zero_info("="*60 + "\n")
 
     # TorchScript components of the model
     if (args.script_modules):
@@ -950,10 +910,6 @@ if __name__ == "__main__":
         "--data_loading_strategy", type=str, default="on_demand",
         choices=["preload_gpu", "preload_cpu", "on_demand"],
         help="Data loading strategy for adaptive training: 'preload_gpu' (default), 'preload_cpu', or 'on_demand'"
-    )
-    parser.add_argument(
-        "--apply_adaptive_blocks_immediately", action="store_true", default=False,
-        help="Apply adaptive blocks immediately after weight loading (for cleaner initialization)"
     )
 
     trainer_group = parser.add_argument_group(

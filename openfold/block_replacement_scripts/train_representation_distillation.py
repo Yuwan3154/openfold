@@ -330,7 +330,6 @@ class RepresentationDistillationDataModule(pl.LightningDataModule):
         validation_fraction: float = 0.2,
         split_seed: int = 42,
         data_loading_strategy: str = 'on_demand',
-        per_block_pretrain_mode: bool = False,
     ):
         super().__init__()
         self.dataset_path = dataset_path
@@ -346,7 +345,6 @@ class RepresentationDistillationDataModule(pl.LightningDataModule):
         self.validation_fraction = validation_fraction
         self.split_seed = split_seed
         self.data_loading_strategy = data_loading_strategy
-        self.per_block_pretrain_mode = per_block_pretrain_mode
         # Convert data_loading_strategy to preload flag
         self.preload_sequences = data_loading_strategy in ['preload_cpu', 'preload_gpu']
         
@@ -444,11 +442,6 @@ class RepresentationDistillationDataModule(pl.LightningDataModule):
     
     def _create_teacher_components(self):
         """Create teacher model, feature processor, and data processor"""
-        # In per-block pretrain mode, we don't need a teacher model
-        # The student model IS the teacher (with adaptive weight = 1.0)
-        if self.per_block_pretrain_mode:
-            return None, None, None
-        
         # Create config
         config = model_config(self.config_preset, train=False, low_prec=False)
         
@@ -743,7 +736,6 @@ class RepresentationDistillationModule(pl.LightningModule):
         replace_loss_scaler: float = 0.0,
         weights_path: str = None,
         resume_adaptive_checkpoint: str = None,
-        per_block_pretrain_mode: bool = False,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -756,14 +748,9 @@ class RepresentationDistillationModule(pl.LightningModule):
         self.replace_loss_scaler = replace_loss_scaler
         self.weights_path = weights_path
         self.resume_adaptive_checkpoint = resume_adaptive_checkpoint
-        self.per_block_pretrain_mode = per_block_pretrain_mode
         
         # Create base student model
         self.student_model = AlphaFold(config)
-        
-        # In per-block pretrain mode, we don't need a separate teacher model
-        # The student model IS the teacher (with adaptive weight = 1.0)
-        self.teacher_model = None if per_block_pretrain_mode else None
         
         # Determine initialization path
         # Priority: resume_adaptive_checkpoint > weights_path + adaptive_config_path
@@ -785,18 +772,10 @@ class RepresentationDistillationModule(pl.LightningModule):
             
             # Freeze all except adaptive components
             trainable_params = freeze_model_except_adaptive_components(self.student_model)
-            
-            # In per-block pretrain mode, additionally freeze weight predictors
-            # Only replacement blocks should be trainable
-            if self.per_block_pretrain_mode:
-                trainable_params = self._freeze_weight_predictors()
-            
             total_params = sum(p.numel() for p in self.student_model.parameters())
             
             print(f"Adaptive blocks: {len(training_info['weight_predictors'])}")
             print(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({trainable_params/total_params*100:.2f}%)")
-            if self.per_block_pretrain_mode:
-                print(f"Per-block pretrain mode: Only replacement blocks trainable")
             print(f"Note: Weights will be loaded from checkpoint by Lightning")
             print(f"{'='*80}\n")
             
@@ -820,18 +799,10 @@ class RepresentationDistillationModule(pl.LightningModule):
             
             # Freeze all except adaptive components
             trainable_params = freeze_model_except_adaptive_components(self.student_model)
-            
-            # In per-block pretrain mode, additionally freeze weight predictors
-            # Only replacement blocks should be trainable
-            if self.per_block_pretrain_mode:
-                trainable_params = self._freeze_weight_predictors()
-            
             total_params = sum(p.numel() for p in self.student_model.parameters())
             
             print(f"Adaptive blocks: {len(training_info['weight_predictors'])}")
             print(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({trainable_params/total_params*100:.2f}%)")
-            if self.per_block_pretrain_mode:
-                print(f"Per-block pretrain mode: Only replacement blocks trainable")
             print(f"{'='*80}\n")
             
             self.adaptive_setup_done = True
@@ -869,30 +840,6 @@ class RepresentationDistillationModule(pl.LightningModule):
             self.student_model.load_state_dict(state_dict, strict=False)
         
         print("Base weights loaded successfully")
-    
-    def _freeze_weight_predictors(self):
-        """
-        Freeze weight predictors while keeping replacement blocks trainable.
-        Used in per-block pretrain mode.
-        
-        Returns:
-            Number of trainable parameters
-        """
-        from openfold.block_replacement_scripts.adaptive_evoformer_blocks import AdaptiveWeightPredictor
-        
-        trainable_params = 0
-        for name, module in self.student_model.named_modules():
-            if isinstance(module, AdaptiveWeightPredictor):
-                # Freeze weight predictors
-                for param in module.parameters():
-                    param.requires_grad = False
-            elif hasattr(module, 'replacement_block'):
-                # Count trainable params in replacement blocks
-                for param in module.replacement_block.parameters():
-                    if param.requires_grad:
-                        trainable_params += param.numel()
-        
-        return trainable_params
     
     def forward(self, batch):
         """Forward pass through student model"""
@@ -981,19 +928,6 @@ class RepresentationDistillationModule(pl.LightningModule):
         target_z = batch_dict['target_z']
         seq_length = batch_dict['seq_length']
         
-        # In per-block pretrain mode, fix adaptive weights to 1.0
-        # This ensures the student model uses 100% original Evoformer blocks
-        if self.per_block_pretrain_mode:
-            from openfold.block_replacement_scripts.adaptive_evoformer_blocks import AdaptiveEvoformerBlock
-            for module in self.student_model.modules():
-                if isinstance(module, AdaptiveEvoformerBlock):
-                    if not hasattr(module, '_predicted_weights'):
-                        module._predicted_weights = {}
-                    # Set weight to 1.0 (100% original block)
-                    module._predicted_weights[module.block_idx] = torch.tensor(
-                        1.0, device=student_batch['aatype'].device
-                    )
-        
         # Forward pass through student model
         outputs = self(student_batch)
         
@@ -1010,23 +944,7 @@ class RepresentationDistillationModule(pl.LightningModule):
         )
         
         # Add adaptive losses if applicable
-        if self.per_block_pretrain_mode:
-            # In per-block pretrain mode, only use block match loss
-            # This trains replacement blocks to match original blocks
-            block_match_loss = compute_block_match_loss(
-                model=self.student_model,
-                device=base_loss.device,
-            )
-            
-            # Scale and combine losses
-            scaled_block_match_loss = block_match_loss * self.replace_loss_scaler
-            total_loss = scaled_block_match_loss
-            
-            # Log losses
-            self.log('train/block_match_loss_raw', block_match_loss, on_step=True, on_epoch=True, batch_size=1)
-            self.log('train/block_match_loss_scaled', scaled_block_match_loss, on_step=True, on_epoch=True, batch_size=1)
-        elif self.adaptive_setup_done and self.replace_loss_scaler > 0:
-            # Normal adaptive training mode
+        if self.adaptive_setup_done and self.replace_loss_scaler > 0:
             # Compute replace loss (penalizes mean adaptive weights)
             raw_replace_loss = compute_adaptive_replace_loss(
                 model=self.student_model,
@@ -1430,7 +1348,6 @@ def main():
         validation_fraction=args.validation_fraction,
         split_seed=args.split_seed,
         data_loading_strategy=args.data_loading_strategy,
-        per_block_pretrain_mode=getattr(args, 'per_block_pretrain_mode', False),
     )
     
     # Create model
@@ -1443,32 +1360,20 @@ def main():
         replace_loss_scaler=args.replace_loss_scaler,
         weights_path=args.weights_path,
         resume_adaptive_checkpoint=args.resume_adaptive_checkpoint,
-        per_block_pretrain_mode=getattr(args, 'per_block_pretrain_mode', False),
     )
     
     # Setup callbacks
     callbacks = []
     
     # Checkpoint callback
-    # Configure checkpointing
-    checkpoint_kwargs = {
-        'dirpath': os.path.join(args.output_dir, 'checkpoints'),
-        'filename': 'repr_distill-{epoch:02d}-{step:06d}',
-        'save_top_k': 3,
-        'save_last': True,
-    }
-    
-    # Add step-based checkpointing if configured
-    if hasattr(args, 'checkpoint_every_n_steps') and args.checkpoint_every_n_steps:
-        checkpoint_kwargs['every_n_train_steps'] = args.checkpoint_every_n_steps
-        checkpoint_kwargs['save_on_train_epoch_end'] = False
-    else:
-        # Default: monitor validation loss
-        checkpoint_kwargs['monitor'] = 'val/loss'
-        checkpoint_kwargs['mode'] = 'min'
-        checkpoint_kwargs['filename'] = 'repr_distill-{epoch:02d}-{val/loss:.4f}'
-    
-    checkpoint_callback = ModelCheckpoint(**checkpoint_kwargs)
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=os.path.join(args.output_dir, 'checkpoints'),
+        filename='repr_distill-{epoch:02d}-{val/loss:.4f}',
+        monitor='val/loss',
+        mode='min',
+        save_top_k=3,
+        save_last=True,
+    )
     callbacks.append(checkpoint_callback)
     
     # Learning rate monitor (only if logger is configured)
@@ -1511,25 +1416,18 @@ def main():
         strategy = 'auto'
     
     # Create trainer
-    # Configure trainer
-    trainer_kwargs = {
-        'max_epochs': args.max_epochs,
-        'accelerator': 'gpu' if args.gpus > 0 else 'cpu',
-        'devices': args.gpus if args.gpus > 0 else None,
-        'strategy': strategy,
-        'precision': args.precision,
-        'gradient_clip_val': args.gradient_clip_val,
-        'callbacks': callbacks,
-        'logger': loggers,
-        'log_every_n_steps': args.log_every_n_steps,
-        'deterministic': True,
-    }
-    
-    # Add step-based validation if configured
-    if hasattr(args, 'val_check_interval') and args.val_check_interval:
-        trainer_kwargs['val_check_interval'] = args.val_check_interval
-    
-    trainer = pl.Trainer(**trainer_kwargs)
+    trainer = pl.Trainer(
+        max_epochs=args.max_epochs,
+        accelerator='gpu' if args.gpus > 0 else 'cpu',
+        devices=args.gpus if args.gpus > 0 else None,
+        strategy=strategy,
+        precision=args.precision,
+        gradient_clip_val=args.gradient_clip_val,
+        callbacks=callbacks,
+        logger=loggers,
+        log_every_n_steps=args.log_every_n_steps,
+        deterministic=True,
+    )
     
     # Train
     print("\nStarting training...")
