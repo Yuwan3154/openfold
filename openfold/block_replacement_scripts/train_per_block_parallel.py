@@ -553,7 +553,7 @@ class ParallelBlockPretrainer(pl.LightningModule):
             num_blocks += 1
             
             # Log per-block loss for all 46 blocks
-            self.log(f'train/block_{block_idx:02d}_loss', block_loss, on_step=True, on_epoch=True, batch_size=1)
+            self.log(f'train/block_{block_idx:02d}_loss', block_loss, on_step=True, on_epoch=True)
             
             # Clear intermediate tensors to free memory
             del m_in_msa, m_pred_msa, m_pred_single, block_loss
@@ -565,9 +565,9 @@ class ParallelBlockPretrainer(pl.LightningModule):
             avg_loss = torch.tensor(0.0, device=self.device)
         
         # Log overall metrics
-        self.log('train/loss', avg_loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=1)
-        self.log('train/num_blocks_trained', float(num_blocks), on_step=False, on_epoch=True, batch_size=1)
-        self.log('train/seq_length', float(seq_length), on_step=False, on_epoch=True, batch_size=1)
+        self.log('train/loss', avg_loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log('train/num_blocks_trained', float(num_blocks), on_step=False, on_epoch=True)
+        self.log('train/seq_length', float(seq_length), on_step=False, on_epoch=True)
         
         # Clear block_data to free GPU memory
         del block_data
@@ -641,7 +641,7 @@ class ParallelBlockPretrainer(pl.LightningModule):
             num_blocks += 1
             
             # Log per-block loss for all 46 blocks
-            self.log(f'val/block_{block_idx:02d}_loss', block_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+            self.log(f'val/block_{block_idx:02d}_loss', block_loss, on_step=False, on_epoch=True, sync_dist=True)
             
             # Clear intermediate tensors
             del m_in_msa, m_pred_msa, m_pred_single, block_loss
@@ -653,8 +653,8 @@ class ParallelBlockPretrainer(pl.LightningModule):
             avg_loss = torch.tensor(0.0, device=self.device)
         
         # Log validation metrics
-        self.log('val/loss', avg_loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=1)
-        self.log('val/num_blocks_evaluated', float(num_blocks), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log('val/loss', avg_loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log('val/num_blocks_evaluated', float(num_blocks), on_step=False, on_epoch=True, sync_dist=True)
         
         # Clear block_data to free GPU memory
         del block_data
