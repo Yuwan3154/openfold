@@ -556,7 +556,7 @@ def generate_translation_dict(model, version, is_multimer=False):
         "model_5_ptm",
     ]
 
-    if version not in no_templ:
+    if version not in no_templ and hasattr(model, "template_embedder"):
         tps_blocks = model.template_embedder.template_pair_stack.blocks
         tps_blocks_params = stacked(
             [TemplatePairBlockParams(b) for b in tps_blocks]
