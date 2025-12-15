@@ -11,7 +11,7 @@ ln -rs openfold/resources/stereo_chemical_props.txt tests/test_data/alphafold/co
 # Decompress test data
 gunzip -c tests/test_data/sample_feats.pickle.gz > tests/test_data/sample_feats.pickle
 
-python setup.py install
+python -m pip install --no-build-isolation -e .
 
 echo "Download CUTLASS, required for Deepspeed Evoformer attention kernel"
 git clone https://github.com/NVIDIA/cutlass --branch v3.6.0 --depth 1

@@ -99,9 +99,8 @@ class LinearTypeComparison:
             cmd.extend(["--experiment_name", f"{self.args.experiment_name}_linear_comparison"])
         
         print(f"Running command: {' '.join(cmd)}")
-        
-            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-            print("Training completed successfully!")
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        print("Training completed successfully!")
         print(f"STDOUT: {result.stdout}")
         if result.stderr:
             print(f"STDERR: {result.stderr}")
