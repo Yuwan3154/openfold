@@ -331,6 +331,89 @@ def make_sequence_features_with_custom_template(
     }
 
 
+def make_sequence_features_with_distogram_template(
+    sequence: str,
+    distogram_probs: np.ndarray,
+    mask: np.ndarray,
+    *,
+    pdb_id: str = "distogram_template",
+    template_sequence_all_x: bool = False,
+) -> FeatureDict:
+    """
+    Build an AlphaFold/OpenFold feature dict using a single \"distogram-only\" template.
+
+    This template contains:
+    - template aatype (from sequence)
+    - template pseudo-beta mask (from mask)
+    - template distogram probabilities (provided)
+    - placeholder zeros for coordinate-derived template fields
+
+    Args:
+        sequence: Query sequence, length L
+        distogram_probs: [L, L, no_bins] float32, probabilities over distance bins
+        mask: [L] float32/bool, residue mask (1 valid, 0 padded)
+        pdb_id: Description/domain name placeholder
+
+    Returns:
+        Feature dict compatible with OpenFold feature pipeline.
+    """
+    num_res = len(sequence)
+    if distogram_probs.shape[0] != num_res or distogram_probs.shape[1] != num_res:
+        raise ValueError(
+            f"distogram_probs must be [L,L,B]; got {distogram_probs.shape} for L={num_res}"
+        )
+    if mask.shape[0] != num_res:
+        raise ValueError(f"mask must be [L]; got {mask.shape} for L={num_res}")
+
+    sequence_features = make_sequence_features(
+        sequence=sequence,
+        description=pdb_id,
+        num_res=num_res,
+    )
+    msa_features = make_dummy_msa_feats(sequence)
+
+    # Template fields (single template axis)
+    no_bins = distogram_probs.shape[-1]
+    template_seq = ("X" * num_res) if template_sequence_all_x else sequence
+    template_aatype_one_hot = residue_constants.sequence_to_onehot(
+        sequence=template_seq,
+        mapping=residue_constants.restype_order_with_x,
+        map_unknown_to_x=True,
+    ).astype(np.float32)  # [L, 21] (with X)
+
+    # Convert to HHblits aatype space with gap+X, matching empty_template_feats shape
+    # We simply place into restypes_with_x_and_gap onehot by mapping residue_constants.
+    # residue_constants.sequence_to_onehot with restype_order_with_x already returns 21,
+    # but templates expect len(restypes_with_x_and_gap) (=22) including '-'.
+    template_aatype = np.zeros((1, num_res, len(residue_constants.restypes_with_x_and_gap)), dtype=np.float32)
+    template_aatype[..., : template_aatype_one_hot.shape[-1]] = template_aatype_one_hot[None, ...]
+
+    mask_f = mask.astype(np.float32)
+    template_pseudo_beta_mask = mask_f[None, ...]  # [1, L]
+    template_pseudo_beta = np.zeros((1, num_res, 3), dtype=np.float32)
+    template_all_atom_positions = np.zeros((1, num_res, residue_constants.atom_type_num, 3), dtype=np.float32)
+    template_all_atom_mask = np.ones((1, num_res, residue_constants.atom_type_num), dtype=np.float32)
+    template_dgram_probs = distogram_probs.astype(np.float32)[None, ...]  # [1, L, L, B]
+
+    template_features = {
+        "template_aatype": template_aatype,
+        "template_all_atom_mask": template_all_atom_mask,
+        "template_all_atom_positions": template_all_atom_positions,
+        "template_pseudo_beta_mask": template_pseudo_beta_mask,
+        "template_pseudo_beta": template_pseudo_beta,
+        "template_dgram_probs": template_dgram_probs,
+        "template_domain_names": np.array([pdb_id.encode("utf-8")], dtype=object),
+        "template_sequence": np.array([template_seq.encode("utf-8")], dtype=object),
+        "template_sum_probs": np.array([[1.0]], dtype=np.float32),
+    }
+
+    return {
+        **sequence_features,
+        **msa_features,
+        **template_features,
+    }
+
+
 class AlignmentRunner:
     """Runs alignment tools and saves the results"""
     def __init__(
