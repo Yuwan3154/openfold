@@ -23,6 +23,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch._dynamo as dynamo
 from torch.utils.data import Dataset, DataLoader
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
@@ -54,7 +55,11 @@ class TeacherModelWithBlockCapture:
     the forward pass. All captured tensors are detached to prevent gradient accumulation.
     """
     
-    def __init__(self, model: AlphaFold, device: torch.device):
+    def __init__(
+        self,
+        model: AlphaFold,
+        device: torch.device,
+    ):
         """
         Args:
             model: AlphaFold model to wrap
@@ -380,6 +385,7 @@ class ParallelBlockPretrainer(pl.LightningModule):
         replacement_mode: str = "per_block",
         replacement_checkpoint_subdir: Optional[str] = None,
         allow_random_init: bool = False,
+        compile_replacement: bool = False,
         learning_rate: float = 1e-4,
         weight_decay: float = 1e-4,
     ):
@@ -395,6 +401,7 @@ class ParallelBlockPretrainer(pl.LightningModule):
         self.replacement_mode = replacement_mode
         self.replacement_checkpoint_subdir = replacement_checkpoint_subdir
         self.allow_random_init = bool(allow_random_init)
+        self.compile_replacement = bool(compile_replacement)
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         
@@ -524,8 +531,25 @@ class ParallelBlockPretrainer(pl.LightningModule):
         """Setup teacher model on correct device"""
         if self.teacher is None:
             device = self.device if hasattr(self, 'device') else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            self.teacher = TeacherModelWithBlockCapture(self._teacher_model, device)
+            self.teacher = TeacherModelWithBlockCapture(
+                self._teacher_model,
+                device,
+            )
             print(f"Teacher model initialized on {device}")
+
+    def on_fit_start(self):
+        if self.compile_replacement and self.device.type == "cuda":
+            dynamo.config.suppress_errors = True
+            for block_idx in list(self.replacement_blocks.keys()):
+                self.replacement_blocks[block_idx] = torch.compile(
+                    self.replacement_blocks[block_idx],
+                    mode="reduce-overhead",
+                    dynamic=True,
+                )
+            print(
+                f"Compiled {len(self.replacement_blocks)} replacement blocks with mode=reduce-overhead dynamic=True",
+                flush=True,
+            )
     
     def forward(self, batch):
         """Not used - training is done in training_step"""
@@ -784,6 +808,7 @@ def main(args, parser):
         replacement_mode=args.replacement_mode,
         replacement_checkpoint_subdir=args.replacement_checkpoint_subdir,
         allow_random_init=args.allow_random_init,
+        compile_replacement=args.compile_replacement,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
     )
@@ -934,6 +959,14 @@ if __name__ == '__main__':
     )
     parser.add_argument('--gradient_clip_val', type=float, default=1.0,
                        help='Gradient clipping value')
+
+    # Compilation arguments
+    parser.add_argument(
+        "--compile_replacement",
+        action="store_true",
+        default=False,
+        help="Compile replacement blocks with torch.compile (mode=reduce-overhead)",
+    )
     
     # Data filtering arguments
     parser.add_argument('--min_length', type=int, default=50,
