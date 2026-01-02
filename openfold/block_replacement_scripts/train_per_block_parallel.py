@@ -564,6 +564,7 @@ class ParallelBlockPretrainer(pl.LightningModule):
         """
         # Move batch to device
         batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+        log_batch_size = 1
         
         # Extract metadata
         seq_length = batch.pop('seq_length')
@@ -636,7 +637,13 @@ class ParallelBlockPretrainer(pl.LightningModule):
             num_blocks += 1
             
             # Log per-block loss for all 46 blocks
-            self.log(f'train/block_{block_idx:02d}_loss', block_loss, on_step=True, on_epoch=True)
+            self.log(
+                f'train/block_{block_idx:02d}_loss',
+                block_loss,
+                on_step=True,
+                on_epoch=True,
+                batch_size=log_batch_size,
+            )
             
             # Clear intermediate tensors to free memory
             del m_in_msa, m_pred_msa, m_pred_single, z_pred_for_loss, block_loss
@@ -648,9 +655,9 @@ class ParallelBlockPretrainer(pl.LightningModule):
             avg_loss = torch.tensor(0.0, device=self.device)
         
         # Log overall metrics
-        self.log('train/loss', avg_loss, on_step=True, on_epoch=True, prog_bar=True)
-        self.log('train/num_blocks_trained', float(num_blocks), on_step=False, on_epoch=True)
-        self.log('train/seq_length', float(seq_length), on_step=False, on_epoch=True)
+        self.log('train/loss', avg_loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=log_batch_size)
+        self.log('train/num_blocks_trained', float(num_blocks), on_step=False, on_epoch=True, batch_size=log_batch_size)
+        self.log('train/seq_length', float(seq_length), on_step=False, on_epoch=True, batch_size=log_batch_size)
         
         # Clear block_data to free GPU memory
         del block_data
@@ -662,6 +669,7 @@ class ParallelBlockPretrainer(pl.LightningModule):
         """Validation step - same as training but without gradient updates"""
         # Move batch to device
         batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+        log_batch_size = 1
         
         # Extract metadata
         seq_length = batch.pop('seq_length')
@@ -733,7 +741,14 @@ class ParallelBlockPretrainer(pl.LightningModule):
             num_blocks += 1
             
             # Log per-block loss for all 46 blocks
-            self.log(f'val/block_{block_idx:02d}_loss', block_loss, on_step=False, on_epoch=True, sync_dist=True)
+            self.log(
+                f'val/block_{block_idx:02d}_loss',
+                block_loss,
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=log_batch_size,
+            )
             
             # Clear intermediate tensors
             del m_in_msa, m_pred_msa, m_pred_single, z_pred_for_loss, block_loss
@@ -745,8 +760,8 @@ class ParallelBlockPretrainer(pl.LightningModule):
             avg_loss = torch.tensor(0.0, device=self.device)
         
         # Log validation metrics
-        self.log('val/loss', avg_loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
-        self.log('val/num_blocks_evaluated', float(num_blocks), on_step=False, on_epoch=True, sync_dist=True)
+        self.log('val/loss', avg_loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=log_batch_size)
+        self.log('val/num_blocks_evaluated', float(num_blocks), on_step=False, on_epoch=True, sync_dist=True, batch_size=log_batch_size)
         
         # Clear block_data to free GPU memory
         del block_data
