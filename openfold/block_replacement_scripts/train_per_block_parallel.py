@@ -386,6 +386,7 @@ class ParallelBlockPretrainer(pl.LightningModule):
         replacement_checkpoint_subdir: Optional[str] = None,
         allow_random_init: bool = False,
         compile_replacement: bool = False,
+        resume_checkpoint_path: Optional[str] = None,
         learning_rate: float = 1e-4,
         weight_decay: float = 1e-4,
     ):
@@ -402,6 +403,7 @@ class ParallelBlockPretrainer(pl.LightningModule):
         self.replacement_checkpoint_subdir = replacement_checkpoint_subdir
         self.allow_random_init = bool(allow_random_init)
         self.compile_replacement = bool(compile_replacement)
+        self.resume_checkpoint_path = resume_checkpoint_path
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         
@@ -453,6 +455,39 @@ class ParallelBlockPretrainer(pl.LightningModule):
         blocks_loaded_from_ckpt = 0
         blocks_random_init = 0
         blocks_failed = 0
+
+        if self.resume_checkpoint_path is not None:
+            # When resuming, Lightning will restore weights from the run checkpoint.
+            # Avoid unnecessary I/O and confusing "checkpoint not found" warnings.
+            for block_idx in range(1, 47):
+                if self.replacement_type == "linear":
+                    replacement_block = SimpleEvoformerReplacement(
+                        c_m=self.c_m,
+                        c_z=self.c_z,
+                        linear_type=self.linear_type,
+                    )
+                else:
+                    replacement_block = DilatedConvEvoformerReplacement(
+                        c_m=self.c_m,
+                        c_z=self.c_z,
+                        kernel_size=self.kernel_size,
+                        dilations=self.dilations,
+                        mode=self.replacement_mode,
+                    )
+                self.replacement_blocks[str(block_idx)] = replacement_block
+                blocks_random_init += 1
+
+            print(
+                f"Resuming from {self.resume_checkpoint_path}; "
+                "initialized replacement blocks for checkpoint restore.",
+                flush=True,
+            )
+            print(
+                f"Replacement blocks: loaded_from_ckpt={blocks_loaded_from_ckpt}, "
+                f"random_init={blocks_random_init}, missing={blocks_failed}",
+                flush=True,
+            )
+            return
 
         if self.replacement_checkpoint_subdir is not None:
             checkpoint_subdir = self.replacement_checkpoint_subdir
@@ -824,6 +859,7 @@ def main(args, parser):
         replacement_checkpoint_subdir=args.replacement_checkpoint_subdir,
         allow_random_init=args.allow_random_init,
         compile_replacement=args.compile_replacement,
+        resume_checkpoint_path=args.resume_checkpoint_path,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
     )
@@ -872,7 +908,7 @@ def main(args, parser):
     trainer = pl.Trainer(
         max_epochs=args.max_epochs,
         accelerator='gpu' if args.gpus > 0 else 'cpu',
-        devices=args.gpus if args.gpus > 0 else None,
+        devices=args.gpus if args.gpus > 0 else 1,
         strategy=strategy,
         precision=args.precision,
         accumulate_grad_batches=args.accumulate_grad_batches,
@@ -887,7 +923,10 @@ def main(args, parser):
     
     # Train
     print("Starting training...")
-    trainer.fit(model, datamodule=data_module)
+    if args.resume_checkpoint_path is not None:
+        trainer.fit(model, datamodule=data_module, ckpt_path=args.resume_checkpoint_path)
+    else:
+        trainer.fit(model, datamodule=data_module)
     
     print("Training completed!")
 
@@ -908,6 +947,18 @@ if __name__ == '__main__':
                        help='Directory containing pretrained replacement blocks')
     parser.add_argument('--output_dir', type=str, required=False,
                        help='Output directory for checkpoints and logs')
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help="Path to a Lightning checkpoint to resume from. If set, overrides auto-resume.",
+    )
+    parser.add_argument(
+        "--no_resume",
+        action="store_true",
+        default=False,
+        help="Disable auto-resume from output_dir/checkpoints/last.ckpt",
+    )
     
     # Model arguments
     parser.add_argument('--config_preset', type=str, default='model_1_ptm',
@@ -1052,6 +1103,29 @@ if __name__ == '__main__':
     missing_args = [arg for arg in required_args if getattr(args, arg) is None]
     if missing_args:
         parser.error(f"The following arguments are required: {', '.join('--' + arg for arg in missing_args)}")
+
+    # Resolve resume checkpoint path with highest priority:
+    # 1) explicit --resume_from_checkpoint
+    # 2) output_dir/checkpoints/last.ckpt (unless --no_resume)
+    # 3) newest .ckpt in output_dir/checkpoints/ (fallback if last.ckpt missing)
+    args.resume_checkpoint_path = None
+    if args.resume_from_checkpoint is not None:
+        args.resume_checkpoint_path = args.resume_from_checkpoint
+    elif not args.no_resume:
+        ckpt_dir = Path(args.output_dir) / "checkpoints"
+        last_ckpt = ckpt_dir / "last.ckpt"
+        if last_ckpt.exists():
+            args.resume_checkpoint_path = str(last_ckpt)
+        elif ckpt_dir.exists():
+            ckpt_files = sorted(
+                [p for p in ckpt_dir.glob("*.ckpt") if p.is_file()],
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if len(ckpt_files) > 0:
+                args.resume_checkpoint_path = str(ckpt_files[0])
+    if args.resume_checkpoint_path is not None:
+        print(f"Will resume from checkpoint: {args.resume_checkpoint_path}", flush=True)
     
     # Validate arguments
     if args.batch_size != 1:
