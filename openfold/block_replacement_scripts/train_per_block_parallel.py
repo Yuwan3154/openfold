@@ -41,6 +41,9 @@ from openfold.utils.tensor_utils import tensor_tree_map
 
 # Import custom replacement blocks
 from openfold.block_replacement_scripts.custom_evoformer_replacement import SimpleEvoformerReplacement
+from openfold.block_replacement_scripts.dilated_conv_evoformer_replacement import (
+    DilatedConvEvoformerReplacement,
+)
 
 
 class TeacherModelWithBlockCapture:
@@ -370,7 +373,13 @@ class ParallelBlockPretrainer(pl.LightningModule):
         config_preset: str,
         weights_path: str,
         trained_models_dir: str,
-        linear_type: str = 'full',
+        replacement_type: str = "linear",
+        linear_type: str = "full",
+        kernel_size: int = 3,
+        dilations: str = "1,2,4",
+        replacement_mode: str = "per_block",
+        replacement_checkpoint_subdir: Optional[str] = None,
+        allow_random_init: bool = False,
         learning_rate: float = 1e-4,
         weight_decay: float = 1e-4,
     ):
@@ -379,7 +388,13 @@ class ParallelBlockPretrainer(pl.LightningModule):
         self.config_preset = config_preset
         self.weights_path = weights_path
         self.trained_models_dir = trained_models_dir
+        self.replacement_type = replacement_type
         self.linear_type = linear_type
+        self.kernel_size = int(kernel_size)
+        self.dilations = tuple(int(d) for d in str(dilations).split(",") if str(d).strip() != "")
+        self.replacement_mode = replacement_mode
+        self.replacement_checkpoint_subdir = replacement_checkpoint_subdir
+        self.allow_random_init = bool(allow_random_init)
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         
@@ -428,45 +443,81 @@ class ParallelBlockPretrainer(pl.LightningModule):
     
     def _load_replacement_blocks(self):
         """Load all pretrained replacement blocks from disk"""
-        blocks_loaded = 0
+        blocks_loaded_from_ckpt = 0
+        blocks_random_init = 0
         blocks_failed = 0
+
+        if self.replacement_checkpoint_subdir is not None:
+            checkpoint_subdir = self.replacement_checkpoint_subdir
+        elif self.replacement_type == "linear":
+            checkpoint_subdir = self.linear_type
+        elif self.replacement_type == "conv":
+            d_str = "-".join(str(d) for d in self.dilations)
+            checkpoint_subdir = f"conv_{self.replacement_mode}_k{self.kernel_size}_d{d_str}"
+        else:
+            raise ValueError(
+                f"Invalid replacement_type: {self.replacement_type}. Expected 'linear' or 'conv'."
+            )
         
         for block_idx in range(1, 47):
-            block_path = Path(self.trained_models_dir) / f"block_{block_idx:02d}" / self.linear_type / "best_model.ckpt"
+            block_path = (
+                Path(self.trained_models_dir)
+                / f"block_{block_idx:02d}"
+                / checkpoint_subdir
+                / "best_model.ckpt"
+            )
             
             if not block_path.exists():
                 print(f"Warning: Block {block_idx} checkpoint not found at {block_path}")
-                blocks_failed += 1
-                continue
+                if not self.allow_random_init:
+                    blocks_failed += 1
+                    continue
             
             # Create replacement block
-            replacement_block = SimpleEvoformerReplacement(
-                c_m=self.c_m,
-                c_z=self.c_z,
-                linear_type=self.linear_type
-            )
-            
-            # Load checkpoint
-            checkpoint = torch.load(block_path, map_location='cpu')
-            if 'state_dict' in checkpoint:
-                state_dict = checkpoint['state_dict']
+            if self.replacement_type == "linear":
+                replacement_block = SimpleEvoformerReplacement(
+                    c_m=self.c_m,
+                    c_z=self.c_z,
+                    linear_type=self.linear_type,
+                )
             else:
-                state_dict = checkpoint
-            
-            # Strip 'replacement_block.' prefix if present
-            if any(k.startswith('replacement_block.') for k in state_dict.keys()):
-                state_dict = {k.replace('replacement_block.', ''): v for k, v in state_dict.items()}
-            
-            # Load weights
-            replacement_block.load_state_dict(state_dict, strict=True)
+                replacement_block = DilatedConvEvoformerReplacement(
+                    c_m=self.c_m,
+                    c_z=self.c_z,
+                    kernel_size=self.kernel_size,
+                    dilations=self.dilations,
+                    mode=self.replacement_mode,
+                )
+
+            # Load checkpoint if present
+            if block_path.exists():
+                checkpoint = torch.load(block_path, map_location="cpu")
+                if "state_dict" in checkpoint:
+                    state_dict = checkpoint["state_dict"]
+                else:
+                    state_dict = checkpoint
+
+                # Strip 'replacement_block.' prefix if present
+                if any(k.startswith("replacement_block.") for k in state_dict.keys()):
+                    state_dict = {
+                        k.replace("replacement_block.", ""): v for k, v in state_dict.items()
+                    }
+
+                replacement_block.load_state_dict(state_dict, strict=True)
+                blocks_loaded_from_ckpt += 1
+            else:
+                blocks_random_init += 1
             
             # Store in ModuleDict
             self.replacement_blocks[str(block_idx)] = replacement_block
-            blocks_loaded += 1
         
-        print(f"Loaded {blocks_loaded} replacement blocks, {blocks_failed} failed")
+        total_blocks = blocks_loaded_from_ckpt + blocks_random_init
+        print(
+            f"Replacement blocks: loaded_from_ckpt={blocks_loaded_from_ckpt}, "
+            f"random_init={blocks_random_init}, missing={blocks_failed}"
+        )
         
-        if blocks_loaded == 0:
+        if total_blocks == 0:
             raise ValueError(f"No replacement blocks loaded from {self.trained_models_dir}")
     
     def setup(self, stage: Optional[str] = None):
@@ -709,7 +760,13 @@ def main(args, parser):
         config_preset=args.config_preset,
         weights_path=args.weights_path,
         trained_models_dir=args.trained_models_dir,
+        replacement_type=args.replacement_type,
         linear_type=args.linear_type,
+        kernel_size=args.kernel_size,
+        dilations=args.dilations,
+        replacement_mode=args.replacement_mode,
+        replacement_checkpoint_subdir=args.replacement_checkpoint_subdir,
+        allow_random_init=args.allow_random_init,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
     )
@@ -797,9 +854,48 @@ if __name__ == '__main__':
     # Model arguments
     parser.add_argument('--config_preset', type=str, default='model_1_ptm',
                        help='Model config preset')
+    parser.add_argument(
+        '--replacement_type',
+        type=str,
+        default='linear',
+        choices=['linear', 'conv'],
+        help="Replacement block type: 'linear' (SimpleEvoformerReplacement) or 'conv' (DilatedConvEvoformerReplacement)",
+    )
     parser.add_argument('--linear_type', type=str, default='full',
                        choices=['full', 'diagonal', 'affine'],
                        help='Type of linear layers in replacement blocks')
+    parser.add_argument(
+        "--kernel_size",
+        type=int,
+        default=3,
+        help="Kernel size for dilated convolution replacement blocks (conv mode)",
+    )
+    parser.add_argument(
+        "--dilations",
+        type=str,
+        default="1,2,4",
+        help="Comma-separated dilations for conv replacement blocks (e.g. '1,2,4,8,16')",
+    )
+    parser.add_argument(
+        "--replacement_mode",
+        type=str,
+        default="per_block",
+        choices=["per_block", "shared_proj"],
+        help="Convolutional replacement architecture mode (conv mode)",
+    )
+    parser.add_argument(
+        "--replacement_checkpoint_subdir",
+        type=str,
+        default=None,
+        help="Override checkpoint subdirectory under each block_{XX}/. "
+             "If unset, uses linear_type for linear or a conv_* tag for conv.",
+    )
+    parser.add_argument(
+        "--allow_random_init",
+        action="store_true",
+        default=False,
+        help="If set, initialize missing replacement blocks randomly instead of skipping them.",
+    )
     
     # Training arguments
     parser.add_argument('--batch_size', type=int, default=1,

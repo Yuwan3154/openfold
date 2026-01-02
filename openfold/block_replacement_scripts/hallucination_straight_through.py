@@ -416,9 +416,23 @@ def optimize_sequence(
     dist_scale: float = 1.0,
     coor_scale: float = 0.0,
     disable_repl_coor_loss: bool = False,
+    init_seq: str = "0",
+    softmax_seq: bool = False,
+    optimizer: str = "SGD",
+    norm_grad: bool = True,
 ) -> Tuple[torch.Tensor, list, list, torch.Tensor, float, Optional[float], Optional[float]]:
-    seq_logits = nn.Parameter(torch.randn(seq_len, 20, device=device))
-    optimizer = torch.optim.Adam([seq_logits], lr=lr)
+    if init_seq == "0":
+        seq_logits = nn.Parameter(torch.zeros(seq_len, 20, device=device))
+    elif init_seq == "gaussian":
+        seq_logits = nn.Parameter(torch.randn(seq_len, 20, device=device))
+    else:
+        raise ValueError(f"Invalid initial sequence: {init_seq}")
+    if optimizer == "SGD":
+        optimizer = torch.optim.SGD([seq_logits], lr=lr)
+    elif optimizer == "Adam":
+        optimizer = torch.optim.Adam([seq_logits], lr=lr)
+    else:
+        raise ValueError(f"Invalid optimizer: {optimizer}")
     losses = []
     seq_frames = []
     residue_index = torch.arange(seq_len, device=device, dtype=torch.long)
@@ -489,10 +503,15 @@ def optimize_sequence(
             if coor_loss is not None:
                 loss = loss + effective_coor_scale * coor_loss
         loss.backward()
+        if norm_grad:
+            seq_logits.grad = seq_logits.grad * seq_logits.shape[0] ** 0.5 / seq_logits.grad.norm()
         optimizer.step()
 
         losses.append(float(loss.item()))
-        seq_frames.append(torch.softmax(seq_logits.detach(), dim=-1).cpu().numpy())
+        if softmax_seq:
+            seq_frames.append(torch.softmax(seq_logits.detach(), dim=-1).cpu().numpy())
+        else:
+            seq_frames.append(seq_logits.detach().softmax(dim=-1).cpu().numpy())
         d_str = "nan" if dist_loss is None else f"{float(dist_loss.item()):.4f}"
         c_str = "nan" if coor_loss is None else f"{float(coor_loss.item()):.4f}"
         step_idx = step + 1
@@ -576,6 +595,30 @@ def main():
         default=False,
         help="When enabled, disable coordinate (FAPE) loss on straight-through steps",
     )
+    parser.add_argument(
+        "--init_seq",
+        type=str,
+        default="0",
+        help="Initial sequence to use for hallucination. 0 or gaussian",
+    )
+    parser.add_argument(
+        "--softmax_seq",
+        action="store_true",
+        default=False,
+        help="Apply softmax to the initial sequence",
+    )
+    parser.add_argument(
+        "--optimizer",
+        type=str,
+        default="SGD",
+        help="Optimizer to use for hallucination. SGD or Adam",
+    )
+    parser.add_argument(
+        "--norm_grad",
+        action="store_true",
+        default=False,
+        help="Normalize the gradient of the initial sequence. Only works with SGD optimizer",
+    )
     args = parser.parse_args()
     if args.dist_scale == 0.0 and args.coor_scale == 0.0:
         raise ValueError("dist_scale and coor_scale cannot both be 0")
@@ -588,6 +631,10 @@ def main():
         f"_dist-loss-scale-{str(args.dist_scale).replace('.', '-')}-cutoff-{str(args.dist_cutoff).replace('.', '-')}"
         f"_coor-loss-scale-{str(args.coor_scale).replace('.', '-')}-cutoff-{str(args.coor_cutoff).replace('.', '-')}"
         f"_disable-repl-coor-loss-{str(args.disable_repl_coor_loss)}"
+        f"_init-seq-{args.init_seq}"
+        f"_softmax-seq-{args.softmax_seq}"
+        f"_optimizer-{args.optimizer}"
+        f"_norm-grad-{args.norm_grad}"
     )
     out_dir = out_dir / out_prefix
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -642,6 +689,10 @@ def main():
         dist_scale=args.dist_scale,
         coor_scale=args.coor_scale,
         disable_repl_coor_loss=args.disable_repl_coor_loss,
+        init_seq=args.init_seq,
+        softmax_seq=args.softmax_seq,
+        optimizer=args.optimizer,
+        norm_grad=args.norm_grad,
     )
 
     loss_plot = out_dir / f"{out_prefix}_loss.png"

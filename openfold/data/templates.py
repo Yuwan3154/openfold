@@ -1235,6 +1235,8 @@ class CustomHitFeaturizer(TemplateHitFeaturizer):
             kalign_binary_path=self._kalign_binary_path,
             rm_template_sequence=rm_template_sequence,
         )
+
+
 class HmmsearchHitFeaturizer(TemplateHitFeaturizer):
     def get_templates(
         self,

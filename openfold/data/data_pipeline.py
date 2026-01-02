@@ -337,7 +337,7 @@ def make_sequence_features_with_distogram_template(
     mask: np.ndarray,
     *,
     pdb_id: str = "distogram_template",
-    template_sequence_all_x: bool = False,
+    rm_template_sequence: bool = False,
 ) -> FeatureDict:
     """
     Build an AlphaFold/OpenFold feature dict using a single \"distogram-only\" template.
@@ -374,7 +374,7 @@ def make_sequence_features_with_distogram_template(
 
     # Template fields (single template axis)
     no_bins = distogram_probs.shape[-1]
-    template_seq = ("X" * num_res) if template_sequence_all_x else sequence
+    template_seq = ("X" * num_res) if rm_template_sequence else sequence
     template_aatype_one_hot = residue_constants.sequence_to_onehot(
         sequence=template_seq,
         mapping=residue_constants.restype_order_with_x,

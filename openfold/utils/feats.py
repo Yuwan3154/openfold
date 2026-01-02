@@ -170,7 +170,6 @@ def build_template_pair_feat(
         template_mask = (
             t_aa_masks[..., n] * t_aa_masks[..., ca] * t_aa_masks[..., c]
         )
-        template_mask_2d = template_mask[..., None] * template_mask[..., None, :]
 
         inv_distance_scalar = inv_distance_scalar * template_mask_2d
         unit_vector = rigid_vec * inv_distance_scalar[..., None]
