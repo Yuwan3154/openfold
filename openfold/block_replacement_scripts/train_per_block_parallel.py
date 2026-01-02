@@ -818,6 +818,7 @@ def main(args, parser):
         devices=args.gpus if args.gpus > 0 else None,
         strategy=strategy,
         precision=args.precision,
+        accumulate_grad_batches=args.accumulate_grad_batches,
         gradient_clip_val=args.gradient_clip_val,
         callbacks=callbacks,
         logger=loggers,
@@ -908,6 +909,12 @@ if __name__ == '__main__':
                        help='Weight decay')
     parser.add_argument('--max_epochs', type=int, default=100,
                        help='Maximum number of epochs')
+    parser.add_argument(
+        '--accumulate_grad_batches',
+        type=int,
+        default=1,
+        help='Number of gradient accumulation steps',
+    )
     parser.add_argument('--gradient_clip_val', type=float, default=1.0,
                        help='Gradient clipping value')
     
