@@ -573,14 +573,20 @@ class ParallelBlockPretrainer(pl.LightningModule):
             m_in_single, z_in = block_data[block_idx]['input']
             m_target_single, z_target = block_data[block_idx]['output']
             
-            # Expand single representation back to MSA format for replacement block
-            # Shape: [batch, n_res, c_m] -> [batch, 1, n_res, c_m]
-            m_in_msa = m_in_single.unsqueeze(1)
+            needs_batch_dim = m_in_single.dim() == 2
+            if needs_batch_dim:
+                # Add batch + n_seq dims: [N, C] -> [1, 1, N, C]
+                m_in_msa = m_in_single.unsqueeze(0).unsqueeze(0)
+                z_in_for_block = z_in.unsqueeze(0) if z_in.dim() == 3 else z_in
+            else:
+                # Add n_seq dim: [B, N, C] -> [B, 1, N, C]
+                m_in_msa = m_in_single.unsqueeze(-3)
+                z_in_for_block = z_in
             
             # Run replacement block
             replacement_block = self.replacement_blocks[str(block_idx)]
             m_pred_msa, z_pred = replacement_block(
-                m_in_msa, z_in, msa_mask, pair_mask,
+                m_in_msa, z_in_for_block, msa_mask, pair_mask,
                 chunk_size=None,
                 use_deepspeed_evo_attention=False,
                 use_lma=False,
@@ -589,14 +595,16 @@ class ParallelBlockPretrainer(pl.LightningModule):
                 _mask_trans=False  # Disable mask application to avoid dimension issues
             )
             
-            # Extract single representation from output
-            # m_pred_msa shape: [batch, n_seq, n_res, c_m] where n_seq=1
-            # We want: [batch, n_res, c_m]
-            m_pred_single = m_pred_msa.squeeze(1)  # Remove the n_seq dimension
+            # Extract single representation from output: [..., 1, N, C] -> [..., N, C]
+            m_pred_single = m_pred_msa[..., 0, :, :]
+            z_pred_for_loss = z_pred
+            if needs_batch_dim:
+                m_pred_single = m_pred_single.squeeze(0)
+                z_pred_for_loss = z_pred_for_loss.squeeze(0)
             
             # Compute MSE loss on single representation and pair representation
             loss_single = F.mse_loss(m_pred_single, m_target_single)
-            loss_pair = F.mse_loss(z_pred, z_target)
+            loss_pair = F.mse_loss(z_pred_for_loss, z_target)
             
             # Combine losses
             block_loss = loss_single + loss_pair
@@ -607,7 +615,7 @@ class ParallelBlockPretrainer(pl.LightningModule):
             self.log(f'train/block_{block_idx:02d}_loss', block_loss, on_step=True, on_epoch=True)
             
             # Clear intermediate tensors to free memory
-            del m_in_msa, m_pred_msa, m_pred_single, block_loss
+            del m_in_msa, m_pred_msa, m_pred_single, z_pred_for_loss, block_loss
         
         # Average loss across all blocks
         if num_blocks > 0:
@@ -663,13 +671,20 @@ class ParallelBlockPretrainer(pl.LightningModule):
             m_in_single, z_in = block_data[block_idx]['input']
             m_target_single, z_target = block_data[block_idx]['output']
             
-            # Expand single representation back to MSA format for replacement block
-            m_in_msa = m_in_single.unsqueeze(1)
+            needs_batch_dim = m_in_single.dim() == 2
+            if needs_batch_dim:
+                # Add batch + n_seq dims: [N, C] -> [1, 1, N, C]
+                m_in_msa = m_in_single.unsqueeze(0).unsqueeze(0)
+                z_in_for_block = z_in.unsqueeze(0) if z_in.dim() == 3 else z_in
+            else:
+                # Add n_seq dim: [B, N, C] -> [B, 1, N, C]
+                m_in_msa = m_in_single.unsqueeze(-3)
+                z_in_for_block = z_in
             
             # Run replacement block
             replacement_block = self.replacement_blocks[str(block_idx)]
             m_pred_msa, z_pred = replacement_block(
-                m_in_msa, z_in, msa_mask, pair_mask,
+                m_in_msa, z_in_for_block, msa_mask, pair_mask,
                 chunk_size=None,
                 use_deepspeed_evo_attention=False,
                 use_lma=False,
@@ -678,14 +693,16 @@ class ParallelBlockPretrainer(pl.LightningModule):
                 _mask_trans=False  # Disable mask application to avoid dimension issues
             )
             
-            # Extract single representation from output
-            # m_pred_msa shape: [batch, n_seq, n_res, c_m] where n_seq=1
-            # We want: [batch, n_res, c_m]
-            m_pred_single = m_pred_msa.squeeze(1)  # Remove the n_seq dimension
+            # Extract single representation from output: [..., 1, N, C] -> [..., N, C]
+            m_pred_single = m_pred_msa[..., 0, :, :]
+            z_pred_for_loss = z_pred
+            if needs_batch_dim:
+                m_pred_single = m_pred_single.squeeze(0)
+                z_pred_for_loss = z_pred_for_loss.squeeze(0)
             
             # Compute MSE loss
             loss_single = F.mse_loss(m_pred_single, m_target_single)
-            loss_pair = F.mse_loss(z_pred, z_target)
+            loss_pair = F.mse_loss(z_pred_for_loss, z_target)
             
             block_loss = loss_single + loss_pair
             total_loss += block_loss
@@ -695,7 +712,7 @@ class ParallelBlockPretrainer(pl.LightningModule):
             self.log(f'val/block_{block_idx:02d}_loss', block_loss, on_step=False, on_epoch=True, sync_dist=True)
             
             # Clear intermediate tensors
-            del m_in_msa, m_pred_msa, m_pred_single, block_loss
+            del m_in_msa, m_pred_msa, m_pred_single, z_pred_for_loss, block_loss
         
         # Average loss
         if num_blocks > 0:
