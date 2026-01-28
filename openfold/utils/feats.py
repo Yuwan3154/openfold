@@ -108,24 +108,28 @@ def dgram_from_positions(
 
 
 def build_template_pair_feat(
-    batch, 
-    min_bin, max_bin, no_bins, 
-    use_unit_vector=False, 
-    eps=1e-20, inf=1e8,
-    distogram_only: bool = False,
+    batch,
+    min_bin,
+    max_bin,
+    no_bins,
+    use_unit_vector=False,
+    eps=1e-20,
+    inf=1e8,
 ):
     template_mask = batch["template_pseudo_beta_mask"]
     template_mask_2d = template_mask[..., None] * template_mask[..., None, :]
 
     # Distogram
-    if distogram_only:
+    if "template_dgram_probs" in batch:
         # User-provided distogram probabilities (already in [0,1], sum over bins=1)
         # Expected shape: [*, N, N, no_bins]
         dgram = batch["template_dgram_probs"]
+        use_template_dgram = True
     else:
         # Compute distogram from coordinates (this seems to differ slightly from Alg. 5)
         tpb = batch["template_pseudo_beta"]
         dgram = dgram_from_positions(tpb, min_bin, max_bin, no_bins, inf)
+        use_template_dgram = False
 
     to_concat = [dgram, template_mask_2d[..., None]]
 
@@ -146,7 +150,7 @@ def build_template_pair_feat(
         )
     )
 
-    if distogram_only:
+    if use_template_dgram:
         # No coordinates: unit vectors are undefined; use zeros placeholders.
         unit_vector = torch.zeros(
             template_mask_2d.shape + (3,),

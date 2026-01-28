@@ -1006,9 +1006,14 @@ def get_custom_template_features(
             _zero_center_positions=True,
             rm_template_sequence=rm_template_sequence
         )
-        curr_features["template_sum_probs"] = [
-            1.0
-        ]  # template given by user, 100% confident
+        num_res = len(query_sequence)
+        if "template_pseudo_beta_mask" not in curr_features:
+            curr_features["template_pseudo_beta_mask"] = np.zeros((num_res,), dtype=np.float32)
+        if "template_pseudo_beta" not in curr_features:
+            curr_features["template_pseudo_beta"] = np.zeros((num_res, 3), dtype=np.float32)
+        if "template_dgram_probs" not in curr_features:
+            curr_features["template_dgram_probs"] = np.zeros((num_res, num_res, 39), dtype=np.float32)
+        curr_features["template_sum_probs"] = np.array([1.0], dtype=np.float32)
         template_features = {
             curr_name: template_features.get(curr_name, []) + [curr_item]
             for curr_name, curr_item in curr_features.items()

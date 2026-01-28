@@ -313,7 +313,11 @@ def make_sequence_features_with_custom_template(
 
     msa_data = [sequence]
     deletion_matrix = [[0 for _ in sequence]]
-    msa_data_obj = parsers.Msa(sequences=msa_data, deletion_matrix=deletion_matrix, descriptions=None)
+    msa_data_obj = parsers.Msa(
+        sequences=msa_data,
+        deletion_matrix=deletion_matrix,
+        descriptions=[pdb_id],
+    )
 
     msa_features = make_msa_features([msa_data_obj])
     template_features = get_custom_template_features(
