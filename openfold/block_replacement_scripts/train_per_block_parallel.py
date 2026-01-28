@@ -203,6 +203,7 @@ class PerBlockDataModule(pl.LightningDataModule):
         self,
         dataset_path: str,
         config_preset: str,
+        block_data_dir: Optional[str] = None,
         batch_size: int = 1,
         num_workers: int = 0,
         min_length: Optional[int] = None,
@@ -213,6 +214,7 @@ class PerBlockDataModule(pl.LightningDataModule):
         super().__init__()
         self.dataset_path = dataset_path
         self.config_preset = config_preset
+        self.block_data_dir = block_data_dir
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.min_length = min_length
@@ -220,8 +222,13 @@ class PerBlockDataModule(pl.LightningDataModule):
         self.validation_fraction = validation_fraction
         self.split_seed = split_seed
         
-        # Setup data and feature processors
-        self.data_processor, self.feature_processor = self._setup_data_pipeline()
+        # Setup data and feature processors only in teacher mode.
+        # Cache-only mode does not require feature processing.
+        if self.block_data_dir is None:
+            self.data_processor, self.feature_processor = self._setup_data_pipeline()
+        else:
+            self.data_processor = None
+            self.feature_processor = None
     
     def _setup_data_pipeline(self):
         """Setup the data and feature processing pipelines"""
@@ -301,10 +308,38 @@ _atom_site.pdbx_PDB_model_num 1
         import tempfile
         import shutil
         
-        # For batch_size=1, just process single sequence
+        # Cache-only batching: collate ids + lengths and build padding masks.
+        if self.block_data_dir is not None:
+            seq_ids = [s["id"] for s in batch]
+            seq_lens = [len(s["sequence"]) for s in batch]
+            bsz = len(seq_lens)
+            if bsz == 0:
+                raise ValueError("Empty batch")
+            n_max = self.max_length if self.max_length is not None else max(seq_lens)
+            seq_mask = torch.zeros((bsz, n_max), dtype=torch.float32)
+            for i, n in enumerate(seq_lens):
+                if n > n_max:
+                    n = n_max
+                    seq_lens[i] = n
+                if n > 0:
+                    seq_mask[i, :n] = 1.0
+            msa_mask = seq_mask.unsqueeze(1)  # [B, 1, Nmax]
+            return {
+                "seq_id": seq_ids,
+                "seq_length": torch.tensor(seq_lens, dtype=torch.long),
+                "seq_mask": seq_mask,
+                "msa_mask": msa_mask,
+            }
+        
+        # Teacher mode: batch_size must be 1 (single-sample pipeline).
+        if self.batch_size != 1 or len(batch) != 1:
+            raise ValueError(
+                f"Teacher mode requires batch_size=1, got batch_size={self.batch_size} len(batch)={len(batch)}"
+            )
+
         seq_data = batch[0]
-        seq_id = seq_data['id']
-        sequence = seq_data['sequence']
+        seq_id = seq_data["id"]
+        sequence = seq_data["sequence"]
         
         # Create temporary FASTA file
         tmp_fasta_path = os.path.join(tempfile.gettempdir(), f"tmp_{os.getpid()}_{seq_id.replace('/', '_')}.fasta")
@@ -356,7 +391,7 @@ _atom_site.pdbx_PDB_model_num 1
         processed_batch['seq_length'] = len(sequence)
         
         return processed_batch
-
+    
     def train_dataloader(self):
         return DataLoader(
             self.train_dataset,
@@ -440,14 +475,14 @@ class ParallelBlockPretrainer(pl.LightningModule):
         self.c_z = config.model.evoformer_stack.c_z
         
         # Create teacher model with block capture
-        self.teacher = None  # Initialized lazily on first cache miss (or in setup if no cache)
+        self.teacher = None
         self._teacher_model = None
         if self.block_data_dir is None:
             print("Loading teacher model...", flush=True)
             self._teacher_model = self._load_teacher_model()
         else:
             print(
-                "Teacher model will be loaded lazily on cache miss (block_data_dir is set).",
+                "Cache-only mode enabled (block_data_dir is set). Teacher model will NOT be initialized.",
                 flush=True,
             )
         
@@ -615,6 +650,55 @@ class ParallelBlockPretrainer(pl.LightningModule):
             print(f"Teacher model initialized on {device}")
 
     def on_fit_start(self):
+        # In cache-only mode, ensure teacher is never initialized.
+        if self.block_data_dir is not None:
+            if self.teacher is not None or self._teacher_model is not None:
+                raise RuntimeError("Cache-only mode forbids teacher initialization, but teacher is present")
+
+            # Preflight: verify all required cache files exist before training.
+            # Do this on rank 0 and broadcast outcome to avoid DDP hangs.
+            is_dist = torch.distributed.is_available() and torch.distributed.is_initialized()
+            global_rank = int(getattr(self, "global_rank", 0))
+            is_rank0 = (global_rank == 0)
+
+            ok = True
+            missing: list[str] = []
+            if is_rank0:
+                dm = getattr(self.trainer, "datamodule", None)
+                if dm is None:
+                    raise RuntimeError("Cache-only mode requires a datamodule for preflight cache validation")
+
+                cache_dir = Path(self.block_data_dir)
+                ext = self.block_data_format
+                blocks_to_train = sorted(int(k) for k in self.replacement_blocks.keys())
+
+                datasets = []
+                if hasattr(dm, "train_dataset") and dm.train_dataset is not None:
+                    datasets.append(("train", dm.train_dataset))
+                if hasattr(dm, "val_dataset") and dm.val_dataset is not None:
+                    datasets.append(("val", dm.val_dataset))
+
+                for split_name, ds in datasets:
+                    for item in ds:
+                        seq_id = item["id"]
+                        sid = sanitize_id(str(seq_id))
+                        for block_idx in blocks_to_train:
+                            cache_path = cache_dir / f"block_{block_idx:02d}" / f"{sid}.{ext}"
+                            if not cache_path.exists():
+                                ok = False
+                                if len(missing) < 20:
+                                    missing.append(f"{split_name}: {cache_path}")
+
+            ok_tensor = torch.tensor([1 if ok else 0], dtype=torch.int32)
+            if is_dist:
+                torch.distributed.broadcast(ok_tensor, src=0)
+
+            if int(ok_tensor.item()) == 0:
+                if is_rank0:
+                    msg = "Cache preflight failed; missing cache files (first 20):\n" + "\n".join(missing)
+                    raise FileNotFoundError(msg)
+                raise RuntimeError("Cache preflight failed on rank0; see rank0 logs for missing cache paths")
+
         if self.compile_replacement and self.device.type == "cuda":
             import torch._dynamo as dynamo
 
@@ -646,13 +730,16 @@ class ParallelBlockPretrainer(pl.LightningModule):
         log_batch_size = 1
         
         # Extract metadata
-        seq_length = batch.pop('seq_length')
-        seq_id = batch.pop('seq_id')
+        seq_length = batch.pop("seq_length")
+        seq_id = batch.pop("seq_id")
         cache_dir = None
         safe_seq_id = None
         if self.block_data_dir:
             cache_dir = Path(self.block_data_dir)
-            safe_seq_id = sanitize_id(str(seq_id))
+            if isinstance(seq_id, (list, tuple)):
+                safe_seq_id = [sanitize_id(str(s)) for s in seq_id]
+            else:
+                safe_seq_id = sanitize_id(str(seq_id))
         cache_can_write = None
         
         # Get masks from batch
@@ -682,19 +769,28 @@ class ParallelBlockPretrainer(pl.LightningModule):
             cached = None
             if cache_dir is not None and safe_seq_id is not None:
                 ext = self.block_data_format
-                cache_path = cache_dir / f"block_{block_idx:02d}" / f"{safe_seq_id}.{ext}"
-                if cache_path.exists():
-                    cache_map_location = self.device if self.block_data_format == "df11.safetensors" else "cpu"
+                cache_map_location = self.device if self.block_data_format == "df11.safetensors" else "cpu"
+                if isinstance(safe_seq_id, list):
+                    cached = []
+                    for sid in safe_seq_id:
+                        cache_path = cache_dir / f"block_{block_idx:02d}" / f"{sid}.{ext}"
+                        if not cache_path.exists():
+                            raise FileNotFoundError(f"Missing cache file: {cache_path}")
+                        cached.append(load_block_sample(cache_path, map_location=cache_map_location))
+                else:
+                    cache_path = cache_dir / f"block_{block_idx:02d}" / f"{safe_seq_id}.{ext}"
+                    if not cache_path.exists():
+                        raise FileNotFoundError(f"Missing cache file: {cache_path}")
                     cached = load_block_sample(cache_path, map_location=cache_map_location)
 
             if cached is not None:
-                m_in_single = cached["input"]["m"].to(self.device, non_blocking=True)
-                z_in = cached["input"]["z"].to(self.device, non_blocking=True)
-                m_target_single = cached["output"]["m"].to(self.device, non_blocking=True)
-                z_target = cached["output"]["z"].to(self.device, non_blocking=True)
                 cache_hits += 1
             else:
+                # Teacher path (single-sample only when block_data_dir is not set)
                 cache_misses += 1
+                if self.block_data_dir is not None:
+                    raise RuntimeError("Cache-only mode: unexpected missing cached data")
+
                 if block_data is None:
                     teacher_used = True
                     if self.teacher is None:
@@ -712,7 +808,7 @@ class ParallelBlockPretrainer(pl.LightningModule):
                 m_target_single, z_target = block_data[block_idx]["output"]
 
                 # Cache to disk if enabled and not already present
-                if cache_dir is not None and safe_seq_id is not None:
+                if cache_dir is not None and safe_seq_id is not None and not isinstance(safe_seq_id, list):
                     ext = self.block_data_format
                     cache_path = cache_dir / f"block_{block_idx:02d}" / f"{safe_seq_id}.{ext}"
                     if not cache_path.exists():
@@ -723,19 +819,11 @@ class ParallelBlockPretrainer(pl.LightningModule):
                             continue
 
                         sample = {
-                            "input": {
-                                "m": m_in_single.detach().cpu(),
-                                "z": z_in.detach().cpu(),
-                            },
-                            "output": {
-                                "m": m_target_single.detach().cpu(),
-                                "z": z_target.detach().cpu(),
-                            },
+                            "input": {"m": m_in_single.detach().cpu(), "z": z_in.detach().cpu()},
+                            "output": {"m": m_target_single.detach().cpu(), "z": z_target.detach().cpu()},
                             "chain_id": str(seq_id),
                             "block_idx": int(block_idx),
                         }
-                        # Atomic write to avoid other DDP ranks reading partially-written files.
-                        # Keep the *same* block_data_format suffix so save_block_sample can infer the format.
                         tmp_tag = f".tmp.{os.getpid()}.{int(getattr(self, 'global_rank', 0))}"
                         suffix = f".{self.block_data_format}"
                         base_name = (
@@ -749,18 +837,100 @@ class ParallelBlockPretrainer(pl.LightningModule):
                             quantization=self.block_data_quantization,  # type: ignore[arg-type]
                         )
                         os.replace(tmp_path, cache_path)
-            
-            needs_batch_dim = m_in_single.dim() == 2
-            if needs_batch_dim:
-                # Add batch + n_seq dims: [N, C] -> [1, 1, N, C]
-                m_in_msa = m_in_single.unsqueeze(0).unsqueeze(0)
-            else:
-                # Add n_seq dim: [B, N, C] -> [B, 1, N, C]
-                m_in_msa = m_in_single.unsqueeze(-3)
 
-            # Cache files store z as [N, N, C_z] (no batch dim). Always add batch dim when missing.
-            z_in_for_block = z_in.unsqueeze(0) if z_in.dim() == 3 else z_in
-            
+            if isinstance(cached, list):
+                # Cache-only batched mode: pad to Nmax and run once.
+                if not isinstance(seq_length, torch.Tensor) or seq_length.ndim != 1:
+                    raise ValueError("Cache-only mode expects seq_length as 1D tensor")
+                bsz = int(seq_length.shape[0])
+                log_batch_size = bsz
+                if seq_mask is None:
+                    raise ValueError("Cache-only mode requires seq_mask in batch")
+                n_max = int(seq_mask.shape[1])
+
+                m_list = []
+                z_list = []
+                mt_list = []
+                zt_list = []
+                for c in cached:
+                    m = c["input"]["m"]
+                    z = c["input"]["z"]
+                    mt = c["output"]["m"]
+                    zt = c["output"]["z"]
+                    if m.dim() == 3 and m.shape[0] == 1:
+                        m = m.squeeze(0)
+                    if z.dim() == 4 and z.shape[0] == 1:
+                        z = z.squeeze(0)
+                    if mt.dim() == 3 and mt.shape[0] == 1:
+                        mt = mt.squeeze(0)
+                    if zt.dim() == 4 and zt.shape[0] == 1:
+                        zt = zt.squeeze(0)
+                    m_list.append(m)
+                    z_list.append(z)
+                    mt_list.append(mt)
+                    zt_list.append(zt)
+
+                c_m = int(m_list[0].shape[-1])
+                c_z = int(z_list[0].shape[-1])
+                m_in_padded = torch.zeros((bsz, n_max, c_m), dtype=m_list[0].dtype, device=self.device)
+                m_tgt_padded = torch.zeros((bsz, n_max, c_m), dtype=mt_list[0].dtype, device=self.device)
+                z_in_padded = torch.zeros((bsz, n_max, n_max, c_z), dtype=z_list[0].dtype, device=self.device)
+                z_tgt_padded = torch.zeros((bsz, n_max, n_max, c_z), dtype=zt_list[0].dtype, device=self.device)
+
+                seq_mask = seq_mask.clone()
+
+                for i in range(bsz):
+                    n_i = int(seq_length[i].item())
+                    if n_i > n_max:
+                        n_i = n_max
+                        seq_length[i] = n_i
+                        seq_mask[i, n_i:] = 0.0
+                    n_cache = int(m_list[i].shape[0])
+                    if z_list[i].dim() >= 2:
+                        n_cache = min(n_cache, int(z_list[i].shape[0]), int(z_list[i].shape[1]))
+                    if n_i > n_cache:
+                        n_i = n_cache
+                        seq_length[i] = n_i
+                        seq_mask[i, n_i:] = 0.0
+                    if n_i == 0:
+                        continue
+                    m_in_padded[i, :n_i, :] = m_list[i][:n_i]
+                    m_tgt_padded[i, :n_i, :] = mt_list[i][:n_i]
+                    z_in_padded[i, :n_i, :n_i, :] = z_list[i][:n_i, :n_i]
+                    z_tgt_padded[i, :n_i, :n_i, :] = zt_list[i][:n_i, :n_i]
+
+                msa_mask = seq_mask.unsqueeze(1)
+                pair_mask = seq_mask.unsqueeze(-1) * seq_mask.unsqueeze(-2)
+
+                m_in_msa = m_in_padded.unsqueeze(1)
+                z_in_for_block = z_in_padded
+                m_target_single = m_tgt_padded
+                z_target = z_tgt_padded
+                needs_batch_dim = False
+            elif cached is not None:
+                m_in_single = cached["input"]["m"].to(self.device, non_blocking=True)
+                z_in = cached["input"]["z"].to(self.device, non_blocking=True)
+                m_target_single = cached["output"]["m"].to(self.device, non_blocking=True)
+                z_target = cached["output"]["z"].to(self.device, non_blocking=True)
+                needs_batch_dim = m_in_single.dim() == 2
+                if needs_batch_dim:
+                    # Add batch + n_seq dims: [N, C] -> [1, 1, N, C]
+                    m_in_msa = m_in_single.unsqueeze(0).unsqueeze(0)
+                else:
+                    # Add n_seq dim: [B, N, C] -> [B, 1, N, C]
+                    m_in_msa = m_in_single.unsqueeze(-3)
+
+                # Cache files store z as [N, N, C_z] (no batch dim). Always add batch dim when missing.
+                z_in_for_block = z_in.unsqueeze(0) if z_in.dim() == 3 else z_in
+            else:
+                # Teacher path (single-sample): m_in_single / z_in / targets already set above.
+                needs_batch_dim = m_in_single.dim() == 2
+                if needs_batch_dim:
+                    m_in_msa = m_in_single.unsqueeze(0).unsqueeze(0)
+                else:
+                    m_in_msa = m_in_single.unsqueeze(-3)
+                z_in_for_block = z_in.unsqueeze(0) if z_in.dim() == 3 else z_in
+
             # Run replacement block
             replacement_block = self.replacement_blocks[str(block_idx)]
             m_pred_msa, z_pred = replacement_block(
@@ -770,7 +940,7 @@ class ParallelBlockPretrainer(pl.LightningModule):
                 use_lma=False,
                 use_flash=False,
                 inplace_safe=False,
-                _mask_trans=False  # Disable mask application to avoid dimension issues
+                _mask_trans=True
             )
             
             # Extract single representation from output: [..., 1, N, C] -> [..., N, C]
@@ -781,9 +951,32 @@ class ParallelBlockPretrainer(pl.LightningModule):
             if z_target.dim() == 3 and z_pred_for_loss.dim() == 4 and z_pred_for_loss.shape[0] == 1:
                 z_pred_for_loss = z_pred_for_loss.squeeze(0)
             
-            # Compute MSE loss on single representation and pair representation
-            loss_single = F.mse_loss(m_pred_single, m_target_single)
-            loss_pair = F.mse_loss(z_pred_for_loss, z_target)
+            # Compute loss
+            if cache_dir is not None and isinstance(seq_length, torch.Tensor) and seq_length.ndim == 1:
+                # Masked MSE (padding-safe) for cache-only batched mode
+                seq_mask_for_loss = seq_mask
+                if seq_mask_for_loss is None:
+                    raise ValueError("Cache-only mode requires seq_mask in batch")
+                pair_mask_for_loss = seq_mask_for_loss.unsqueeze(-1) * seq_mask_for_loss.unsqueeze(-2)
+
+                c_m = int(m_pred_single.shape[-1])
+                c_z = int(z_pred_for_loss.shape[-1])
+                denom_m = float(seq_mask_for_loss.sum().item())
+                denom_z = float(pair_mask_for_loss.sum().item())
+                if denom_m == 0.0 or denom_z == 0.0:
+                    loss_single = torch.tensor(0.0, device=self.device)
+                    loss_pair = torch.tensor(0.0, device=self.device)
+                else:
+                    loss_single = (
+                        ((m_pred_single - m_target_single) ** 2) * seq_mask_for_loss.unsqueeze(-1)
+                    ).sum() / (seq_mask_for_loss.sum() * c_m)
+                    loss_pair = (
+                        ((z_pred_for_loss - z_target) ** 2) * pair_mask_for_loss.unsqueeze(-1)
+                    ).sum() / (pair_mask_for_loss.sum() * c_z)
+            else:
+                # Original behavior
+                loss_single = F.mse_loss(m_pred_single, m_target_single)
+                loss_pair = F.mse_loss(z_pred_for_loss, z_target)
             
             # Combine losses
             block_loss = loss_single + loss_pair
@@ -812,7 +1005,10 @@ class ParallelBlockPretrainer(pl.LightningModule):
         # Log overall metrics
         self.log('train/loss', avg_loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=log_batch_size, sync_dist=True)
         self.log('train/num_blocks_trained', float(num_blocks), on_step=False, on_epoch=True, batch_size=log_batch_size, sync_dist=True)
-        self.log('train/seq_length', float(seq_length), on_step=False, on_epoch=True, batch_size=log_batch_size, sync_dist=True)
+        if isinstance(seq_length, torch.Tensor):
+            self.log('train/seq_length', float(seq_length.float().mean().item()), on_step=False, on_epoch=True, batch_size=log_batch_size, sync_dist=True)
+        else:
+            self.log('train/seq_length', float(seq_length), on_step=False, on_epoch=True, batch_size=log_batch_size, sync_dist=True)
         
         # Clear teacher outputs to free GPU memory (if used)
         if block_data is not None:
@@ -836,13 +1032,16 @@ class ParallelBlockPretrainer(pl.LightningModule):
         log_batch_size = 1
         
         # Extract metadata
-        seq_length = batch.pop('seq_length')
-        seq_id = batch.pop('seq_id')
+        seq_length = batch.pop("seq_length")
+        seq_id = batch.pop("seq_id")
         cache_dir = None
         safe_seq_id = None
         if self.block_data_dir:
             cache_dir = Path(self.block_data_dir)
-            safe_seq_id = sanitize_id(str(seq_id))
+            if isinstance(seq_id, (list, tuple)):
+                safe_seq_id = [sanitize_id(str(s)) for s in seq_id]
+            else:
+                safe_seq_id = sanitize_id(str(seq_id))
         cache_can_write = None
         
         # Get masks from batch
@@ -872,19 +1071,28 @@ class ParallelBlockPretrainer(pl.LightningModule):
             cached = None
             if cache_dir is not None and safe_seq_id is not None:
                 ext = self.block_data_format
-                cache_path = cache_dir / f"block_{block_idx:02d}" / f"{safe_seq_id}.{ext}"
-                if cache_path.exists():
-                    cache_map_location = self.device if self.block_data_format == "df11.safetensors" else "cpu"
+                cache_map_location = self.device if self.block_data_format == "df11.safetensors" else "cpu"
+                if isinstance(safe_seq_id, list):
+                    cached = []
+                    for sid in safe_seq_id:
+                        cache_path = cache_dir / f"block_{block_idx:02d}" / f"{sid}.{ext}"
+                        if not cache_path.exists():
+                            raise FileNotFoundError(f"Missing cache file: {cache_path}")
+                        cached.append(load_block_sample(cache_path, map_location=cache_map_location))
+                else:
+                    cache_path = cache_dir / f"block_{block_idx:02d}" / f"{safe_seq_id}.{ext}"
+                    if not cache_path.exists():
+                        raise FileNotFoundError(f"Missing cache file: {cache_path}")
                     cached = load_block_sample(cache_path, map_location=cache_map_location)
 
             if cached is not None:
-                m_in_single = cached["input"]["m"].to(self.device, non_blocking=True)
-                z_in = cached["input"]["z"].to(self.device, non_blocking=True)
-                m_target_single = cached["output"]["m"].to(self.device, non_blocking=True)
-                z_target = cached["output"]["z"].to(self.device, non_blocking=True)
                 cache_hits += 1
             else:
+                # Teacher path (single-sample only when block_data_dir is not set)
                 cache_misses += 1
+                if self.block_data_dir is not None:
+                    raise RuntimeError("Cache-only mode: unexpected missing cached data")
+
                 if block_data is None:
                     teacher_used = True
                     if self.teacher is None:
@@ -902,7 +1110,7 @@ class ParallelBlockPretrainer(pl.LightningModule):
                 m_target_single, z_target = block_data[block_idx]["output"]
 
                 # Cache to disk if enabled and not already present
-                if cache_dir is not None and safe_seq_id is not None:
+                if cache_dir is not None and safe_seq_id is not None and not isinstance(safe_seq_id, list):
                     ext = self.block_data_format
                     cache_path = cache_dir / f"block_{block_idx:02d}" / f"{safe_seq_id}.{ext}"
                     if not cache_path.exists():
@@ -913,19 +1121,11 @@ class ParallelBlockPretrainer(pl.LightningModule):
                             continue
 
                         sample = {
-                            "input": {
-                                "m": m_in_single.detach().cpu(),
-                                "z": z_in.detach().cpu(),
-                            },
-                            "output": {
-                                "m": m_target_single.detach().cpu(),
-                                "z": z_target.detach().cpu(),
-                            },
+                            "input": {"m": m_in_single.detach().cpu(), "z": z_in.detach().cpu()},
+                            "output": {"m": m_target_single.detach().cpu(), "z": z_target.detach().cpu()},
                             "chain_id": str(seq_id),
                             "block_idx": int(block_idx),
                         }
-                        # Atomic write to avoid other DDP ranks reading partially-written files.
-                        # Keep the *same* block_data_format suffix so save_block_sample can infer the format.
                         tmp_tag = f".tmp.{os.getpid()}.{int(getattr(self, 'global_rank', 0))}"
                         suffix = f".{self.block_data_format}"
                         base_name = (
@@ -939,18 +1139,100 @@ class ParallelBlockPretrainer(pl.LightningModule):
                             quantization=self.block_data_quantization,  # type: ignore[arg-type]
                         )
                         os.replace(tmp_path, cache_path)
-            
-            needs_batch_dim = m_in_single.dim() == 2
-            if needs_batch_dim:
-                # Add batch + n_seq dims: [N, C] -> [1, 1, N, C]
-                m_in_msa = m_in_single.unsqueeze(0).unsqueeze(0)
-            else:
-                # Add n_seq dim: [B, N, C] -> [B, 1, N, C]
-                m_in_msa = m_in_single.unsqueeze(-3)
 
-            # Cache files store z as [N, N, C_z] (no batch dim). Always add batch dim when missing.
-            z_in_for_block = z_in.unsqueeze(0) if z_in.dim() == 3 else z_in
-            
+            if isinstance(cached, list):
+                # Cache-only batched mode: pad to Nmax and run once.
+                if not isinstance(seq_length, torch.Tensor) or seq_length.ndim != 1:
+                    raise ValueError("Cache-only mode expects seq_length as 1D tensor")
+                bsz = int(seq_length.shape[0])
+                log_batch_size = bsz
+                if seq_mask is None:
+                    raise ValueError("Cache-only mode requires seq_mask in batch")
+                n_max = int(seq_mask.shape[1])
+
+                m_list = []
+                z_list = []
+                mt_list = []
+                zt_list = []
+                for c in cached:
+                    m = c["input"]["m"]
+                    z = c["input"]["z"]
+                    mt = c["output"]["m"]
+                    zt = c["output"]["z"]
+                    if m.dim() == 3 and m.shape[0] == 1:
+                        m = m.squeeze(0)
+                    if z.dim() == 4 and z.shape[0] == 1:
+                        z = z.squeeze(0)
+                    if mt.dim() == 3 and mt.shape[0] == 1:
+                        mt = mt.squeeze(0)
+                    if zt.dim() == 4 and zt.shape[0] == 1:
+                        zt = zt.squeeze(0)
+                    m_list.append(m)
+                    z_list.append(z)
+                    mt_list.append(mt)
+                    zt_list.append(zt)
+
+                c_m = int(m_list[0].shape[-1])
+                c_z = int(z_list[0].shape[-1])
+                m_in_padded = torch.zeros((bsz, n_max, c_m), dtype=m_list[0].dtype, device=self.device)
+                m_tgt_padded = torch.zeros((bsz, n_max, c_m), dtype=mt_list[0].dtype, device=self.device)
+                z_in_padded = torch.zeros((bsz, n_max, n_max, c_z), dtype=z_list[0].dtype, device=self.device)
+                z_tgt_padded = torch.zeros((bsz, n_max, n_max, c_z), dtype=zt_list[0].dtype, device=self.device)
+
+                seq_mask = seq_mask.clone()
+
+                for i in range(bsz):
+                    n_i = int(seq_length[i].item())
+                    if n_i > n_max:
+                        n_i = n_max
+                        seq_length[i] = n_i
+                        seq_mask[i, n_i:] = 0.0
+                    n_cache = int(m_list[i].shape[0])
+                    if z_list[i].dim() >= 2:
+                        n_cache = min(n_cache, int(z_list[i].shape[0]), int(z_list[i].shape[1]))
+                    if n_i > n_cache:
+                        n_i = n_cache
+                        seq_length[i] = n_i
+                        seq_mask[i, n_i:] = 0.0
+                    if n_i == 0:
+                        continue
+                    m_in_padded[i, :n_i, :] = m_list[i][:n_i]
+                    m_tgt_padded[i, :n_i, :] = mt_list[i][:n_i]
+                    z_in_padded[i, :n_i, :n_i, :] = z_list[i][:n_i, :n_i]
+                    z_tgt_padded[i, :n_i, :n_i, :] = zt_list[i][:n_i, :n_i]
+
+                msa_mask = seq_mask.unsqueeze(1)
+                pair_mask = seq_mask.unsqueeze(-1) * seq_mask.unsqueeze(-2)
+
+                m_in_msa = m_in_padded.unsqueeze(1)
+                z_in_for_block = z_in_padded
+                m_target_single = m_tgt_padded
+                z_target = z_tgt_padded
+                needs_batch_dim = False
+            elif cached is not None:
+                m_in_single = cached["input"]["m"].to(self.device, non_blocking=True)
+                z_in = cached["input"]["z"].to(self.device, non_blocking=True)
+                m_target_single = cached["output"]["m"].to(self.device, non_blocking=True)
+                z_target = cached["output"]["z"].to(self.device, non_blocking=True)
+                needs_batch_dim = m_in_single.dim() == 2
+                if needs_batch_dim:
+                    # Add batch + n_seq dims: [N, C] -> [1, 1, N, C]
+                    m_in_msa = m_in_single.unsqueeze(0).unsqueeze(0)
+                else:
+                    # Add n_seq dim: [B, N, C] -> [B, 1, N, C]
+                    m_in_msa = m_in_single.unsqueeze(-3)
+
+                # Cache files store z as [N, N, C_z] (no batch dim). Always add batch dim when missing.
+                z_in_for_block = z_in.unsqueeze(0) if z_in.dim() == 3 else z_in
+            else:
+                # Teacher path (single-sample): m_in_single / z_in / targets already set above.
+                needs_batch_dim = m_in_single.dim() == 2
+                if needs_batch_dim:
+                    m_in_msa = m_in_single.unsqueeze(0).unsqueeze(0)
+                else:
+                    m_in_msa = m_in_single.unsqueeze(-3)
+                z_in_for_block = z_in.unsqueeze(0) if z_in.dim() == 3 else z_in
+
             # Run replacement block
             replacement_block = self.replacement_blocks[str(block_idx)]
             m_pred_msa, z_pred = replacement_block(
@@ -960,7 +1242,7 @@ class ParallelBlockPretrainer(pl.LightningModule):
                 use_lma=False,
                 use_flash=False,
                 inplace_safe=False,
-                _mask_trans=False  # Disable mask application to avoid dimension issues
+                _mask_trans=True
             )
             
             # Extract single representation from output: [..., 1, N, C] -> [..., N, C]
@@ -971,9 +1253,30 @@ class ParallelBlockPretrainer(pl.LightningModule):
             if z_target.dim() == 3 and z_pred_for_loss.dim() == 4 and z_pred_for_loss.shape[0] == 1:
                 z_pred_for_loss = z_pred_for_loss.squeeze(0)
             
-            # Compute MSE loss
-            loss_single = F.mse_loss(m_pred_single, m_target_single)
-            loss_pair = F.mse_loss(z_pred_for_loss, z_target)
+            # Compute loss
+            if cache_dir is not None and isinstance(seq_length, torch.Tensor) and seq_length.ndim == 1:
+                seq_mask_for_loss = seq_mask
+                if seq_mask_for_loss is None:
+                    raise ValueError("Cache-only mode requires seq_mask in batch")
+                pair_mask_for_loss = seq_mask_for_loss.unsqueeze(-1) * seq_mask_for_loss.unsqueeze(-2)
+
+                c_m = int(m_pred_single.shape[-1])
+                c_z = int(z_pred_for_loss.shape[-1])
+                denom_m = float(seq_mask_for_loss.sum().item())
+                denom_z = float(pair_mask_for_loss.sum().item())
+                if denom_m == 0.0 or denom_z == 0.0:
+                    loss_single = torch.tensor(0.0, device=self.device)
+                    loss_pair = torch.tensor(0.0, device=self.device)
+                else:
+                    loss_single = (
+                        ((m_pred_single - m_target_single) ** 2) * seq_mask_for_loss.unsqueeze(-1)
+                    ).sum() / (seq_mask_for_loss.sum() * c_m)
+                    loss_pair = (
+                        ((z_pred_for_loss - z_target) ** 2) * pair_mask_for_loss.unsqueeze(-1)
+                    ).sum() / (pair_mask_for_loss.sum() * c_z)
+            else:
+                loss_single = F.mse_loss(m_pred_single, m_target_single)
+                loss_pair = F.mse_loss(z_pred_for_loss, z_target)
             
             block_loss = loss_single + loss_pair
             total_loss += block_loss
@@ -1051,12 +1354,17 @@ def main(args, parser):
         train=True,
         low_prec=(args.precision in ["bf16-mixed", "16", "bf16", "16-true", "16-mixed"])
     )
+
+    # Enforce mode constraints early.
+    if getattr(args, "block_data_dir", None) is None and int(args.batch_size) != 1:
+        raise ValueError("Teacher mode (no block_data_dir) requires --batch_size 1")
     
     # Create data module
     print("Setting up data module...")
     data_module = PerBlockDataModule(
         dataset_path=args.dataset_path,
         config_preset=args.config_preset,
+        block_data_dir=getattr(args, "block_data_dir", None),
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         min_length=args.min_length,
@@ -1415,8 +1723,8 @@ if __name__ == '__main__':
         print(f"Will resume from checkpoint: {args.resume_checkpoint_path}", flush=True)
     
     # Validate arguments
-    if args.batch_size != 1:
-        raise ValueError("batch_size must be 1 for per-block training")
+    if getattr(args, "block_data_dir", None) is None and int(args.batch_size) != 1:
+        raise ValueError("Teacher mode (no block_data_dir) requires --batch_size 1")
     
     main(args, parser)
 

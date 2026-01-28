@@ -162,21 +162,26 @@ class _MSharedProjConvStack(nn.Module):
         x = self.ln_in(m)
         x = F.gelu(x)
         x = self.down(x)  # [B, S, N, C_hidden]
+        if msa_mask is not None:
+            x = x * msa_mask[..., None]
 
         b, s, n, c_h = x.shape
         for ln, conv in zip(self.conv_lns, self.convs):
             x = ln(x)
             x = F.gelu(x)
+            if msa_mask is not None:
+                x = x * msa_mask[..., None]
             y = x.reshape(b * s, n, c_h).transpose(1, 2)  # [B*S, C_hidden, N]
             y = conv(y)
             x = y.transpose(1, 2).reshape(b, s, n, c_h)
+            if msa_mask is not None:
+                x = x * msa_mask[..., None]
 
         x = self.ln_out(x)
         x = F.gelu(x)
         x = self.up(x)  # [B, S, N, C_m]
 
         x = x * layer_gate
-
         if msa_mask is not None:
             x = x * msa_mask[..., None]
 
@@ -225,20 +230,25 @@ class _ZSharedProjConvStack(nn.Module):
         x = self.ln_in(z)
         x = F.gelu(x)
         x = self.down(x)  # [B, N, N, C_hidden]
+        if pair_mask is not None:
+            x = x * pair_mask[..., None]
 
         for ln, conv in zip(self.conv_lns, self.convs):
             x = ln(x)
             x = F.gelu(x)
+            if pair_mask is not None:
+                x = x * pair_mask[..., None]
             y = x.permute(0, 3, 1, 2).contiguous()  # [B, C_hidden, N, N]
             y = conv(y)
             x = y.permute(0, 2, 3, 1).contiguous()  # [B, N, N, C_hidden]
+            if pair_mask is not None:
+                x = x * pair_mask[..., None]
 
         x = self.ln_out(x)
         x = F.gelu(x)
         x = self.up(x)  # [B, N, N, C_z]
 
         x = x * layer_gate
-
         if pair_mask is not None:
             x = x * pair_mask[..., None]
 
