@@ -26,6 +26,7 @@ from typing import Dict, Tuple, Optional
 import time
 import csv
 import json
+import yaml
 import re
 import subprocess
 from tqdm import tqdm
@@ -49,6 +50,9 @@ from openfold.data.data_transforms import (
 )
 import openfold.np.residue_constants as rc
 from openfold.block_replacement_scripts.custom_evoformer_replacement import SimpleEvoformerReplacement
+from openfold.block_replacement_scripts.dilated_conv_evoformer_replacement import (
+    DilatedConvEvoformerReplacement,
+)
 from openfold.np.protein import from_pdb_string, from_prediction, to_pdb, Protein
 
 class GradientStraightThroughBlock(nn.Module):
@@ -318,13 +322,54 @@ def _load_block_submodule(module: nn.Module, state_dict: Dict[str, torch.Tensor]
             print(f"Warning: block load had missing={len(missing)} unexpected={len(unexpected)} for {prefix}")
 
 
-def _wrap_replacements_from_checkpoint(model: AlphaFold, state_dict: Dict[str, torch.Tensor], c_m: int, c_z: int,linear_type: str = "full") -> int:
+def _resolve_checkpoint_path(path: Path) -> Path:
+    """
+    Resolve a checkpoint path.
+    - If `path` is a directory: prefer `last.ckpt` if present, else pick newest `*.ckpt`.
+    - If `path` is a file: return it as-is.
+    """
+    p = Path(path).expanduser()
+    if p.is_dir():
+        last = p / "last.ckpt"
+        if last.exists():
+            return last
+        ckpts = [q for q in p.glob("*.ckpt") if q.is_file()]
+        if len(ckpts) == 0:
+            raise FileNotFoundError(f"No .ckpt files found in checkpoint directory: {p}")
+        return max(ckpts, key=lambda q: q.stat().st_mtime)
+    return p
+
+
+def _wrap_replacements_from_checkpoint(
+    model: AlphaFold,
+    state_dict: Dict[str, torch.Tensor],
+    c_m: int,
+    c_z: int,
+    replacement_type: str = "linear",
+    linear_type: str = "full",
+    kernel_size: int = 3,
+    dilations: Tuple[int, ...] = (1, 2, 4),
+    replacement_mode: str = "per_block",
+) -> int:
     """Replace Evoformer blocks with checkpointed replacements when available."""
     wrapped = 0
     for idx in range(len(model.evoformer.blocks)):
         rep_prefix = f"replacement_blocks.{idx}."
         if any(k.startswith(rep_prefix) for k in state_dict):
-            replacement = SimpleEvoformerReplacement(c_m=c_m, c_z=c_z, linear_type=linear_type)
+            if replacement_type == "linear":
+                replacement = SimpleEvoformerReplacement(c_m=c_m, c_z=c_z, linear_type=linear_type)
+            elif replacement_type == "conv":
+                replacement = DilatedConvEvoformerReplacement(
+                    c_m=c_m,
+                    c_z=c_z,
+                    kernel_size=int(kernel_size),
+                    dilations=tuple(int(d) for d in dilations),
+                    mode=str(replacement_mode),
+                )
+            else:
+                raise ValueError(
+                    f"Invalid replacement_type: {replacement_type}. Expected 'linear' or 'conv'."
+                )
             _load_block_submodule(replacement, state_dict, rep_prefix)
             replacement = replacement.to(next(model.parameters()).device)
             # Optional: load original block fine-tunes if present
@@ -343,6 +388,44 @@ def _set_straight_through(model: AlphaFold, enabled: bool):
             blk.use_straight_through = enabled
 
 
+def _parse_block_indices(spec: str) -> Tuple[int, ...]:
+    """
+    Parse a comma-separated list of ints and ranges into block indices.
+    Example: "1-4,7,9-10" -> (1,2,3,4,7,9,10)
+    """
+    s = str(spec).strip()
+    if s == "":
+        return ()
+    out = []
+    for part in s.split(","):
+        part = part.strip()
+        if part == "":
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            a = a.strip()
+            b = b.strip()
+            if not a.isdigit() or not b.isdigit():
+                raise ValueError(f"Invalid block range: {part}")
+            start = int(a)
+            end = int(b)
+            if end < start:
+                raise ValueError(f"Invalid block range (end<start): {part}")
+            out.extend(list(range(start, end + 1)))
+        else:
+            if not part.isdigit():
+                raise ValueError(f"Invalid block index: {part}")
+            out.append(int(part))
+    return tuple(sorted(set(out)))
+
+
+def _set_straight_through_blocks(model: AlphaFold, st_blocks: Tuple[int, ...]):
+    st_set = set(int(i) for i in st_blocks)
+    for blk in model.evoformer.blocks:
+        if isinstance(blk, GradientStraightThroughBlock):
+            blk.use_straight_through = blk.block_idx in st_set
+
+
 def load_model(
     config_path: Path,
     checkpoint_path: Path,
@@ -355,7 +438,15 @@ def load_model(
         cfg_yaml = yaml.safe_load(handle)
     preset = cfg_yaml.get("config_preset", "model_1_ptm")
     weights_path = cfg_yaml["weights_path"]
-    linear_type = cfg_yaml["linear_type"]
+    replacement_type = str(cfg_yaml.get("replacement_type", "linear"))
+    linear_type = str(cfg_yaml.get("linear_type", "full"))
+    kernel_size = int(cfg_yaml.get("kernel_size", 3))
+    replacement_mode = str(cfg_yaml.get("replacement_mode", "per_block"))
+    dilations_raw = cfg_yaml.get("dilations", "1,2,4")
+    if isinstance(dilations_raw, str):
+        dilations = tuple(int(d) for d in dilations_raw.split(",") if d.strip() != "")
+    else:
+        dilations = tuple(int(d) for d in dilations_raw)
 
     cfg = model_config(preset)
     cfg.model.template.enabled = False
@@ -365,6 +456,7 @@ def load_model(
     model = AlphaFold(cfg).to(device)
     import_jax_weights_(model, os.path.join(Path.home(), weights_path), version=preset)
 
+    checkpoint_path = _resolve_checkpoint_path(checkpoint_path)
     ckpt = torch.load(checkpoint_path, map_location=device)
     state_dict = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
     state_dict = _strip_student_prefix(state_dict)
@@ -382,7 +474,17 @@ def load_model(
     c_z = evo_cfg.c_z
 
     # Inject replacement blocks when present in checkpoint
-    wrapped = _wrap_replacements_from_checkpoint(model, state_dict, c_m, c_z, linear_type)
+    wrapped = _wrap_replacements_from_checkpoint(
+        model,
+        state_dict,
+        c_m,
+        c_z,
+        replacement_type=replacement_type,
+        linear_type=linear_type,
+        kernel_size=kernel_size,
+        dilations=dilations,
+        replacement_mode=replacement_mode,
+    )
     if device.type == "cuda":
         model = model.bfloat16()
 
@@ -416,6 +518,8 @@ def optimize_sequence(
     dist_scale: float = 1.0,
     coor_scale: float = 0.0,
     disable_repl_coor_loss: bool = False,
+    straight_through_selection: str = "cycle",
+    straight_through_blocks: Tuple[int, ...] = (),
     init_seq: str = "0",
     softmax_seq: bool = False,
     optimizer: str = "SGD",
@@ -441,15 +545,26 @@ def optimize_sequence(
     t_start = time.perf_counter()
     final_dist_loss: Optional[float] = None
     final_coor_loss: Optional[float] = None
+
+    if straight_through_selection == "static_blocks":
+        _set_straight_through_blocks(model, straight_through_blocks)
+        any_st_enabled = len(straight_through_blocks) > 0
+    else:
+        any_st_enabled = True
+
     for step in tqdm(range(steps), desc="Optimizing sequence"):
         optimizer.zero_grad()
-        if cycle > 0:
-            pos = step % cycle
-            use_straight_through = pos >= orig_steps_per_cycle
-            _set_straight_through(model, enabled=use_straight_through)
+        if straight_through_selection == "static_blocks":
+            # Mixed mode (per-block selection), no per-step toggling.
+            use_straight_through = any_st_enabled
         else:
-            use_straight_through = True
-            _set_straight_through(model, enabled=True)
+            if cycle > 0:
+                pos = step % cycle
+                use_straight_through = pos >= orig_steps_per_cycle
+                _set_straight_through(model, enabled=use_straight_through)
+            else:
+                use_straight_through = True
+                _set_straight_through(model, enabled=True)
         batch = make_feature_batch(seq_logits, residue_index)
 
         effective_coor_scale = coor_scale
@@ -596,6 +711,20 @@ def main():
         help="When enabled, disable coordinate (FAPE) loss on straight-through steps",
     )
     parser.add_argument(
+        "--straight_through_selection",
+        type=str,
+        default="cycle",
+        choices=["cycle", "static_blocks"],
+        help="How to choose straight-through usage: cycle (orig/repl schedule) or static_blocks (fixed per-block selection).",
+    )
+    parser.add_argument(
+        "--straight_through_blocks",
+        type=str,
+        default="",
+        help="Block indices (0-based, Evoformer block idx) to use straight-through when straight_through_selection=static_blocks. "
+             "Format: '1-46' or '1,2,5-7'. Others will use original gradients.",
+    )
+    parser.add_argument(
         "--init_seq",
         type=str,
         default="0",
@@ -622,15 +751,20 @@ def main():
     args = parser.parse_args()
     if args.dist_scale == 0.0 and args.coor_scale == 0.0:
         raise ValueError("dist_scale and coor_scale cannot both be 0")
+    
+    st_blocks = _parse_block_indices(args.straight_through_blocks) if args.straight_through_selection == "static_blocks" else ()
+
+    with open(args.config_path, "r", encoding="utf-8") as handle:
+        cfg_yaml = yaml.safe_load(handle)
+    replacement_type = cfg_yaml["replacement_type"]
+    replacement_description = f"_orig-{args.orig_steps_per_cycle}_repl-{args.repl_steps_per_cycle}" if args.straight_through_selection == "cycle" else f"_st-blocks-{st_blocks}"
 
     out_dir = args.output_dir
     out_prefix = (
         f"{args.pdb_id}_{args.chain_id}"
-        f"_orig-{args.orig_steps_per_cycle}_repl-{args.repl_steps_per_cycle}"
+        f"_repl-type-{replacement_type}"
+        f"{replacement_description}"
         f"_steps-{args.steps}_lr-{str(args.lr).replace('.', '-')}"
-        f"_dist-loss-scale-{str(args.dist_scale).replace('.', '-')}-cutoff-{str(args.dist_cutoff).replace('.', '-')}"
-        f"_coor-loss-scale-{str(args.coor_scale).replace('.', '-')}-cutoff-{str(args.coor_cutoff).replace('.', '-')}"
-        f"_disable-repl-coor-loss-{str(args.disable_repl_coor_loss)}"
         f"_init-seq-{args.init_seq}"
         f"_softmax-seq-{args.softmax_seq}"
         f"_optimizer-{args.optimizer}"
@@ -655,6 +789,10 @@ def main():
         losses_csv_handle.flush()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+
     pdb_string = load_pdb_string(args.pdb_path, args.pdb_id)
     prot = from_pdb_string(pdb_string, chain_id=args.chain_id)
     pseudo_beta, pseudo_mask = ground_truth_pseudo_beta(prot, device)
@@ -664,9 +802,6 @@ def main():
 
     model = load_model(args.config_path, args.checkpoint_path, device, straight_through=True)
     # Pull the canonical FAPE config from the training preset (same name as used for weights)
-    with open(args.config_path, "r", encoding="utf-8") as handle:
-        import yaml
-        cfg_yaml = yaml.safe_load(handle)
     preset = cfg_yaml.get("config_preset", "model_1_ptm")
     fape_cfg = model_config(preset, train=True).loss.fape
 
@@ -689,11 +824,19 @@ def main():
         dist_scale=args.dist_scale,
         coor_scale=args.coor_scale,
         disable_repl_coor_loss=args.disable_repl_coor_loss,
+        straight_through_selection=args.straight_through_selection,
+        straight_through_blocks=st_blocks,
         init_seq=args.init_seq,
         softmax_seq=args.softmax_seq,
         optimizer=args.optimizer,
         norm_grad=args.norm_grad,
     )
+
+    peak_mem_allocated_bytes = None
+    peak_mem_reserved_bytes = None
+    if device.type == "cuda":
+        peak_mem_allocated_bytes = int(torch.cuda.max_memory_allocated())
+        peak_mem_reserved_bytes = int(torch.cuda.max_memory_reserved())
 
     loss_plot = out_dir / f"{out_prefix}_loss.png"
     gif_path = out_dir / f"{out_prefix}_seq.gif"
@@ -761,6 +904,10 @@ def main():
         "final_total_loss": None if len(losses) == 0 else float(losses[-1]),
         "final_dist_loss": final_dist_loss,
         "final_coor_loss": final_coor_loss,
+        "peak_gpu_memory_allocated_bytes": peak_mem_allocated_bytes,
+        "peak_gpu_memory_reserved_bytes": peak_mem_reserved_bytes,
+        "straight_through_selection": args.straight_through_selection,
+        "straight_through_blocks": list(st_blocks),
         "usalign": {
             "command": ["USalign", str(gt_pdb_for_usalign), str(pdb_out)],
             "exit_code": int(usalign.returncode),

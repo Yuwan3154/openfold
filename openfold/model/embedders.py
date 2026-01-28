@@ -682,13 +682,11 @@ class TemplateEmbedder(nn.Module):
             )
 
             # [*, N, N, C_t]
-            distogram_only = "template_dgram_probs" in single_template_feats
             t = build_template_pair_feat(
                 single_template_feats,
                 use_unit_vector=self.config.use_unit_vector,
                 inf=self.config.inf,
                 eps=self.config.eps,
-                distogram_only=distogram_only,
                 **self.config.distogram,
             ).to(z.dtype)
             t = self.template_pair_embedder(t)

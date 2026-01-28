@@ -313,6 +313,21 @@ class DilatedConvEvoformerReplacement(nn.Module):
         msa_trans_mask = msa_mask if _mask_trans else None
         pair_trans_mask = pair_mask if _mask_trans else None
 
+        squeeze_m = False
+        squeeze_z = False
+        if m is not None and m.dim() == 3:
+            # Support OpenFold's no-explicit-batch convention: [S, N, C] -> [1, S, N, C]
+            m = m.unsqueeze(0)
+            squeeze_m = True
+            if msa_trans_mask is not None and msa_trans_mask.dim() == 2:
+                msa_trans_mask = msa_trans_mask.unsqueeze(0)
+        if z is not None and z.dim() == 3:
+            # [N, N, C] -> [1, N, N, C]
+            z = z.unsqueeze(0)
+            squeeze_z = True
+            if pair_trans_mask is not None and pair_trans_mask.dim() == 2:
+                pair_trans_mask = pair_trans_mask.unsqueeze(0)
+
         if m is not None:
             if self.mode == "per_block":
                 for blk in self.m_blocks:
@@ -325,4 +340,9 @@ class DilatedConvEvoformerReplacement(nn.Module):
                     z = blk(z, pair_trans_mask)
             else:
                 z = self.z_stack(z, pair_trans_mask)
+
+        if squeeze_m and m is not None:
+            m = m.squeeze(0)
+        if squeeze_z and z is not None:
+            z = z.squeeze(0)
         return m, z
