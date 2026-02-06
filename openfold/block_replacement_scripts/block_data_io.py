@@ -806,6 +806,31 @@ def save_block_sample(
     raise ValueError(f"Unrecognized block data format from path: {path}")
 
 
+def load_merged_block_samples(
+    path: Path,
+    *,
+    map_location: str | torch.device = "cpu",
+) -> Dict[int, Dict[str, Any]]:
+    """
+    Load a merged per-sample safetensors file containing all 48 blocks.
+
+    Tensor keys: block_{XX}.{role}.{key}  (e.g. block_00.input.m)
+    Returns: dict mapping block_idx -> {"input": {"m": ..., "z": ...}, "output": {"m": ..., "z": ...}}
+    """
+    results: Dict[int, Dict[str, Any]] = {}
+    with safetensors_safe_open(str(path), framework="pt", device=str(map_location)) as f:
+        for tensor_name in f.keys():
+            # Parse "block_XX.role.key"
+            parts = tensor_name.split(".")
+            bi = int(parts[0].split("_")[1])
+            role = parts[1]   # "input" or "output"
+            key = parts[2]    # "m" or "z"
+            if bi not in results:
+                results[bi] = {"input": {}, "output": {}}
+            results[bi][role][key] = f.get_tensor(tensor_name)
+    return results
+
+
 def load_block_sample(path: Path, *, map_location: str | torch.device = "cpu") -> Dict[str, Any]:
     """
     Load a block sample saved by `save_block_sample`.

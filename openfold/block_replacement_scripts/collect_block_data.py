@@ -27,6 +27,7 @@ warnings.filterwarnings('ignore')
 # Add openfold to path
 sys.path.append(str(Path.home() / 'openfold'))
 
+from openfold.block_replacement_scripts import _torch_pytree_compat  # noqa: F401
 from openfold.config import model_config
 from openfold.model.model import AlphaFold
 from openfold.data import feature_pipeline, data_pipeline, templates
@@ -104,8 +105,8 @@ class EvoformerBlockDataCollector:
             print(f"  TSV path: {self.tsv_path}")
             print(f"  PDB directory: (unused)")
         else:
-        print(f"  CSV path: {self.csv_path}")
-        print(f"  PDB directory: {self.pdb_dir}")
+            print(f"  CSV path: {self.csv_path}")
+            print(f"  PDB directory: {self.pdb_dir}")
         print(f"  Output directory: {self.output_dir}")
         print(f"  Weights: {self.weights_path}")
         print(f"  Config preset: {self.args.config_preset}")
@@ -370,7 +371,7 @@ _atom_site.pdbx_PDB_model_num 1
                     sequence = self.chain_to_sequence[chain_id]
                     features = self._create_features_from_sequence(chain_id, sequence)
                 else:
-                features = self._create_features(chain_id)
+                    features = self._create_features(chain_id)
                 outputs = self._run_inference_with_hooks(model, features)
                 
                 # Save data for this protein
@@ -390,10 +391,10 @@ _atom_site.pdbx_PDB_model_num 1
         self._save_metadata(all_chains)
 
     def _check_protein_data_exists(self, chain_id: str) -> bool:
-        """Check if data has already been collected for this protein (all blocks 1-46 present)."""
+        """Check if data has already been collected for this protein (all requested blocks present)."""
         safe_chain_id = sanitize_id(chain_id)
         
-        for block_idx in range(1, 47):  # Skip first and last blocks
+        for block_idx in self.args.blocks:
             block_dir = self.output_dir / f"block_{block_idx:02d}"
             pt_file = block_dir / f"{safe_chain_id}.pt"
             pt_gz_file = block_dir / f"{safe_chain_id}.pt.gz"
@@ -414,7 +415,7 @@ _atom_site.pdbx_PDB_model_num 1
             ):
                 return False
 
-                return True
+        return True
 
     def _save_protein_data(self, chain_id: str, outputs: Dict[str, torch.Tensor]):
         """Save data for a single protein using built-in intermediate outputs"""
@@ -443,13 +444,17 @@ _atom_site.pdbx_PDB_model_num 1
             block_output = outputs[block_key]
             m_out, z_out = block_output[0], block_output[1]
             
-            # For inputs, we need the output of the previous block (or initial embeddings for block 0)
-            if block_idx == 0:
-                # For block 0, we don't have "inputs" from a previous block
-                # Skip block 0 for now, or handle specially
-                continue
             if block_idx not in self.args.blocks:
                 continue
+
+            # For inputs, we need the output of the previous block (or evoformer input for block 0)
+            if block_idx == 0:
+                evo_input_key = "recycle_0_evoformer_input"
+                if evo_input_key not in outputs:
+                    print(f"    Warning: No evoformer input found for block 0 of {chain_id}")
+                    continue
+                evo_input = outputs[evo_input_key]
+                m_in, z_in = evo_input[0], evo_input[1]
             else:
                 # Input is the output of the previous block
                 prev_block_key = f"recycle_0_block_{block_idx-1}"

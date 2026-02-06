@@ -121,7 +121,13 @@ class _ZResNetBlock(nn.Module):
 
 
 class _MSharedProjConvStack(nn.Module):
-    def __init__(self, c_m: int, kernel_size: int, dilations: Sequence[int]):
+    def __init__(
+        self,
+        c_m: int,
+        kernel_size: int,
+        dilation_pattern: Sequence[int],
+        repeats: int,
+    ):
         super().__init__()
         if c_m % 2 != 0:
             raise ValueError(f"c_m must be even for down-projection, got {c_m}")
@@ -129,6 +135,8 @@ class _MSharedProjConvStack(nn.Module):
             raise ValueError(f"kernel_size must be > 0, got {kernel_size}")
         if kernel_size % 2 != 1:
             raise ValueError(f"kernel_size must be odd to preserve length, got {kernel_size}")
+        if repeats <= 0:
+            raise ValueError(f"repeats must be >= 1, got {repeats}")
         c_hidden = c_m // 2
 
         pad_factor = kernel_size // 2
@@ -137,59 +145,77 @@ class _MSharedProjConvStack(nn.Module):
         self.ln_in = nn.LayerNorm(c_m)
         self.down = nn.Linear(c_m, c_hidden)
 
-        self.conv_lns = nn.ModuleList([nn.LayerNorm(c_hidden) for _ in dilations])
+        self.conv_lns = nn.ModuleList(
+            [
+                nn.ModuleList([nn.LayerNorm(c_hidden) for _ in dilation_pattern])
+                for _ in range(repeats)
+            ]
+        )
         self.convs = nn.ModuleList(
             [
-                nn.Conv1d(
-                    in_channels=c_hidden,
-                    out_channels=c_hidden,
-                    kernel_size=kernel_size,
-                    padding=int(d) * pad_factor,
-                    dilation=int(d),
+                nn.ModuleList(
+                    [
+                        nn.Conv1d(
+                            in_channels=c_hidden,
+                            out_channels=c_hidden,
+                            kernel_size=kernel_size,
+                            padding=int(d) * pad_factor,
+                            dilation=int(d),
+                        )
+                        for d in dilation_pattern
+                    ]
                 )
-                for d in dilations
+                for _ in range(repeats)
             ]
         )
 
         self.ln_out = nn.LayerNorm(c_hidden)
         self.up = nn.Linear(c_hidden, c_m)
+        self.repeats = repeats
 
     def forward(self, m: torch.Tensor, msa_mask: Optional[torch.Tensor]) -> torch.Tensor:
         # m: [B, S, N, C_m]
         residual = m
-        layer_gate = torch.sigmoid(self.layer_gate(residual))
 
-        x = self.ln_in(m)
-        x = F.gelu(x)
-        x = self.down(x)  # [B, S, N, C_hidden]
-        if msa_mask is not None:
-            x = x * msa_mask[..., None]
-
-        b, s, n, c_h = x.shape
-        for ln, conv in zip(self.conv_lns, self.convs):
-            x = ln(x)
+        for rep in range(self.repeats):
+            layer_gate = torch.sigmoid(self.layer_gate(residual))
+            x = self.ln_in(residual)
             x = F.gelu(x)
-            if msa_mask is not None:
-                x = x * msa_mask[..., None]
-            y = x.reshape(b * s, n, c_h).transpose(1, 2)  # [B*S, C_hidden, N]
-            y = conv(y)
-            x = y.transpose(1, 2).reshape(b, s, n, c_h)
+            x = self.down(x)  # [B, S, N, C_hidden]
             if msa_mask is not None:
                 x = x * msa_mask[..., None]
 
-        x = self.ln_out(x)
-        x = F.gelu(x)
-        x = self.up(x)  # [B, S, N, C_m]
+            b, s, n, c_h = x.shape
+            for ln, conv in zip(self.conv_lns[rep], self.convs[rep]):
+                x = ln(x)
+                x = F.gelu(x)
+                if msa_mask is not None:
+                    x = x * msa_mask[..., None]
+                y = x.reshape(b * s, n, c_h).transpose(1, 2)  # [B*S, C_hidden, N]
+                y = conv(y)
+                x = y.transpose(1, 2).reshape(b, s, n, c_h)
+                if msa_mask is not None:
+                    x = x * msa_mask[..., None]
 
-        x = x * layer_gate
-        if msa_mask is not None:
-            x = x * msa_mask[..., None]
+            x = self.ln_out(x)
+            x = F.gelu(x)
+            x = self.up(x)  # [B, S, N, C_m]
+            x = x * layer_gate
+            if msa_mask is not None:
+                x = x * msa_mask[..., None]
+            residual = residual + x
 
-        return residual + x
+        return residual
 
 
 class _ZSharedProjConvStack(nn.Module):
-    def __init__(self, c_z: int, kernel_size: int, dilations: Sequence[int]):
+    def __init__(
+        self,
+        c_z: int,
+        kernel_size: int,
+        dilation_pattern: Sequence[int],
+        repeats: int,
+    ):
         super().__init__()
         if c_z % 2 != 0:
             raise ValueError(f"c_z must be even for down-projection, got {c_z}")
@@ -197,6 +223,8 @@ class _ZSharedProjConvStack(nn.Module):
             raise ValueError(f"kernel_size must be > 0, got {kernel_size}")
         if kernel_size % 2 != 1:
             raise ValueError(f"kernel_size must be odd to preserve spatial dims, got {kernel_size}")
+        if repeats <= 0:
+            raise ValueError(f"repeats must be >= 1, got {repeats}")
         c_hidden = c_z // 2
 
         pad_factor = kernel_size // 2
@@ -205,54 +233,66 @@ class _ZSharedProjConvStack(nn.Module):
         self.ln_in = nn.LayerNorm(c_z)
         self.down = nn.Linear(c_z, c_hidden)
 
-        self.conv_lns = nn.ModuleList([nn.LayerNorm(c_hidden) for _ in dilations])
+        self.conv_lns = nn.ModuleList(
+            [
+                nn.ModuleList([nn.LayerNorm(c_hidden) for _ in dilation_pattern])
+                for _ in range(repeats)
+            ]
+        )
         self.convs = nn.ModuleList(
             [
-                nn.Conv2d(
-                    in_channels=c_hidden,
-                    out_channels=c_hidden,
-                    kernel_size=kernel_size,
-                    padding=int(d) * pad_factor,
-                    dilation=int(d),
+                nn.ModuleList(
+                    [
+                        nn.Conv2d(
+                            in_channels=c_hidden,
+                            out_channels=c_hidden,
+                            kernel_size=kernel_size,
+                            padding=int(d) * pad_factor,
+                            dilation=int(d),
+                        )
+                        for d in dilation_pattern
+                    ]
                 )
-                for d in dilations
+                for _ in range(repeats)
             ]
         )
 
         self.ln_out = nn.LayerNorm(c_hidden)
         self.up = nn.Linear(c_hidden, c_z)
+        self.repeats = repeats
 
     def forward(self, z: torch.Tensor, pair_mask: Optional[torch.Tensor]) -> torch.Tensor:
         # z: [B, N, N, C_z]
         residual = z
-        layer_gate = torch.sigmoid(self.layer_gate(residual))
 
-        x = self.ln_in(z)
-        x = F.gelu(x)
-        x = self.down(x)  # [B, N, N, C_hidden]
-        if pair_mask is not None:
-            x = x * pair_mask[..., None]
-
-        for ln, conv in zip(self.conv_lns, self.convs):
-            x = ln(x)
+        for rep in range(self.repeats):
+            layer_gate = torch.sigmoid(self.layer_gate(residual))
+            x = self.ln_in(residual)
             x = F.gelu(x)
-            if pair_mask is not None:
-                x = x * pair_mask[..., None]
-            y = x.permute(0, 3, 1, 2).contiguous()  # [B, C_hidden, N, N]
-            y = conv(y)
-            x = y.permute(0, 2, 3, 1).contiguous()  # [B, N, N, C_hidden]
+            x = self.down(x)  # [B, N, N, C_hidden]
             if pair_mask is not None:
                 x = x * pair_mask[..., None]
 
-        x = self.ln_out(x)
-        x = F.gelu(x)
-        x = self.up(x)  # [B, N, N, C_z]
+            for ln, conv in zip(self.conv_lns[rep], self.convs[rep]):
+                x = ln(x)
+                x = F.gelu(x)
+                if pair_mask is not None:
+                    x = x * pair_mask[..., None]
+                y = x.permute(0, 3, 1, 2).contiguous()  # [B, C_hidden, N, N]
+                y = conv(y)
+                x = y.permute(0, 2, 3, 1).contiguous()  # [B, N, N, C_hidden]
+                if pair_mask is not None:
+                    x = x * pair_mask[..., None]
 
-        x = x * layer_gate
-        if pair_mask is not None:
-            x = x * pair_mask[..., None]
+            x = self.ln_out(x)
+            x = F.gelu(x)
+            x = self.up(x)  # [B, N, N, C_z]
+            x = x * layer_gate
+            if pair_mask is not None:
+                x = x * pair_mask[..., None]
+            residual = residual + x
 
-        return residual + x
+        return residual
 
 
 class DilatedConvEvoformerReplacement(nn.Module):
@@ -273,12 +313,23 @@ class DilatedConvEvoformerReplacement(nn.Module):
         c_z: int,
         kernel_size: int = 3,
         dilations: Sequence[int] = (1, 2, 4),
+        dilation_pattern: Optional[Sequence[int]] = None,
+        dilation_repeats: int = 1,
         mode: str = "per_block",
     ):
         super().__init__()
         self.c_m = c_m
         self.c_z = c_z
-        self.dilations = tuple(int(d) for d in dilations)
+        if dilation_pattern is None:
+            dilation_pattern = tuple(int(d) for d in dilations)
+        else:
+            dilation_pattern = tuple(int(d) for d in dilation_pattern)
+        if dilation_repeats <= 0:
+            raise ValueError(f"dilation_repeats must be >= 1, got {dilation_repeats}")
+        self.dilation_pattern = dilation_pattern
+        self.dilation_repeats = int(dilation_repeats)
+        expanded = dilation_pattern * self.dilation_repeats
+        self.dilations = tuple(int(d) for d in expanded)
         self.mode = str(mode)
 
         if self.mode == "per_block":
@@ -289,8 +340,18 @@ class DilatedConvEvoformerReplacement(nn.Module):
         elif self.mode == "shared_proj":
             self.m_blocks = None
             self.z_blocks = None
-            self.m_stack = _MSharedProjConvStack(c_m=c_m, kernel_size=kernel_size, dilations=self.dilations)
-            self.z_stack = _ZSharedProjConvStack(c_z=c_z, kernel_size=kernel_size, dilations=self.dilations)
+            self.m_stack = _MSharedProjConvStack(
+                c_m=c_m,
+                kernel_size=kernel_size,
+                dilation_pattern=self.dilation_pattern,
+                repeats=self.dilation_repeats,
+            )
+            self.z_stack = _ZSharedProjConvStack(
+                c_z=c_z,
+                kernel_size=kernel_size,
+                dilation_pattern=self.dilation_pattern,
+                repeats=self.dilation_repeats,
+            )
         else:
             raise ValueError(f"Invalid mode: {self.mode}. Expected 'per_block' or 'shared_proj'.")
 
@@ -356,3 +417,46 @@ class DilatedConvEvoformerReplacement(nn.Module):
         if squeeze_z and z is not None:
             z = z.squeeze(0)
         return m, z
+
+
+class TriangleOpConvReplacement(nn.Module):
+    """
+    Replacement module for triangle operations (tri_mul/tri_att) on pair features.
+
+    Operates on z: [B, N, N, C_z] and returns a z-shaped update.
+    Uses shared-projection conv stack with repeated dilation patterns.
+    """
+
+    def __init__(
+        self,
+        c_z: int,
+        kernel_size: int,
+        dilation_pattern: Sequence[int],
+        dilation_repeats: int,
+    ):
+        super().__init__()
+        self.z_stack = _ZSharedProjConvStack(
+            c_z=c_z,
+            kernel_size=kernel_size,
+            dilation_pattern=tuple(int(d) for d in dilation_pattern),
+            repeats=int(dilation_repeats),
+        )
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        pair_mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        del kwargs
+        z_in = z  # Keep original input for subtraction
+        squeeze = False
+        if z.dim() == 3:
+            z = z.unsqueeze(0)
+            squeeze = True
+            if pair_mask is not None and pair_mask.dim() == 2:
+                pair_mask = pair_mask.unsqueeze(0)
+        out = self.z_stack(z, pair_mask)
+        if squeeze:
+            out = out.squeeze(0)
+        return out - z_in  # Use original input shape

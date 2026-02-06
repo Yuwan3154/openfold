@@ -808,7 +808,11 @@ def _flash_attn(q, k, v, kv_mask):
     # [B_flat, N, 2 * H * C]
     kv = kv.reshape(*kv.shape[:-3], -1) 
     
-    kv_unpad, _, kv_cu_seqlens, kv_max_s, _ = unpad_input(kv, kv_mask)
+    kv_unpad_result = unpad_input(kv, kv_mask)
+    if len(kv_unpad_result) == 4:
+        kv_unpad, _, kv_cu_seqlens, kv_max_s = kv_unpad_result
+    else:
+        kv_unpad, _, kv_cu_seqlens, kv_max_s, _ = kv_unpad_result
     kv_unpad = kv_unpad.reshape(-1, *kv_shape[-3:])
    
     out = flash_attn_varlen_kvpacked_func(

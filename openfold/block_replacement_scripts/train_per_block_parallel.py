@@ -48,6 +48,7 @@ from openfold.block_replacement_scripts.dilated_conv_evoformer_replacement impor
 )
 from openfold.block_replacement_scripts.block_data_io import (
     load_block_sample,
+    load_merged_block_samples,
     sanitize_id,
     save_block_sample,
 )
@@ -441,6 +442,8 @@ class ParallelBlockPretrainer(pl.LightningModule):
         linear_type: str = "full",
         kernel_size: int = 3,
         dilations: str = "1,2,4",
+        dilation_pattern: Optional[str] = None,
+        dilation_repeats: int = 1,
         replacement_mode: str = "per_block",
         replacement_checkpoint_subdir: Optional[str] = None,
         allow_random_init: bool = False,
@@ -461,7 +464,17 @@ class ParallelBlockPretrainer(pl.LightningModule):
         self.replacement_type = replacement_type
         self.linear_type = linear_type
         self.kernel_size = int(kernel_size)
-        self.dilations = tuple(int(d) for d in str(dilations).split(",") if str(d).strip() != "")
+        if dilation_pattern is None:
+            dilation_pattern_vals = tuple(
+                int(d) for d in str(dilations).split(",") if str(d).strip() != ""
+            )
+        else:
+            dilation_pattern_vals = tuple(
+                int(d) for d in str(dilation_pattern).split(",") if str(d).strip() != ""
+            )
+        self.dilation_pattern = dilation_pattern_vals
+        self.dilation_repeats = int(dilation_repeats)
+        self.dilations = tuple(self.dilation_pattern) * self.dilation_repeats
         self.replacement_mode = replacement_mode
         self.replacement_checkpoint_subdir = replacement_checkpoint_subdir
         self.allow_random_init = bool(allow_random_init)
@@ -533,7 +546,7 @@ class ParallelBlockPretrainer(pl.LightningModule):
         if self.resume_checkpoint_path is not None:
             # When resuming, Lightning will restore weights from the run checkpoint.
             # Avoid unnecessary I/O and confusing "checkpoint not found" warnings.
-            for block_idx in range(1, 47):
+            for block_idx in range(0, 48):
                 if self.replacement_type == "linear":
                     replacement_block = SimpleEvoformerReplacement(
                         c_m=self.c_m,
@@ -546,6 +559,8 @@ class ParallelBlockPretrainer(pl.LightningModule):
                         c_z=self.c_z,
                         kernel_size=self.kernel_size,
                         dilations=self.dilations,
+                        dilation_pattern=self.dilation_pattern,
+                        dilation_repeats=self.dilation_repeats,
                         mode=self.replacement_mode,
                     )
                 self.replacement_blocks[str(block_idx)] = replacement_block
@@ -575,7 +590,7 @@ class ParallelBlockPretrainer(pl.LightningModule):
                 f"Invalid replacement_type: {self.replacement_type}. Expected 'linear' or 'conv'."
             )
         
-        for block_idx in range(1, 47):
+        for block_idx in range(0, 48):
             block_path = (
                 Path(self.trained_models_dir)
                 / f"block_{block_idx:02d}"
@@ -602,6 +617,8 @@ class ParallelBlockPretrainer(pl.LightningModule):
                     c_z=self.c_z,
                     kernel_size=self.kernel_size,
                     dilations=self.dilations,
+                    dilation_pattern=self.dilation_pattern,
+                    dilation_repeats=self.dilation_repeats,
                     mode=self.replacement_mode,
                 )
 
@@ -678,16 +695,24 @@ class ParallelBlockPretrainer(pl.LightningModule):
                 if hasattr(dm, "val_dataset") and dm.val_dataset is not None:
                     datasets.append(("val", dm.val_dataset))
 
+                is_merged = ext == "merged.safetensors"
                 for split_name, ds in datasets:
                     for item in ds:
                         seq_id = item["id"]
                         sid = sanitize_id(str(seq_id))
-                        for block_idx in blocks_to_train:
-                            cache_path = cache_dir / f"block_{block_idx:02d}" / f"{sid}.{ext}"
+                        if is_merged:
+                            cache_path = cache_dir / f"{sid}.safetensors"
                             if not cache_path.exists():
                                 ok = False
                                 if len(missing) < 20:
                                     missing.append(f"{split_name}: {cache_path}")
+                        else:
+                            for block_idx in blocks_to_train:
+                                cache_path = cache_dir / f"block_{block_idx:02d}" / f"{sid}.{ext}"
+                                if not cache_path.exists():
+                                    ok = False
+                                    if len(missing) < 20:
+                                        missing.append(f"{split_name}: {cache_path}")
 
             ok_tensor = torch.tensor([1 if ok else 0], dtype=torch.int32)
             if is_dist:
@@ -757,17 +782,42 @@ class ParallelBlockPretrainer(pl.LightningModule):
         teacher_used = False
         cache_hits = 0
         cache_misses = 0
+
+        # For merged format, load all blocks for each sample once before the loop.
+        # Use map_location="cpu" to leverage safetensors mmap (instant open);
+        # the existing .to(device, non_blocking=True) calls in the block loop
+        # handle GPU transfer more efficiently than loading directly to GPU.
+        merged_all = None  # sid -> dict[block_idx] -> {input: ..., output: ...}
+        is_merged = cache_dir is not None and self.block_data_format == "merged.safetensors"
+        if is_merged and safe_seq_id is not None:
+            merged_all = {}
+            sids = safe_seq_id if isinstance(safe_seq_id, list) else [safe_seq_id]
+            for sid in sids:
+                merged_path = cache_dir / f"{sid}.safetensors"
+                if not merged_path.exists():
+                    raise FileNotFoundError(f"Missing merged cache file: {merged_path}")
+                merged_all[sid] = load_merged_block_samples(merged_path, map_location="cpu")
         
         # Train each replacement block sequentially
         total_loss = 0.0
         num_blocks = 0
         
-        for block_idx in range(1, 47):
+        for block_idx in range(0, 48):
             if str(block_idx) not in self.replacement_blocks:
                 continue
             
             cached = None
-            if cache_dir is not None and safe_seq_id is not None:
+            if merged_all is not None:
+                # Merged format: look up from pre-loaded dict
+                if isinstance(safe_seq_id, list):
+                    cached = [merged_all[sid].get(block_idx) for sid in safe_seq_id]
+                    if any(c is None for c in cached):
+                        raise FileNotFoundError(f"Block {block_idx} missing in merged cache for some samples")
+                else:
+                    cached = merged_all[safe_seq_id].get(block_idx)
+                    if cached is None:
+                        raise FileNotFoundError(f"Block {block_idx} missing in merged cache for {safe_seq_id}")
+            elif cache_dir is not None and safe_seq_id is not None:
                 ext = self.block_data_format
                 cache_map_location = self.device if self.block_data_format == "df11.safetensors" else "cpu"
                 if isinstance(safe_seq_id, list):
@@ -1059,17 +1109,39 @@ class ParallelBlockPretrainer(pl.LightningModule):
         teacher_used = False
         cache_hits = 0
         cache_misses = 0
-        
+
+        # For merged format, load all blocks for each sample once before the loop.
+        # Use map_location="cpu" for mmap; .to(device) in block loop handles transfer.
+        merged_all = None
+        is_merged = cache_dir is not None and self.block_data_format == "merged.safetensors"
+        if is_merged and safe_seq_id is not None:
+            merged_all = {}
+            sids = safe_seq_id if isinstance(safe_seq_id, list) else [safe_seq_id]
+            for sid in sids:
+                merged_path = cache_dir / f"{sid}.safetensors"
+                if not merged_path.exists():
+                    raise FileNotFoundError(f"Missing merged cache file: {merged_path}")
+                merged_all[sid] = load_merged_block_samples(merged_path, map_location="cpu")
+
         # Evaluate each replacement block
         total_loss = 0.0
         num_blocks = 0
         
-        for block_idx in range(1, 47):
+        for block_idx in range(0, 48):
             if str(block_idx) not in self.replacement_blocks:
                 continue
             
             cached = None
-            if cache_dir is not None and safe_seq_id is not None:
+            if merged_all is not None:
+                if isinstance(safe_seq_id, list):
+                    cached = [merged_all[sid].get(block_idx) for sid in safe_seq_id]
+                    if any(c is None for c in cached):
+                        raise FileNotFoundError(f"Block {block_idx} missing in merged cache for some samples")
+                else:
+                    cached = merged_all[safe_seq_id].get(block_idx)
+                    if cached is None:
+                        raise FileNotFoundError(f"Block {block_idx} missing in merged cache for {safe_seq_id}")
+            elif cache_dir is not None and safe_seq_id is not None:
                 ext = self.block_data_format
                 cache_map_location = self.device if self.block_data_format == "df11.safetensors" else "cpu"
                 if isinstance(safe_seq_id, list):
@@ -1388,6 +1460,8 @@ def main(args, parser):
         linear_type=args.linear_type,
         kernel_size=args.kernel_size,
         dilations=args.dilations,
+        dilation_pattern=args.dilation_pattern,
+        dilation_repeats=args.dilation_repeats,
         replacement_mode=args.replacement_mode,
         replacement_checkpoint_subdir=args.replacement_checkpoint_subdir,
         allow_random_init=args.allow_random_init,
@@ -1462,12 +1536,12 @@ def main(args, parser):
         num_nodes = 1
         accelerator = "gpu" if args.gpus > 0 else "cpu"
         devices = args.gpus if args.gpus > 0 else 1
-    if args.gpus > 1:
-        strategy = DDPStrategy(
-            find_unused_parameters=False,
+        if args.gpus > 1:
+            strategy = DDPStrategy(
+                find_unused_parameters=False,
                 process_group_backend=args.distributed_backend,
-        )
-    else:
+            )
+        else:
             strategy = "auto"
     
     # Create trainer
@@ -1491,7 +1565,23 @@ def main(args, parser):
     # Train
     print("Starting training...")
     if args.resume_checkpoint_path is not None:
-        trainer.fit(model, datamodule=data_module, ckpt_path=args.resume_checkpoint_path)
+        ckpt = torch.load(args.resume_checkpoint_path, map_location="cpu")
+        # If the checkpoint has optimizer_states, it's a full Lightning checkpoint
+        # and we can let Lightning resume normally.
+        if "optimizer_states" in ckpt and len(ckpt["optimizer_states"]) > 0:
+            del ckpt
+            trainer.fit(model, datamodule=data_module, ckpt_path=args.resume_checkpoint_path)
+        else:
+            # Weights-only checkpoint: load state_dict manually, train from scratch.
+            sd = ckpt.get("state_dict", ckpt)
+            missing, unexpected = model.load_state_dict(sd, strict=False)
+            del ckpt, sd
+            if missing:
+                print(f"  Weights-only resume: {len(missing)} missing keys (first 5: {missing[:5]})")
+            if unexpected:
+                print(f"  Weights-only resume: {len(unexpected)} unexpected keys (first 5: {unexpected[:5]})")
+            print(f"Loaded weights-only checkpoint from {args.resume_checkpoint_path}", flush=True)
+            trainer.fit(model, datamodule=data_module)
     else:
         trainer.fit(model, datamodule=data_module)
     
@@ -1525,8 +1615,8 @@ if __name__ == '__main__':
         "--block_data_format",
         type=str,
         default="pt",
-        choices=["pt", "pt.gz", "safetensors", "safetensors.gz", "safetensors.znn", "df11.safetensors"],
-        help="Cache file format used inside block_data_dir",
+        choices=["pt", "pt.gz", "safetensors", "safetensors.gz", "safetensors.znn", "df11.safetensors", "merged.safetensors"],
+        help="Cache file format used inside block_data_dir. 'merged.safetensors' expects one file per sample in a flat dir.",
     )
     parser.add_argument(
         "--block_data_save_dtype",
@@ -1579,6 +1669,18 @@ if __name__ == '__main__':
         type=str,
         default="1,2,4",
         help="Comma-separated dilations for conv replacement blocks (e.g. '1,2,4,8,16')",
+    )
+    parser.add_argument(
+        "--dilation_pattern",
+        type=str,
+        default=None,
+        help="Optional dilation pattern to repeat for shared_proj mode (e.g. '1,2,4,8').",
+    )
+    parser.add_argument(
+        "--dilation_repeats",
+        type=int,
+        default=1,
+        help="Number of times to repeat the dilation pattern.",
     )
     parser.add_argument(
         "--replacement_mode",

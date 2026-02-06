@@ -19,6 +19,7 @@ Notes:
 """
 
 import argparse
+import importlib.util
 import io
 import os
 from pathlib import Path
@@ -37,6 +38,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from openfold.block_replacement_scripts import _torch_pytree_compat  # noqa: F401
+
 from openfold.config import model_config
 from openfold.model.model import AlphaFold
 from openfold.utils.import_weights import import_jax_weights_
@@ -52,6 +55,7 @@ import openfold.np.residue_constants as rc
 from openfold.block_replacement_scripts.custom_evoformer_replacement import SimpleEvoformerReplacement
 from openfold.block_replacement_scripts.dilated_conv_evoformer_replacement import (
     DilatedConvEvoformerReplacement,
+    TriangleOpConvReplacement,
 )
 from openfold.np.protein import from_pdb_string, from_prediction, to_pdb, Protein
 
@@ -64,6 +68,7 @@ class GradientStraightThroughBlock(nn.Module):
         self.replacement_block = replacement_block
         self.block_idx = block_idx
         self.use_straight_through = True
+        self.ckpt_replacement_only = False
         for p in self.original_block.parameters():
             p.requires_grad = False
 
@@ -155,6 +160,7 @@ def make_feature_batch(
     seq_logits: torch.Tensor,
     residue_index: torch.Tensor,
     recycle_dim: int = 1,
+    msa_depth: int = 1,
 ) -> Dict[str, torch.Tensor]:
     """Construct minimal feature dict with differentiable sequence channels."""
     device = seq_logits.device
@@ -170,7 +176,7 @@ def make_feature_batch(
         dim=-1,
     )  # [L,22]
 
-    msa_feat = torch.zeros((1, L, 49), device=device, dtype=seq_probs21.dtype)
+    msa_feat = torch.zeros((msa_depth, L, 49), device=device, dtype=seq_probs21.dtype)
     msa_one_hot = torch.cat(
         [seq_probs21, torch.zeros((L, 2), device=device, dtype=seq_probs21.dtype)],
         dim=-1,
@@ -178,12 +184,12 @@ def make_feature_batch(
     msa_feat[..., :23] = msa_one_hot.unsqueeze(0)
 
     seq_mask = torch.ones((L,), device=device, dtype=seq_probs21.dtype)
-    msa_mask = torch.ones((1, L), device=device, dtype=seq_probs21.dtype)
+    msa_mask = torch.ones((msa_depth, L), device=device, dtype=seq_probs21.dtype)
     pair_mask = seq_mask[:, None] * seq_mask[None, :]
-    extra_msa_mask = torch.zeros((1, L), device=device, dtype=seq_probs21.dtype)
-    extra_msa = torch.zeros((1, L), device=device, dtype=torch.long)
-    extra_has_deletion = torch.zeros((1, L), device=device, dtype=seq_probs21.dtype)
-    extra_deletion_value = torch.zeros((1, L), device=device, dtype=seq_probs21.dtype)
+    extra_msa_mask = torch.zeros((msa_depth, L), device=device, dtype=seq_probs21.dtype)
+    extra_msa = torch.zeros((msa_depth, L), device=device, dtype=torch.long)
+    extra_has_deletion = torch.zeros((msa_depth, L), device=device, dtype=seq_probs21.dtype)
+    extra_deletion_value = torch.zeros((msa_depth, L), device=device, dtype=seq_probs21.dtype)
     aatype_int = torch.argmax(seq_probs21, dim=-1).to(torch.long)
 
     def add_cycle(x: torch.Tensor) -> torch.Tensor:
@@ -258,6 +264,9 @@ def save_loss_plot(
 
 
 def save_sequence_gif(seq_history, path: Path, title: str = "Hallucination sequence logits"):
+    if importlib.util.find_spec("imageio") is None:
+        print("imageio not available; skipping sequence GIF", flush=True)
+        return
     import imageio
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -349,6 +358,8 @@ def _wrap_replacements_from_checkpoint(
     linear_type: str = "full",
     kernel_size: int = 3,
     dilations: Tuple[int, ...] = (1, 2, 4),
+    dilation_pattern: Optional[Tuple[int, ...]] = None,
+    dilation_repeats: int = 1,
     replacement_mode: str = "per_block",
 ) -> int:
     """Replace Evoformer blocks with checkpointed replacements when available."""
@@ -364,6 +375,8 @@ def _wrap_replacements_from_checkpoint(
                     c_z=c_z,
                     kernel_size=int(kernel_size),
                     dilations=tuple(int(d) for d in dilations),
+                    dilation_pattern=dilation_pattern,
+                    dilation_repeats=int(dilation_repeats),
                     mode=str(replacement_mode),
                 )
             else:
@@ -382,10 +395,143 @@ def _wrap_replacements_from_checkpoint(
     return wrapped
 
 
+def _wrap_remaining_blocks(
+    model: AlphaFold,
+    c_m: int,
+    c_z: int,
+    replacement_type: str = "linear",
+    linear_type: str = "full",
+    kernel_size: int = 3,
+    dilations: Tuple[int, ...] = (1, 2, 4),
+    dilation_pattern: Optional[Tuple[int, ...]] = None,
+    dilation_repeats: int = 1,
+    replacement_mode: str = "per_block",
+) -> int:
+    """Wrap any Evoformer blocks that aren't already wrapped with GradientStraightThroughBlock.
+    
+    This ensures ALL blocks use replacement-only checkpointing for maximum memory savings.
+    Blocks without pretrained weights get randomly initialized replacement blocks.
+    """
+    wrapped = 0
+    for idx, block in enumerate(model.evoformer.blocks):
+        if isinstance(block, GradientStraightThroughBlock):
+            continue
+        if replacement_type == "linear":
+            replacement = SimpleEvoformerReplacement(c_m=c_m, c_z=c_z, linear_type=linear_type)
+        elif replacement_type == "conv":
+            replacement = DilatedConvEvoformerReplacement(
+                c_m=c_m,
+                c_z=c_z,
+                kernel_size=int(kernel_size),
+                dilations=tuple(int(d) for d in dilations),
+                dilation_pattern=dilation_pattern,
+                dilation_repeats=int(dilation_repeats),
+                mode=str(replacement_mode),
+            )
+        else:
+            replacement = SimpleEvoformerReplacement(c_m=c_m, c_z=c_z, linear_type="full")
+        replacement = replacement.to(
+            device=next(model.parameters()).device,
+            dtype=next(model.parameters()).dtype,
+        )
+        wrapped_block = GradientStraightThroughBlock(block, replacement, idx)
+        wrapped_block.use_straight_through = True
+        wrapped_block.ckpt_replacement_only = True
+        model.evoformer.blocks[idx] = wrapped_block
+        wrapped += 1
+    return wrapped
+
+
 def _set_straight_through(model: AlphaFold, enabled: bool):
     for blk in model.evoformer.blocks:
         if isinstance(blk, GradientStraightThroughBlock):
             blk.use_straight_through = enabled
+
+
+def _set_replacement_checkpoint_only(model: AlphaFold, enabled: bool):
+    for blk in model.evoformer.blocks:
+        if isinstance(blk, GradientStraightThroughBlock):
+            blk.ckpt_replacement_only = enabled
+
+
+class GradientStraightThroughModule(nn.Module):
+    """
+    Straight-through wrapper for a module operating on pair features.
+
+    Forward: uses original module output (no grad).
+    Backward: gradients flow through replacement module.
+    """
+
+    def __init__(
+        self,
+        original: nn.Module,
+        replacement: nn.Module,
+        ckpt_replacement_only: bool = True,
+    ):
+        super().__init__()
+        self.original = original
+        self.replacement = replacement
+        self.ckpt_replacement_only = ckpt_replacement_only
+        for param in self.original.parameters():
+            param.requires_grad = False
+
+    def forward(self, *args, **kwargs):
+        with torch.no_grad():
+            orig_out = self.original(*args, **kwargs)
+        mask = kwargs.get("mask", None)
+        if mask is None and len(args) > 1:
+            mask = args[1]
+        z = args[0] if len(args) > 0 else None
+        if self.ckpt_replacement_only:
+            repl_out = torch.utils.checkpoint.checkpoint(
+                self.replacement,
+                z,
+                mask,
+                use_reentrant=False,
+            )
+        else:
+            repl_out = self.replacement(z, pair_mask=mask)
+        return repl_out + (orig_out - repl_out).detach()
+
+
+def _wrap_triangle_ops(
+    model: AlphaFold,
+    kernel_size: int,
+    dilation_pattern: Tuple[int, ...],
+    dilation_repeats: int,
+    ckpt_replacement_only: bool = True,
+) -> int:
+    """
+    Set up triangle-only straight-through gradient estimation.
+
+    Instead of wrapping each triangle op individually, stores a single
+    replacement layer per block and sets a flag. The actual ST logic
+    is handled in checkpoint_blocks via 4-phase execution:
+      Phase 1: MSA + OPM (checkpointed)
+      Phase 2: all 4 triangle ops (no_grad, not checkpointed)
+      Phase 3: single replacement call (checkpointed) + ST combine
+      Phase 4: pair_transition (checkpointed)
+    """
+    wrapped = 0
+    c_z = model.evoformer.blocks[0].pair_stack.tri_att_start.c_in
+    device = next(model.parameters()).device
+    dtype = next(model.parameters()).dtype
+    for block in model.evoformer.blocks:
+        replacement = TriangleOpConvReplacement(
+            c_z=c_z,
+            kernel_size=int(kernel_size),
+            dilation_pattern=tuple(int(d) for d in dilation_pattern),
+            dilation_repeats=int(dilation_repeats),
+        ).to(device=device, dtype=dtype)
+        # Store replacement as a submodule so its params are registered
+        block._triangle_replacement = replacement
+        block._has_triangle_st = True
+        # Freeze original triangle op parameters
+        for name in ['tri_mul_out', 'tri_mul_in', 'tri_att_start', 'tri_att_end']:
+            for param in getattr(block.pair_stack, name).parameters():
+                param.requires_grad = False
+        wrapped += 4
+    return wrapped
 
 
 def _parse_block_indices(spec: str) -> Tuple[int, ...]:
@@ -431,6 +577,16 @@ def load_model(
     checkpoint_path: Path,
     device: torch.device,
     straight_through: bool = True,
+    allow_replacements: bool = True,
+    disable_attention_opts: bool = False,
+    enable_flash_attention: bool = False,
+    enable_deepspeed_attention: bool = False,
+    disable_chunking: bool = False,
+    wrap_all_blocks: bool = False,
+    triangle_st_only: bool = False,
+    triangle_kernel_size: int = 3,
+    triangle_dilation_pattern: Optional[Tuple[int, ...]] = None,
+    triangle_dilation_repeats: int = 1,
 ) -> AlphaFold:
     with open(config_path, "r", encoding="utf-8") as handle:
         import yaml
@@ -447,11 +603,47 @@ def load_model(
         dilations = tuple(int(d) for d in dilations_raw.split(",") if d.strip() != "")
     else:
         dilations = tuple(int(d) for d in dilations_raw)
+    dilation_pattern_raw = cfg_yaml.get("dilation_pattern", None)
+    dilation_repeats = int(cfg_yaml.get("dilation_repeats", 1))
+    if dilation_pattern_raw is None:
+        dilation_pattern = None
+    elif isinstance(dilation_pattern_raw, str):
+        dilation_pattern = tuple(int(d) for d in dilation_pattern_raw.split(",") if d.strip() != "")
+    else:
+        dilation_pattern = tuple(int(d) for d in dilation_pattern_raw)
 
     cfg = model_config(preset)
     cfg.model.template.enabled = False
     cfg.globals.chunk_size = 4
     cfg.model.num_recycle = 1
+    # Enable activation checkpointing for hallucination backprop to reduce memory.
+    cfg.globals.blocks_per_ckpt = 1
+    cfg.model.evoformer_stack.blocks_per_ckpt = 1
+    cfg.model.template.template_pair_stack.blocks_per_ckpt = 1
+    cfg.model.extra_msa.extra_msa_stack.ckpt = True
+    if disable_chunking:
+        cfg.globals.chunk_size = None
+        cfg.model.evoformer_stack.tune_chunk_size = False
+        cfg.model.template.template_pair_stack.tune_chunk_size = False
+        cfg.model.extra_msa.extra_msa_stack.tune_chunk_size = False
+    if enable_flash_attention and disable_attention_opts:
+        raise ValueError("enable_flash_attention and disable_attention_opts are mutually exclusive")
+    if enable_deepspeed_attention and disable_attention_opts:
+        raise ValueError("enable_deepspeed_attention and disable_attention_opts are mutually exclusive")
+    if enable_deepspeed_attention and enable_flash_attention:
+        raise ValueError("enable_deepspeed_attention and enable_flash_attention are mutually exclusive")
+    if disable_attention_opts:
+        cfg.globals.use_flash = False
+        cfg.globals.use_lma = False
+        cfg.globals.use_deepspeed_evo_attention = False
+    if enable_flash_attention:
+        cfg.globals.use_flash = True
+        cfg.globals.use_lma = False
+        cfg.globals.use_deepspeed_evo_attention = False
+    if enable_deepspeed_attention:
+        cfg.globals.use_flash = False
+        cfg.globals.use_lma = False
+        cfg.globals.use_deepspeed_evo_attention = True
 
     model = AlphaFold(cfg).to(device)
     import_jax_weights_(model, os.path.join(Path.home(), weights_path), version=preset)
@@ -474,21 +666,54 @@ def load_model(
     c_z = evo_cfg.c_z
 
     # Inject replacement blocks when present in checkpoint
-    wrapped = _wrap_replacements_from_checkpoint(
-        model,
-        state_dict,
-        c_m,
-        c_z,
-        replacement_type=replacement_type,
-        linear_type=linear_type,
-        kernel_size=kernel_size,
-        dilations=dilations,
-        replacement_mode=replacement_mode,
-    )
+    wrapped = 0
+    if allow_replacements:
+        wrapped = _wrap_replacements_from_checkpoint(
+            model,
+            state_dict,
+            c_m,
+            c_z,
+            replacement_type=replacement_type,
+            linear_type=linear_type,
+            kernel_size=kernel_size,
+            dilations=dilations,
+            dilation_pattern=dilation_pattern,
+            dilation_repeats=dilation_repeats,
+            replacement_mode=replacement_mode,
+        )
     if device.type == "cuda":
         model = model.bfloat16()
 
-    if straight_through:
+    # Wrap remaining blocks for maximum memory savings
+    if wrap_all_blocks and allow_replacements:
+        remaining = _wrap_remaining_blocks(
+            model,
+            c_m,
+            c_z,
+            replacement_type=replacement_type,
+            linear_type=linear_type,
+            kernel_size=kernel_size,
+            dilations=dilations,
+            dilation_pattern=dilation_pattern,
+            dilation_repeats=dilation_repeats,
+            replacement_mode=replacement_mode,
+        )
+        if remaining > 0:
+            print(f"Wrapped {remaining} additional blocks without pretrained weights.")
+        wrapped += remaining
+
+    if triangle_st_only:
+        if triangle_dilation_pattern is None:
+            triangle_dilation_pattern = (1, 2, 4, 8)
+        wrapped_ops = _wrap_triangle_ops(
+            model,
+            kernel_size=triangle_kernel_size,
+            dilation_pattern=triangle_dilation_pattern,
+            dilation_repeats=triangle_dilation_repeats,
+            ckpt_replacement_only=True,
+        )
+        print(f"Applied triangle-only straight-through to {wrapped_ops} ops.", flush=True)
+    if straight_through and allow_replacements and not triangle_st_only:
         if wrapped == 0:
             wrapped = apply_gradient_straight_through(model)
         if wrapped == 0:
@@ -548,8 +773,10 @@ def optimize_sequence(
 
     if straight_through_selection == "static_blocks":
         _set_straight_through_blocks(model, straight_through_blocks)
+        _set_replacement_checkpoint_only(model, enabled=True)
         any_st_enabled = len(straight_through_blocks) > 0
     else:
+        _set_replacement_checkpoint_only(model, enabled=False)
         any_st_enabled = True
 
     for step in tqdm(range(steps), desc="Optimizing sequence"):
@@ -754,12 +981,16 @@ def main():
     
     st_blocks = _parse_block_indices(args.straight_through_blocks) if args.straight_through_selection == "static_blocks" else ()
 
-    with open(args.config_path, "r", encoding="utf-8") as handle:
+    config_path = args.config_path.expanduser()
+    output_base_dir = args.output_dir.expanduser()
+    config_name = config_path.stem
+
+    with open(config_path, "r", encoding="utf-8") as handle:
         cfg_yaml = yaml.safe_load(handle)
     replacement_type = cfg_yaml["replacement_type"]
-    replacement_description = f"_orig-{args.orig_steps_per_cycle}_repl-{args.repl_steps_per_cycle}" if args.straight_through_selection == "cycle" else f"_st-blocks-{st_blocks}"
+    replacement_description = f"_orig-{args.orig_steps_per_cycle}_repl-{args.repl_steps_per_cycle}" if args.straight_through_selection == "cycle" else f"_st-blocks-{args.straight_through_blocks}"
 
-    out_dir = args.output_dir
+    out_dir = output_base_dir / config_name
     out_prefix = (
         f"{args.pdb_id}_{args.chain_id}"
         f"_repl-type-{replacement_type}"
@@ -800,7 +1031,7 @@ def main():
     gt_len = int(pseudo_beta.shape[-2]) if gt_batch is None else int(gt_batch["aatype"].shape[-1])
     tee(f"Ground truth length: {gt_len}")
 
-    model = load_model(args.config_path, args.checkpoint_path, device, straight_through=True)
+    model = load_model(config_path, args.checkpoint_path, device, straight_through=True)
     # Pull the canonical FAPE config from the training preset (same name as used for weights)
     preset = cfg_yaml.get("config_preset", "model_1_ptm")
     fape_cfg = model_config(preset, train=True).loss.fape
