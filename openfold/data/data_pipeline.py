@@ -299,7 +299,10 @@ def make_sequence_features_with_custom_template(
         mmcif_path: str,
         pdb_id: str,
         chain_id: str,
-        kalign_binary_path: str) -> FeatureDict:
+        kalign_binary_path: str,
+        rm_template_sequence: bool = False,
+        skip_alignment: bool = False,
+) -> FeatureDict:
     """
     process a single fasta file using features derived from a single template rather than an alignment
     """
@@ -325,7 +328,9 @@ def make_sequence_features_with_custom_template(
         query_sequence=sequence,
         pdb_id=pdb_id,
         chain_id=chain_id,
-        kalign_binary_path=kalign_binary_path
+        kalign_binary_path=kalign_binary_path,
+        rm_template_sequence=rm_template_sequence,
+        skip_alignment=skip_alignment,
     )
 
     return {
