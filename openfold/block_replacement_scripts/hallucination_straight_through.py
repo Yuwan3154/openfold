@@ -454,6 +454,27 @@ def _set_replacement_checkpoint_only(model: AlphaFold, enabled: bool):
             blk.ckpt_replacement_only = enabled
 
 
+def _freeze_all_non_replacement_params(model: AlphaFold) -> None:
+    """Freeze all params except replacement blocks (for memory savings during backprop)."""
+    total_params = 0
+    trainable_params = 0
+    for name, param in model.named_parameters():
+        total_params += param.numel()
+        is_replacement = (
+            ".replacement_block." in name
+            or "._triangle_replacement." in name
+        )
+        if is_replacement:
+            param.requires_grad = True
+            trainable_params += param.numel()
+        else:
+            param.requires_grad = False
+    print(
+        f"Froze all non-replacement params: trainable={trainable_params} total={total_params}",
+        flush=True,
+    )
+
+
 class GradientStraightThroughModule(nn.Module):
     """
     Straight-through wrapper for a module operating on pair features.
@@ -749,6 +770,7 @@ def optimize_sequence(
     softmax_seq: bool = False,
     optimizer: str = "SGD",
     norm_grad: bool = True,
+    ckpt_replacement_only: bool = False,
 ) -> Tuple[torch.Tensor, list, list, torch.Tensor, float, Optional[float], Optional[float]]:
     if init_seq == "0":
         seq_logits = nn.Parameter(torch.zeros(seq_len, 20, device=device))
@@ -776,7 +798,7 @@ def optimize_sequence(
         _set_replacement_checkpoint_only(model, enabled=True)
         any_st_enabled = len(straight_through_blocks) > 0
     else:
-        _set_replacement_checkpoint_only(model, enabled=False)
+        _set_replacement_checkpoint_only(model, enabled=ckpt_replacement_only)
         any_st_enabled = True
 
     for step in tqdm(range(steps), desc="Optimizing sequence"):
@@ -975,10 +997,48 @@ def main():
         default=False,
         help="Normalize the gradient of the initial sequence. Only works with SGD optimizer",
     )
+    parser.add_argument(
+        "--wrap_all_blocks",
+        action="store_true",
+        default=False,
+        help="Wrap ALL Evoformer blocks (including those without pretrained weights) for max memory savings.",
+    )
+    parser.add_argument(
+        "--disable_chunking",
+        action="store_true",
+        default=False,
+        help="Disable chunked attention and chunk-size tuning.",
+    )
+    parser.add_argument(
+        "--disable_extra_msa",
+        action="store_true",
+        default=False,
+        help="Disable extra MSA stack for memory savings.",
+    )
+    parser.add_argument(
+        "--straight_through_all",
+        action="store_true",
+        default=False,
+        help="Use straight-through for all Evoformer blocks (requires straight_through_selection=static_blocks).",
+    )
+    parser.add_argument(
+        "--ckpt_replacement_only",
+        action="store_true",
+        default=False,
+        help="Checkpoint replacement blocks only when straight-through is enabled.",
+    )
+    parser.add_argument(
+        "--freeze_all_non_replacement_params",
+        action="store_true",
+        default=False,
+        help="Freeze all params except replacement blocks for memory savings.",
+    )
     args = parser.parse_args()
     if args.dist_scale == 0.0 and args.coor_scale == 0.0:
         raise ValueError("dist_scale and coor_scale cannot both be 0")
-    
+    if args.straight_through_all and args.straight_through_selection != "static_blocks":
+        raise ValueError("--straight_through_all requires --straight_through_selection static_blocks")
+
     st_blocks = _parse_block_indices(args.straight_through_blocks) if args.straight_through_selection == "static_blocks" else ()
 
     config_path = args.config_path.expanduser()
@@ -1031,7 +1091,21 @@ def main():
     gt_len = int(pseudo_beta.shape[-2]) if gt_batch is None else int(gt_batch["aatype"].shape[-1])
     tee(f"Ground truth length: {gt_len}")
 
-    model = load_model(config_path, args.checkpoint_path, device, straight_through=True)
+    model = load_model(
+        config_path,
+        args.checkpoint_path,
+        device,
+        straight_through=True,
+        disable_chunking=args.disable_chunking,
+        wrap_all_blocks=args.wrap_all_blocks,
+    )
+    if args.disable_extra_msa:
+        model.config.extra_msa.enabled = False
+        print("Extra MSA stack disabled", flush=True)
+    if args.straight_through_all:
+        st_blocks = tuple(range(len(model.evoformer.blocks)))
+    if args.freeze_all_non_replacement_params:
+        _freeze_all_non_replacement_params(model)
     # Pull the canonical FAPE config from the training preset (same name as used for weights)
     preset = cfg_yaml.get("config_preset", "model_1_ptm")
     fape_cfg = model_config(preset, train=True).loss.fape
@@ -1061,6 +1135,7 @@ def main():
         softmax_seq=args.softmax_seq,
         optimizer=args.optimizer,
         norm_grad=args.norm_grad,
+        ckpt_replacement_only=args.ckpt_replacement_only,
     )
 
     peak_mem_allocated_bytes = None

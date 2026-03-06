@@ -46,25 +46,38 @@ def _plot_metric(
     for data in datasets:
         x = data["lengths"]
         y = data[metric_key]
+        solid_to_extrapolate = data.get("solid_to_extrapolate", False)
         coeffs = _fit_cubic(x, y)
-        x_fit = np.linspace(x.min(), x.max(), 200)
+        x_max_plot = x.max()
+        if solid_to_extrapolate and extrapolate_to is not None and extrapolate_to > x_max_plot:
+            x_max_plot = float(extrapolate_to)
+        x_fit = np.linspace(x.min(), x_max_plot, 200)
         y_fit = np.polyval(coeffs, x_fit)
         plt.scatter(x, y, label=data["label"])
         line = plt.plot(x_fit, y_fit, label="_nolegend_")[0]
 
         if extrapolate_to is not None and extrapolate_to > x.max():
-            x_ext = np.linspace(x.max(), extrapolate_to, 80)
-            y_ext = np.polyval(coeffs, x_ext)
-            plt.plot(x_ext, y_ext, linestyle=":", color=line.get_color(), label="_nolegend_")
             y_ext_val = float(np.polyval(coeffs, extrapolate_to))
-            plt.scatter(
-                [extrapolate_to],
-                [y_ext_val],
-                facecolors="none",
-                edgecolors=line.get_color(),
-                linewidths=1.5,
-                label="_nolegend_",
-            )
+            if solid_to_extrapolate:
+                plt.scatter(
+                    [extrapolate_to],
+                    [y_ext_val],
+                    color=line.get_color(),
+                    zorder=5,
+                    label="_nolegend_",
+                )
+            else:
+                x_ext = np.linspace(x.max(), extrapolate_to, 80)
+                y_ext = np.polyval(coeffs, x_ext)
+                plt.plot(x_ext, y_ext, linestyle=":", color=line.get_color(), label="_nolegend_")
+                plt.scatter(
+                    [extrapolate_to],
+                    [y_ext_val],
+                    facecolors="none",
+                    edgecolors=line.get_color(),
+                    linewidths=1.5,
+                    label="_nolegend_",
+                )
     # if hline_y is not None:
     #     plt.axhline(hline_y, linestyle="--", color="black", linewidth=1.0, label="H200 (141GB)")
     plt.xlabel("Sequence length")
@@ -120,6 +133,13 @@ def main():
         default=None,
         help="Optional length to extrapolate fit with dotted line.",
     )
+    parser.add_argument(
+        "--solid_extrapolate_labels",
+        type=str,
+        nargs="*",
+        default=("Full block r1", "Full block r2"),
+        help="Labels for which fit is drawn solid to extrapolate_to (default: Full block r1, r2).",
+    )
     args = parser.parse_args()
 
     if len(args.csv_paths) != len(args.labels):
@@ -130,6 +150,7 @@ def main():
 
     datasets: List[Dict] = []
     coeffs_rows: List[Dict[str, float]] = []
+    solid_labels = set(args.solid_extrapolate_labels or ())
     for path, label in zip(args.csv_paths, args.labels):
         lengths, elapsed_s, mem_alloc = _load_results(path)
         datasets.append(
@@ -138,6 +159,7 @@ def main():
                 "lengths": lengths,
                 "elapsed_s": elapsed_s,
                 "mem_alloc": mem_alloc,
+                "solid_to_extrapolate": label in solid_labels,
             }
         )
         coeffs_time = _fit_cubic(lengths, elapsed_s)

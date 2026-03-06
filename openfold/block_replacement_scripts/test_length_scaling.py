@@ -56,7 +56,12 @@ def _freeze_all_non_replacement_params(model) -> None:
     trainable_params = 0
     for name, param in model.named_parameters():
         total_params += param.numel()
-        if ".replacement_block." in name:
+        # Keep both full-block replacement params and triangle-only replacement params trainable.
+        is_replacement = (
+            ".replacement_block." in name
+            or "._triangle_replacement." in name
+        )
+        if is_replacement:
             param.requires_grad = True
             trainable_params += param.numel()
         else:
@@ -111,6 +116,84 @@ def _parse_block_indices(value: str) -> Tuple[int, ...]:
                 raise ValueError(f"Invalid block index: {part}")
             out.append(int(part))
     return tuple(sorted(set(out)))
+
+
+def _format_block_range_spec(blocks: Tuple[int, ...]) -> str:
+    if len(blocks) == 0:
+        return "none"
+    ranges: List[str] = []
+    start = blocks[0]
+    prev = blocks[0]
+    for idx in blocks[1:]:
+        if idx == prev + 1:
+            prev = idx
+            continue
+        if start == prev:
+            ranges.append(f"{start}")
+        else:
+            ranges.append(f"{start}-{prev}")
+        start = idx
+        prev = idx
+    if start == prev:
+        ranges.append(f"{start}")
+    else:
+        ranges.append(f"{start}-{prev}")
+    return ",".join(ranges)
+
+
+def _sanitize_token(token: str) -> str:
+    out_chars: List[str] = []
+    for ch in token:
+        if ch.isalnum() or ch in ("-", "_", "."):
+            out_chars.append(ch)
+        else:
+            out_chars.append("-")
+    out = "".join(out_chars).strip("-")
+    while "--" in out:
+        out = out.replace("--", "-")
+    return out
+
+
+def _build_run_descriptor(
+    *,
+    args,
+    st_blocks: Tuple[int, ...],
+    num_evoformer_blocks: int,
+) -> str:
+    if args.straight_through_selection == "cycle":
+        base = f"orig-{args.orig_steps_per_cycle}_repl-{args.repl_steps_per_cycle}"
+    else:
+        use_all = len(st_blocks) == num_evoformer_blocks and num_evoformer_blocks > 0
+        if args.straight_through_all or use_all:
+            block_spec = "all"
+        else:
+            block_spec = _format_block_range_spec(st_blocks)
+        base = f"st-blocks-{block_spec}"
+
+    tags: List[str] = []
+    if args.use_base_model:
+        tags.append("base")
+    if args.triangle_st_only:
+        tri_d = "-".join([d.strip() for d in args.triangle_dilation_pattern.split(",") if d.strip() != ""])
+        tags.append(f"triangle-k{args.triangle_kernel_size}-d{tri_d}-r{args.triangle_dilation_repeats}")
+    if args.wrap_all_blocks:
+        tags.append("wrap-all")
+    if args.ckpt_replacement_only:
+        tags.append("ckpt-repl-only")
+    if args.freeze_non_replacement_params:
+        tags.append("freeze-replaced-orig")
+    if args.freeze_all_non_replacement_params:
+        tags.append("freeze-all-non-repl")
+    if args.freeze_all_params:
+        tags.append("freeze-all")
+    if args.disable_chunking:
+        tags.append("no-chunk")
+    if args.disable_extra_msa:
+        tags.append("no-extra-msa")
+
+    if len(tags) > 0:
+        base = f"{base}__{'__'.join(tags)}"
+    return _sanitize_token(base)
 
 
 def _get_optimizer(seq_logits: nn.Parameter, name: str, lr: float):
@@ -442,6 +525,13 @@ def main():
         help="Number of repeats per length (median is reported).",
     )
     parser.add_argument(
+        "--skip_existing_lengths",
+        action="store_true",
+        default=False,
+        help="If set, skip seq_len values already present in the output CSV. "
+             "Default behavior is to recompute requested lengths and replace existing rows.",
+    )
+    parser.add_argument(
         "--disable_checkpointing",
         action="store_true",
         default=False,
@@ -520,13 +610,6 @@ def main():
     config_path = args.config_path.expanduser()
     output_base_dir = args.output_dir.expanduser()
     config_name = config_path.stem
-    replacement_description = (
-        f"_orig-{args.orig_steps_per_cycle}_repl-{args.repl_steps_per_cycle}"
-        if args.straight_through_selection == "cycle"
-        else f"_st-blocks-{args.straight_through_blocks}"
-    )
-    out_dir = output_base_dir / config_name / f"length_scaling{replacement_description}"
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     if args.device is not None:
         device = torch.device(args.device)
@@ -600,9 +683,17 @@ def main():
     if args.freeze_all_params:
         _freeze_all_params(model)
 
+    run_descriptor = _build_run_descriptor(
+        args=args,
+        st_blocks=st_blocks,
+        num_evoformer_blocks=len(model.evoformer.blocks),
+    )
+    out_dir = output_base_dir / config_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     ckpt_tag = "no-ckpt" if args.disable_checkpointing else "ckpt"
-    results_path = out_dir / f"length_scaling{replacement_description}_{ckpt_tag}.csv"
-    existing_lengths = set()
+    results_path = out_dir / f"length_scaling_{run_descriptor}_{ckpt_tag}.csv"
+    existing_rows = {}
     if results_path.exists():
         with open(results_path, "r", encoding="utf-8", newline="") as handle:
             reader = csv.DictReader(handle)
@@ -610,12 +701,80 @@ def main():
                 seq_val = row.get("seq_len", "")
                 if not str(seq_val).isdigit():
                     continue
-                existing_lengths.add(int(seq_val))
-    write_header = True
-    if results_path.exists() and results_path.stat().st_size > 0:
-        write_header = False
-    open_mode = "a" if results_path.exists() else "w"
-    with open(results_path, open_mode, encoding="utf-8", newline="") as handle:
+                existing_rows[int(seq_val)] = row
+
+    if args.skip_existing_lengths:
+        lengths_to_run = [int(l) for l in lengths if int(l) not in existing_rows]
+    else:
+        lengths_to_run = [int(l) for l in lengths]
+        for l in lengths_to_run:
+            if l in existing_rows:
+                del existing_rows[l]
+
+    new_rows = {}
+    for seq_len in lengths_to_run:
+        elapsed_s_list: List[float] = []
+        mem_alloc_list: List[float] = []
+        mem_reserved_list: List[float] = []
+        loss_list: List[float] = []
+        dist_loss_list: List[float] = []
+        use_straight_through = None
+        for _ in range(args.repeats):
+            row = run_one_pass(
+                model=model,
+                seq_len=seq_len,
+                device=device,
+                dist_scale=args.dist_scale,
+                lr=args.lr,
+                init_seq=args.init_seq,
+                optimizer_name=args.optimizer,
+                norm_grad=args.norm_grad,
+                straight_through_selection=args.straight_through_selection,
+                straight_through_blocks=st_blocks,
+                orig_steps_per_cycle=args.orig_steps_per_cycle,
+                repl_steps_per_cycle=args.repl_steps_per_cycle,
+                msa_depth=args.msa_depth,
+                log_fwd_bwd_mem=args.log_fwd_bwd_mem,
+                log_mz_sizes=args.log_mz_sizes,
+                no_grad=args.no_grad,
+                assert_grad_nonzero=args.assert_grad_nonzero,
+                assert_seq_grad_nonzero=args.assert_seq_grad_nonzero,
+                assert_orig_grad_none=args.assert_orig_grad_none,
+            )
+            elapsed_s_list.append(row["elapsed_s"])
+            mem_alloc_list.append(float(row["peak_mem_allocated_bytes"]))
+            mem_reserved_list.append(float(row["peak_mem_reserved_bytes"]))
+            loss_list.append(row["loss"])
+            dist_loss_list.append(row["dist_loss"])
+            if use_straight_through is None:
+                use_straight_through = row["use_straight_through"]
+
+        med_row = {
+            "seq_len": int(seq_len),
+            "loss": float(np.median(np.array(loss_list, dtype=np.float64))),
+            "dist_loss": float(np.median(np.array(dist_loss_list, dtype=np.float64))),
+            "elapsed_s": float(np.median(np.array(elapsed_s_list, dtype=np.float64))),
+            "peak_mem_allocated_bytes": int(np.median(np.array(mem_alloc_list, dtype=np.float64))),
+            "peak_mem_reserved_bytes": int(np.median(np.array(mem_reserved_list, dtype=np.float64))),
+            "use_straight_through": bool(use_straight_through),
+            "repeats": int(args.repeats),
+        }
+        new_rows[int(seq_len)] = med_row
+        print(
+            f"len={med_row['seq_len']} loss={med_row['loss']:.4f} "
+            f"time={med_row['elapsed_s']:.3f}s "
+            f"mem_alloc={med_row['peak_mem_allocated_bytes']} "
+            f"repeats={med_row['repeats']}",
+            flush=True,
+        )
+
+    merged_rows = {}
+    for k, v in existing_rows.items():
+        merged_rows[int(k)] = v
+    for k, v in new_rows.items():
+        merged_rows[int(k)] = v
+
+    with open(results_path, "w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(
             handle,
             fieldnames=[
@@ -629,67 +788,10 @@ def main():
                 "repeats",
             ],
         )
-        if write_header:
-            writer.writeheader()
-        for seq_len in lengths:
-            if int(seq_len) in existing_lengths:
-                print(f"Skipping existing length {seq_len}", flush=True)
-                continue
-            elapsed_s_list: List[float] = []
-            mem_alloc_list: List[float] = []
-            mem_reserved_list: List[float] = []
-            loss_list: List[float] = []
-            dist_loss_list: List[float] = []
-            use_straight_through = None
-            for _ in range(args.repeats):
-                row = run_one_pass(
-                    model=model,
-                    seq_len=seq_len,
-                    device=device,
-                    dist_scale=args.dist_scale,
-                    lr=args.lr,
-                    init_seq=args.init_seq,
-                    optimizer_name=args.optimizer,
-                    norm_grad=args.norm_grad,
-                    straight_through_selection=args.straight_through_selection,
-                    straight_through_blocks=st_blocks,
-                    orig_steps_per_cycle=args.orig_steps_per_cycle,
-                    repl_steps_per_cycle=args.repl_steps_per_cycle,
-                    msa_depth=args.msa_depth,
-                    log_fwd_bwd_mem=args.log_fwd_bwd_mem,
-                    log_mz_sizes=args.log_mz_sizes,
-                    no_grad=args.no_grad,
-                    assert_grad_nonzero=args.assert_grad_nonzero,
-                    assert_seq_grad_nonzero=args.assert_seq_grad_nonzero,
-                    assert_orig_grad_none=args.assert_orig_grad_none,
-                )
-                elapsed_s_list.append(row["elapsed_s"])
-                mem_alloc_list.append(float(row["peak_mem_allocated_bytes"]))
-                mem_reserved_list.append(float(row["peak_mem_reserved_bytes"]))
-                loss_list.append(row["loss"])
-                dist_loss_list.append(row["dist_loss"])
-                if use_straight_through is None:
-                    use_straight_through = row["use_straight_through"]
-
-            med_row = {
-                "seq_len": int(seq_len),
-                "loss": float(np.median(np.array(loss_list, dtype=np.float64))),
-                "dist_loss": float(np.median(np.array(dist_loss_list, dtype=np.float64))),
-                "elapsed_s": float(np.median(np.array(elapsed_s_list, dtype=np.float64))),
-                "peak_mem_allocated_bytes": int(np.median(np.array(mem_alloc_list, dtype=np.float64))),
-                "peak_mem_reserved_bytes": int(np.median(np.array(mem_reserved_list, dtype=np.float64))),
-                "use_straight_through": bool(use_straight_through),
-                "repeats": int(args.repeats),
-            }
-            writer.writerow(med_row)
-            handle.flush()
-            print(
-                f"len={med_row['seq_len']} loss={med_row['loss']:.4f} "
-                f"time={med_row['elapsed_s']:.3f}s "
-                f"mem_alloc={med_row['peak_mem_allocated_bytes']} "
-                f"repeats={med_row['repeats']}",
-                flush=True,
-            )
+        writer.writeheader()
+        for seq_len in sorted(list(merged_rows.keys())):
+            writer.writerow(merged_rows[seq_len])
+        handle.flush()
 
     print(f"Saved results to {results_path}", flush=True)
 

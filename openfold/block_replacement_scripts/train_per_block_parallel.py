@@ -18,6 +18,7 @@ import argparse
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import numpy as np
@@ -449,6 +450,7 @@ class ParallelBlockPretrainer(pl.LightningModule):
         allow_random_init: bool = False,
         compile_replacement: bool = False,
         resume_checkpoint_path: Optional[str] = None,
+        blocks_to_train: Optional[Tuple[int, ...]] = None,
         learning_rate: float = 1e-4,
         weight_decay: float = 1e-4,
     ):
@@ -480,6 +482,7 @@ class ParallelBlockPretrainer(pl.LightningModule):
         self.allow_random_init = bool(allow_random_init)
         self.compile_replacement = bool(compile_replacement)
         self.resume_checkpoint_path = resume_checkpoint_path
+        self.blocks_to_train = tuple(blocks_to_train) if blocks_to_train is not None else None
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         
@@ -543,10 +546,15 @@ class ParallelBlockPretrainer(pl.LightningModule):
         blocks_random_init = 0
         blocks_failed = 0
 
+        block_indices = (
+            self.blocks_to_train
+            if self.blocks_to_train is not None
+            else tuple(range(0, 48))
+        )
         if self.resume_checkpoint_path is not None:
             # When resuming, Lightning will restore weights from the run checkpoint.
             # Avoid unnecessary I/O and confusing "checkpoint not found" warnings.
-            for block_idx in range(0, 48):
+            for block_idx in block_indices:
                 if self.replacement_type == "linear":
                     replacement_block = SimpleEvoformerReplacement(
                         c_m=self.c_m,
@@ -590,7 +598,7 @@ class ParallelBlockPretrainer(pl.LightningModule):
                 f"Invalid replacement_type: {self.replacement_type}. Expected 'linear' or 'conv'."
             )
         
-        for block_idx in range(0, 48):
+        for block_idx in block_indices:
             block_path = (
                 Path(self.trained_models_dir)
                 / f"block_{block_idx:02d}"
@@ -742,7 +750,33 @@ class ParallelBlockPretrainer(pl.LightningModule):
     def forward(self, batch):
         """Not used - training is done in training_step"""
         pass
-    
+
+    def on_before_backward(self, loss):
+        if getattr(self, "_profile_step", False):
+            torch.cuda.synchronize(self.device)
+            self._t_before_backward = time.perf_counter()
+
+    def on_after_backward(self):
+        if getattr(self, "_profile_step", False):
+            torch.cuda.synchronize(self.device)
+            self._t_after_backward = time.perf_counter()
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        if getattr(self, "_profile_step", False):
+            torch.cuda.synchronize(self.device)
+            _t_end = time.perf_counter()
+            bwd = getattr(self, "_t_after_backward", _t_end) - getattr(self, "_t_before_backward", _t_end)
+            fwd = getattr(self, "_t_training_step_end", _t_end) - getattr(self, "_t_step_start", _t_end)
+            total = _t_end - getattr(self, "_t_step_start", _t_end)
+            other = total - fwd - bwd
+            print(
+                f"[profile-full] step={batch_idx} total={total:.3f}s | "
+                f"fwd(training_step)={fwd:.3f}s backward={bwd:.3f}s "
+                f"other(optim+ddp+log)={other:.3f}s",
+                flush=True,
+            )
+            self._profile_step = False
+
     def training_step(self, batch, batch_idx):
         """
         Training step that:
@@ -750,6 +784,13 @@ class ParallelBlockPretrainer(pl.LightningModule):
         2. Trains each replacement block sequentially
         3. Returns average loss across all blocks
         """
+        _profile = (batch_idx < 5 and int(getattr(self, "global_rank", 0)) == 0)
+        self._profile_step = _profile
+        if _profile:
+            torch.cuda.synchronize(self.device)
+            _t_step_start = time.perf_counter()
+            self._t_step_start = _t_step_start
+
         # Move batch to device
         batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
         log_batch_size = 1
@@ -797,7 +838,14 @@ class ParallelBlockPretrainer(pl.LightningModule):
                 if not merged_path.exists():
                     raise FileNotFoundError(f"Missing merged cache file: {merged_path}")
                 merged_all[sid] = load_merged_block_samples(merged_path, map_location="cpu")
-        
+
+        if _profile:
+            torch.cuda.synchronize(self.device)
+            _t_after_load = time.perf_counter()
+            _t_data_prep_total = 0.0
+            _t_forward_total = 0.0
+            _t_loss_total = 0.0
+
         # Train each replacement block sequentially
         total_loss = 0.0
         num_blocks = 0
@@ -805,7 +853,10 @@ class ParallelBlockPretrainer(pl.LightningModule):
         for block_idx in range(0, 48):
             if str(block_idx) not in self.replacement_blocks:
                 continue
-            
+
+            if _profile:
+                _t_block_start = time.perf_counter()
+
             cached = None
             if merged_all is not None:
                 # Merged format: look up from pre-loaded dict
@@ -981,6 +1032,11 @@ class ParallelBlockPretrainer(pl.LightningModule):
                     m_in_msa = m_in_single.unsqueeze(-3)
                 z_in_for_block = z_in.unsqueeze(0) if z_in.dim() == 3 else z_in
 
+            if _profile:
+                torch.cuda.synchronize(self.device)
+                _t_dp = time.perf_counter()
+                _t_data_prep_total += _t_dp - _t_block_start
+
             # Run replacement block
             replacement_block = self.replacement_blocks[str(block_idx)]
             m_pred_msa, z_pred = replacement_block(
@@ -1000,7 +1056,12 @@ class ParallelBlockPretrainer(pl.LightningModule):
                 m_pred_single = m_pred_single.squeeze(0)
             if z_target.dim() == 3 and z_pred_for_loss.dim() == 4 and z_pred_for_loss.shape[0] == 1:
                 z_pred_for_loss = z_pred_for_loss.squeeze(0)
-            
+
+            if _profile:
+                torch.cuda.synchronize(self.device)
+                _t_fwd = time.perf_counter()
+                _t_forward_total += _t_fwd - _t_dp
+
             # Compute loss
             if cache_dir is not None and isinstance(seq_length, torch.Tensor) and seq_length.ndim == 1:
                 # Masked MSE (padding-safe) for cache-only batched mode
@@ -1027,7 +1088,11 @@ class ParallelBlockPretrainer(pl.LightningModule):
                 # Original behavior
                 loss_single = F.mse_loss(m_pred_single, m_target_single)
                 loss_pair = F.mse_loss(z_pred_for_loss, z_target)
-            
+
+            if _profile:
+                torch.cuda.synchronize(self.device)
+                _t_loss_total += time.perf_counter() - _t_fwd
+
             # Combine losses
             block_loss = loss_single + loss_pair
             total_loss += block_loss
@@ -1045,7 +1110,22 @@ class ParallelBlockPretrainer(pl.LightningModule):
             
             # Clear intermediate tensors to free memory
             del m_in_msa, m_pred_msa, m_pred_single, z_pred_for_loss, block_loss
-        
+
+        if _profile:
+            torch.cuda.synchronize(self.device)
+            _t_step_end = time.perf_counter()
+            _t_total = _t_step_end - _t_step_start
+            _t_load = _t_after_load - _t_step_start
+            _t_block_loop = _t_step_end - _t_after_load
+            print(
+                f"[profile] step={batch_idx} total={_t_total:.3f}s | "
+                f"load={_t_load:.3f}s data_prep={_t_data_prep_total:.3f}s "
+                f"forward={_t_forward_total:.3f}s loss={_t_loss_total:.3f}s | "
+                f"block_loop={_t_block_loop:.3f}s "
+                f"(other={_t_block_loop - _t_data_prep_total - _t_forward_total - _t_loss_total:.3f}s)",
+                flush=True,
+            )
+
         # Average loss across all blocks
         if num_blocks > 0:
             avg_loss = total_loss / num_blocks
@@ -1073,6 +1153,10 @@ class ParallelBlockPretrainer(pl.LightningModule):
                 flush=True,
             )
         
+        if _profile:
+            torch.cuda.synchronize(self.device)
+            self._t_training_step_end = time.perf_counter()
+
         return avg_loss
     
     def validation_step(self, batch, batch_idx):
@@ -1467,6 +1551,7 @@ def main(args, parser):
         allow_random_init=args.allow_random_init,
         compile_replacement=args.compile_replacement,
         resume_checkpoint_path=args.resume_checkpoint_path,
+        blocks_to_train=getattr(args, "blocks_to_train", None),
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
     )
@@ -1483,6 +1568,7 @@ def main(args, parser):
         monitor='train/loss',
         mode='min',
         save_last=True,
+        enable_version_counter=False,
     )
     callbacks.append(checkpoint_callback)
     
@@ -1702,6 +1788,13 @@ if __name__ == '__main__':
         default=False,
         help="If set, initialize missing replacement blocks randomly instead of skipping them.",
     )
+    parser.add_argument(
+        "--blocks_to_train",
+        type=int,
+        nargs="+",
+        default=None,
+        help="If set, only load and train these block indices (e.g. --blocks_to_train 47). Default: all 0-47.",
+    )
     
     # Training arguments
     parser.add_argument('--batch_size', type=int, default=1,
@@ -1801,19 +1894,14 @@ if __name__ == '__main__':
     if missing_args:
         parser.error(f"The following arguments are required: {', '.join('--' + arg for arg in missing_args)}")
 
-    # Resolve resume checkpoint path with highest priority:
-    # 1) explicit --resume_from_checkpoint
-    # 2) output_dir/checkpoints/last.ckpt (unless --no_resume)
-    # 3) newest .ckpt in output_dir/checkpoints/ (fallback if last.ckpt missing)
+    # Resolve resume checkpoint path with priority:
+    # 1) newest .ckpt in output_dir/checkpoints/ by mtime (avoids loading stale last.ckpt when
+    #    Lightning creates last-v1.ckpt, last-v2.ckpt via enable_version_counter)
+    # 2) explicit --resume_from_checkpoint — initial weights for first run only
     args.resume_checkpoint_path = None
-    if args.resume_from_checkpoint is not None:
-        args.resume_checkpoint_path = args.resume_from_checkpoint
-    elif not args.no_resume:
+    if not args.no_resume:
         ckpt_dir = Path(args.output_dir) / "checkpoints"
-        last_ckpt = ckpt_dir / "last.ckpt"
-        if last_ckpt.exists():
-            args.resume_checkpoint_path = str(last_ckpt)
-        elif ckpt_dir.exists():
+        if ckpt_dir.exists():
             ckpt_files = sorted(
                 [p for p in ckpt_dir.glob("*.ckpt") if p.is_file()],
                 key=lambda p: p.stat().st_mtime,
@@ -1821,6 +1909,8 @@ if __name__ == '__main__':
             )
             if len(ckpt_files) > 0:
                 args.resume_checkpoint_path = str(ckpt_files[0])
+    if args.resume_checkpoint_path is None and args.resume_from_checkpoint is not None:
+        args.resume_checkpoint_path = args.resume_from_checkpoint
     if args.resume_checkpoint_path is not None:
         print(f"Will resume from checkpoint: {args.resume_checkpoint_path}", flush=True)
     
