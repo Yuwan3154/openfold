@@ -1,5 +1,6 @@
 # Copyright 2021 AlQuraishi Laboratory
 # Copyright 2021 DeepMind Technologies Limited
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 import math
 import sys
 import torch
@@ -19,6 +21,7 @@ import torch.nn as nn
 from typing import Tuple, Sequence, Optional, Dict, Any
 from functools import partial
 from abc import ABC, abstractmethod
+from torch.fx._symbolic_trace import is_fx_tracing
 
 from openfold.model.primitives import Linear, LayerNorm
 from openfold.model.dropout import DropoutRowwise, DropoutColumnwise
@@ -179,6 +182,8 @@ class PairStack(nn.Module):
         pair_mask: torch.Tensor,
         chunk_size: Optional[int] = None,
         use_deepspeed_evo_attention: bool = False,
+        use_cuequivariance_attention: bool = False,
+        use_cuequivariance_multiplicative_update: bool = False,
         use_lma: bool = False,
         inplace_safe: bool = False,
         _mask_trans: bool = True,
@@ -197,6 +202,7 @@ class PairStack(nn.Module):
             mask=pair_mask,
             inplace_safe=inplace_safe,
             _add_with_inplace=True,
+            use_cuequivariance_multiplicative_update=use_cuequivariance_multiplicative_update
         )
         if (not inplace_safe):
             z = z + self.ps_dropout_row_layer(tmu_update)
@@ -210,6 +216,7 @@ class PairStack(nn.Module):
             mask=pair_mask,
             inplace_safe=inplace_safe,
             _add_with_inplace=True,
+            use_cuequivariance_multiplicative_update=use_cuequivariance_multiplicative_update
         )
         if (not inplace_safe):
             z = z + self.ps_dropout_row_layer(tmu_update)
@@ -226,6 +233,7 @@ class PairStack(nn.Module):
                         chunk_size=_attn_chunk_size,
                         use_memory_efficient_kernel=False,
                         use_deepspeed_evo_attention=use_deepspeed_evo_attention,
+                        use_cuequivariance_attention=use_cuequivariance_attention,
                         use_lma=use_lma,
                         inplace_safe=inplace_safe,
                     )
@@ -245,6 +253,7 @@ class PairStack(nn.Module):
                         chunk_size=_attn_chunk_size,
                         use_memory_efficient_kernel=False,
                         use_deepspeed_evo_attention=use_deepspeed_evo_attention,
+                        use_cuequivariance_attention=use_cuequivariance_attention,
                         use_lma=use_lma,
                         inplace_safe=inplace_safe,
                     )
@@ -446,6 +455,7 @@ class MSABlock(nn.Module, ABC):
         pair_mask: torch.Tensor,
         chunk_size: Optional[int] = None,
         use_deepspeed_evo_attention: bool = False,
+        use_cuequivariance_attention: bool = False,
         use_lma: bool = False,
         use_flash: bool = False,
         inplace_safe: bool = False,
@@ -510,6 +520,8 @@ class EvoformerBlock(MSABlock):
         pair_mask: torch.Tensor,
         chunk_size: Optional[int] = None,
         use_deepspeed_evo_attention: bool = False,
+        use_cuequivariance_attention: bool = False,
+        use_cuequivariance_multiplicative_update: bool = False,
         use_lma: bool = False,
         use_flash: bool = False,
         inplace_safe: bool = False,
@@ -550,6 +562,7 @@ class EvoformerBlock(MSABlock):
                         chunk_size=_attn_chunk_size,
                         use_memory_efficient_kernel=False,
                         use_deepspeed_evo_attention=use_deepspeed_evo_attention,
+                        use_cuequivariance_attention=use_cuequivariance_attention,
                         use_lma=use_lma,
                     )
                 ),
@@ -572,6 +585,7 @@ class EvoformerBlock(MSABlock):
                         mask=msa_mask,
                         chunk_size=chunk_size,
                         use_deepspeed_evo_attention=use_deepspeed_evo_attention,
+                        use_cuequivariance_attention=use_cuequivariance_attention,
                         use_lma=use_lma,
                         use_flash=use_flash,
                     ),
@@ -617,6 +631,8 @@ class EvoformerBlock(MSABlock):
             pair_mask=pair_mask,
             chunk_size=chunk_size,
             use_deepspeed_evo_attention=use_deepspeed_evo_attention,
+            use_cuequivariance_attention=use_cuequivariance_attention,
+            use_cuequivariance_multiplicative_update=use_cuequivariance_multiplicative_update,
             use_lma=use_lma,
             inplace_safe=inplace_safe,
             _mask_trans=_mask_trans,
@@ -753,6 +769,8 @@ class ExtraMSABlock(MSABlock):
         pair_mask: torch.Tensor,
         chunk_size: Optional[int] = None,
         use_deepspeed_evo_attention: bool = False,
+        use_cuequivariance_attention: bool = False,
+        use_cuequivariance_multiplicative_update: bool = False,
         use_lma: bool = False,
         inplace_safe: bool = False,
         _mask_trans: bool = True,
@@ -761,8 +779,8 @@ class ExtraMSABlock(MSABlock):
         _offloadable_inputs: Optional[Sequence[torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if(_attn_chunk_size is None):
-            _attn_chunk_size = chunk_size
-       
+            _attn_chunk_size = chunk_size        
+
         if(_offload_inference and inplace_safe):
             input_tensors = _offloadable_inputs
             del _offloadable_inputs
@@ -789,7 +807,8 @@ class ExtraMSABlock(MSABlock):
                     chunk_size=_attn_chunk_size,
                     use_lma=use_lma,
                     use_deepspeed_evo_attention=use_deepspeed_evo_attention,
-                    use_memory_efficient_kernel=not (use_lma or use_deepspeed_evo_attention),
+                    use_cuequivariance_attention=use_cuequivariance_attention,
+                    use_memory_efficient_kernel=not (use_lma or use_deepspeed_evo_attention or use_cuequivariance_attention),
                     _checkpoint_chunks=
                         self.ckpt if torch.is_grad_enabled() else False,
                 )
@@ -862,6 +881,8 @@ class ExtraMSABlock(MSABlock):
                 pair_mask=pair_mask,
                 chunk_size=chunk_size,
                 use_deepspeed_evo_attention=use_deepspeed_evo_attention,
+                use_cuequivariance_attention=use_cuequivariance_attention,
+                use_cuequivariance_multiplicative_update=use_cuequivariance_multiplicative_update,
                 use_lma=use_lma,
                 inplace_safe=inplace_safe,
                 _mask_trans=_mask_trans,
@@ -1000,13 +1021,15 @@ class EvoformerStack(nn.Module):
         self.tune_chunk_size = tune_chunk_size
         self.chunk_size_tuner = None
         if(tune_chunk_size):
-            self.chunk_size_tuner = ChunkSizeTuner()
+            self.chunk_size_tuner = ChunkSizeTuner(2048)
 
     def _prep_blocks(self, 
         m: torch.Tensor, 
         z: torch.Tensor, 
         chunk_size: int,
         use_deepspeed_evo_attention: bool,
+        use_cuequivariance_attention: bool,
+        use_cuequivariance_multiplicative_update: bool,
         use_lma: bool,
         use_flash: bool,
         msa_mask: Optional[torch.Tensor],
@@ -1021,6 +1044,8 @@ class EvoformerStack(nn.Module):
                 pair_mask=pair_mask,
                 chunk_size=chunk_size,
                 use_deepspeed_evo_attention=use_deepspeed_evo_attention,
+                use_cuequivariance_attention=use_cuequivariance_attention,
+                use_cuequivariance_multiplicative_update=use_cuequivariance_multiplicative_update,
                 use_lma=use_lma,
                 use_flash=use_flash,
                 inplace_safe=inplace_safe,
@@ -1044,12 +1069,13 @@ class EvoformerStack(nn.Module):
                 args=(m.clone(), z.clone(),),
                 min_chunk_size=chunk_size,
             )
+            # A temporary measure to address torch's occasional
+            # inability to allocate large tensors
+            attn_chunk = tuned_chunk_size if use_cuequivariance_attention else (tuned_chunk_size // 4)
             blocks = [
                 partial(b, 
                     chunk_size=tuned_chunk_size,
-                    # A temporary measure to address torch's occasional
-                    # inability to allocate large tensors
-                    _attn_chunk_size=max(chunk_size, tuned_chunk_size // 4),
+                    _attn_chunk_size=max(chunk_size, attn_chunk),
                 ) for b in blocks
             ]
 
@@ -1061,6 +1087,8 @@ class EvoformerStack(nn.Module):
         pair_mask: torch.Tensor,
         chunk_size: int,
         use_deepspeed_evo_attention: bool = False,
+        use_cuequivariance_attention: bool = False,
+        use_cuequivariance_multiplicative_update: bool = False,
         use_lma: bool = False,
         use_flash: bool = False,
         _mask_trans: bool = True,
@@ -1073,6 +1101,8 @@ class EvoformerStack(nn.Module):
             z=input_tensors[1],
             chunk_size=chunk_size,
             use_deepspeed_evo_attention=use_deepspeed_evo_attention,
+            use_cuequivariance_attention=use_cuequivariance_attention,
+            use_cuequivariance_multiplicative_update=use_cuequivariance_multiplicative_update,
             use_lma=use_lma,
             use_flash=use_flash,
             msa_mask=msa_mask,
@@ -1105,8 +1135,10 @@ class EvoformerStack(nn.Module):
         pair_mask: torch.Tensor,
         outputs: Dict[str, Any],
         cycle_no: int,
-        chunk_size: int,
+        chunk_size: int = None,
         use_deepspeed_evo_attention: bool = False,
+        use_cuequivariance_attention: bool = False,
+        use_cuequivariance_multiplicative_update: bool = False,
         use_lma: bool = False,
         use_flash: bool = False,
         inplace_safe: bool = False,
@@ -1141,12 +1173,19 @@ class EvoformerStack(nn.Module):
                 [*, N_res, N_res, C_z] pair embedding
             s:
                 [*, N_res, C_s] single embedding (or None if extra MSA stack)
-        """ 
+        """
+
+        if torch.onnx.is_in_onnx_export() or is_fx_tracing():
+            inplace_safe = False
+            chunk_size = None
+
         blocks = self._prep_blocks(
             m=m,
             z=z,
             chunk_size=chunk_size,
             use_deepspeed_evo_attention=use_deepspeed_evo_attention,
+            use_cuequivariance_attention=use_cuequivariance_attention,
+            use_cuequivariance_multiplicative_update=use_cuequivariance_multiplicative_update,
             use_lma=use_lma,
             use_flash=use_flash,
             msa_mask=msa_mask,
@@ -1231,13 +1270,15 @@ class ExtraMSAStack(nn.Module):
         self.tune_chunk_size = tune_chunk_size
         self.chunk_size_tuner = None
         if(tune_chunk_size):
-            self.chunk_size_tuner = ChunkSizeTuner()
+            self.chunk_size_tuner = ChunkSizeTuner(2048)
 
     def _prep_blocks(self, 
         m: torch.Tensor, 
         z: torch.Tensor, 
         chunk_size: int,
         use_deepspeed_evo_attention: bool,
+        use_cuequivariance_attention: bool,
+        use_cuequivariance_multiplicative_update: bool,
         use_lma: bool,
         msa_mask: Optional[torch.Tensor],
         pair_mask: Optional[torch.Tensor],
@@ -1251,6 +1292,8 @@ class ExtraMSAStack(nn.Module):
                 pair_mask=pair_mask, 
                 chunk_size=chunk_size,
                 use_deepspeed_evo_attention=use_deepspeed_evo_attention,
+                use_cuequivariance_attention=use_cuequivariance_attention,
+                use_cuequivariance_multiplicative_update=use_cuequivariance_multiplicative_update,
                 use_lma=use_lma,
                 inplace_safe=inplace_safe,
                 _mask_trans=_mask_trans,
@@ -1273,12 +1316,15 @@ class ExtraMSAStack(nn.Module):
                 args=(m.clone(), z.clone(),),
                 min_chunk_size=chunk_size,
             )
+
+            # A temporary measure to address torch's occasional
+            # inability to allocate large tensors
+            attn_chunk = tuned_chunk_size if use_cuequivariance_attention else (tuned_chunk_size // 4)
+
             blocks = [
                 partial(b, 
                     chunk_size=tuned_chunk_size,
-                    # A temporary measure to address torch's occasional
-                    # inability to allocate large tensors
-                    _attn_chunk_size=max(chunk_size, tuned_chunk_size // 4),
+                    _attn_chunk_size=max(chunk_size, attn_chunk),
                 ) for b in blocks
             ]
 
@@ -1288,6 +1334,8 @@ class ExtraMSAStack(nn.Module):
         input_tensors: Sequence[torch.Tensor],
         chunk_size: int,
         use_deepspeed_evo_attention: bool = False,
+        use_cuequivariance_attention: bool = False,
+        use_cuequivariance_multiplicative_update: bool = False,
         use_lma: bool = False,
         msa_mask: Optional[torch.Tensor] = None,
         pair_mask: Optional[torch.Tensor] = None,
@@ -1301,6 +1349,8 @@ class ExtraMSAStack(nn.Module):
             z=input_tensors[1],
             chunk_size=chunk_size,
             use_deepspeed_evo_attention=use_deepspeed_evo_attention,
+            use_cuequivariance_attention=use_cuequivariance_attention,
+            use_cuequivariance_multiplicative_update=use_cuequivariance_multiplicative_update,
             use_lma=use_lma,
             msa_mask=msa_mask,
             pair_mask=pair_mask,
@@ -1326,8 +1376,10 @@ class ExtraMSAStack(nn.Module):
         z: torch.Tensor,
         msa_mask: Optional[torch.Tensor],
         pair_mask: Optional[torch.Tensor],
-        chunk_size: int,
+        chunk_size: int = None,
         use_deepspeed_evo_attention: bool = False,
+        use_cuequivariance_attention: bool = False,
+        use_cuequivariance_multiplicative_update: bool = False,
         use_lma: bool = False,
         inplace_safe: bool = False,
         _mask_trans: bool = True,
@@ -1348,12 +1400,19 @@ class ExtraMSAStack(nn.Module):
         Returns:
             [*, N_res, N_res, C_z] pair update
         """
+
+        if torch.onnx.is_in_onnx_export() or is_fx_tracing():
+            inplace_safe = False
+            chunk_size = None
+
         checkpoint_fn = get_checkpoint_fn()
         blocks = self._prep_blocks(
             m=m,
             z=z,
             chunk_size=chunk_size,
             use_deepspeed_evo_attention=use_deepspeed_evo_attention,
+            use_cuequivariance_attention=use_cuequivariance_attention,
+            use_cuequivariance_multiplicative_update=use_cuequivariance_multiplicative_update,
             use_lma=use_lma,
             msa_mask=msa_mask,
             pair_mask=pair_mask,

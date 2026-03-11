@@ -27,6 +27,9 @@ def skip_unless_ds4s_installed():
         "deepspeed.ops.deepspeed4science") is not None
     return unittest.skipUnless(ds4s_is_installed, "Requires DeepSpeed with version ≥ 0.10.4")
 
+def skip_unless_cueq_installed():
+    cueq_is_installed = importlib.util.find_spec("cuequivariance_torch") is not None
+    return unittest.skipUnless(cueq_is_installed, "Requires cuEquivariance")
 
 def skip_unless_flash_attn_installed():
     fa_is_installed = importlib.util.find_spec("flash_attn") is not None

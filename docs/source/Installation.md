@@ -56,6 +56,8 @@ Certain tests perform equivalence comparisons with the AlphaFold implementation.
 ### MPI
 To use OpenFold with MPI support, you will need to add the package [`mpi4py`](https://pypi.org/project/mpi4py/). This can be done with pip in your OpenFold environment, e.g. `$ pip install mpi4py`. 
 
+### cuEquivariance
+cuEquivariance can be installed from pip: `$ pip install cuequivariance_ops_torch_cu13 cuequivariance_torch` (on CUDA13) or `$ pip install cuequivariance_ops_torch_cu12 cuequivariance_torch` (on CUDA12) 
 
 ### Install OpenFold parameters without aws
 If you don't have access to `aws` on your system, you can use a different download source:

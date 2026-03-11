@@ -143,13 +143,37 @@ Some commonly used command line flags are here. A full list of flags can be view
 
 ### Advanced Options for Increasing Efficiency
 
-#### Speeding up inference 
+#### Turning on TF32 (TensorFloat-32) precision on compatible hardware
+
+When running on latest NVIDIA GPUs, starting from Ampere, you can enable TF32 precision to get about 1.3x performance boost. 
+TF32 uses 1 sign bit, 8 exponent bits (like FP32), and 10 mantissa (significand) bits (like FP16), packed into a 32-bit word.
+It was found generally safe to use OF2 with TF32 instead of full FP32. To enable it globally in Torch: 
+
+```
+torch.backends.cuda.matmul.allow_tf32 = True       # Enable TF32 for matrix multiplications
+torch.backends.cudnn.allow_tf32 = True             # Enable TF32 for convolutions
+``` 
+Make sure NVIDIA_TF32_OVERRIDE environment variable is either not defined or set to 1.
+
+#### Applying lower BF16 precision to EvoformerStack and ExtraMSAStack
+
+BF16 occupies 16 bits: 1 sign bit, 8 exponent bits (same as FP32), and 7 mantissa (fraction) bits. Its dynamic range is equivalent to FP32, but BF16 can only represent numbers with about three decimal digits of precision.
+It was found generally safe to apply BF16 precision cast to EvoformerStack and ExtraMSAStack. This allows to achieve ~1.5x speedup compared to TF32 inferenceof the whole model. 
+To apply BF16, use '--precision=bf16' argument. '--precision=fp16' is also supported, but not recommended due to numerical instability. 
+
+#### Speeding up inference with custom attention and multiplicative update kernels
 
 The **DeepSpeed DS4Sci_EvoformerAttention kernel** is a memory-efficient attention kernel developed as part of a collaboration between OpenFold and the DeepSpeed4Science initiative. 
 
 If your system supports deepseed, using deepspeed generally leads an inference speedup of 2 - 3x without significant additional memory use. You may specify this option by selecting the `--use_deepspeed_inference` argument. 
 
+OF2 supports the cuEquivariance [triangle_multiplicative_update](https://docs.nvidia.com/cuda/cuequivariance/api/generated/cuequivariance_torch.triangle_multiplicative_update.html) and [triangle_attention](https://docs.nvidia.com/cuda/cuequivariance/api/generated/cuequivariance_torch.triangle_attention.html) kernels which can speed up inference/training of the model 1.2 to 1.5 on top of DeepSpeed and even more for sequences with > 1000 residues. cuEquivariance attention actually uses much less memory than default or DeepSpeed attention. To enable, pass '--use_cuequivariance_attention' and  '--use_cuequivariance_multiplicative_update' arguments to run_pretrained_openfold.py.
+CUEquivariance does fall back to DeepSpeed on shapes it does not efficiently support, so enable both for best effect. 
+
 If DeepSpeed is unavailable for your system, you may also try using [FlashAttention](https://github.com/HazyResearch/flash-attention) by adding `globals.use_flash = True` to the `--experiment_config_json`. Note that FlashAttention appears to work best for sequences with < 1000 residues.
+
+####  Speeding up inference with TensorRT
+Alternatively (or together with cuEquivariance), you can try applying [TensorRT](https://developer.nvidia.com/tensorrt) to key modules. OF2 comes with built-in TensorRT lazy compilation support. It allows to build TensorRT engine for Evoformer on the first inference run and to reuse it on subsequent runs. To enable, pass '--trt_mode-run', '--trt_engine_dir', '--trt_max_sequence_len', '--trt_num_profiles' and '--trt_optimization_level' arguments to run_pretrained_openfold.py. 
 
 #### Large-scale batch inference 
 For large-scale batch inference, we offer an optional tracing mode, which massively improves runtimes at the cost of a lengthy model compilation process. To enable it, add `--trace_model` to the inference command.
