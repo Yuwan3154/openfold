@@ -556,7 +556,7 @@ def generate_translation_dict(model, version, is_multimer=False):
         "model_5_ptm",
     ]
 
-    if version not in no_templ and hasattr(model, "template_embedder"):
+    if version not in no_templ:
         tps_blocks = model.template_embedder.template_pair_stack.blocks
         tps_blocks_params = stacked(
             [TemplatePairBlockParams(b) for b in tps_blocks]
@@ -700,14 +700,14 @@ def convert_deprecated_v1_keys(state_dict):
     return converted_state_dict
 
 
-def import_openfold_weights_(model, state_dict, strict=True):
+def import_openfold_weights_(model, state_dict):
     """
     Import model weights. Several parts of the model were refactored in the process
     of adding support for Multimer. The state dicts of older models are translated
     to match the refactored model code.
     """
     try:
-        model.load_state_dict(state_dict, strict=True)
+        model.load_state_dict(state_dict)
     except RuntimeError:
         converted_state_dict = convert_deprecated_v1_keys(state_dict)
-        model.load_state_dict(converted_state_dict, strict=strict)
+        model.load_state_dict(converted_state_dict)

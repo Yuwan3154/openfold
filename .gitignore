@@ -4,9 +4,14 @@ __pycache__/
 *.egg-info
 build
 dist
+*.so
+.ipynb_checkpoints/
+.env
 
 # files from script downloads
-data
+data/
 openfold/resources/
 tests/test_data/
 cutlass/
+notebooks/prediction*
+notebooks/*.fasta

@@ -16,7 +16,7 @@ import math
 import sys
 import torch
 import torch.nn as nn
-from typing import Tuple, Sequence, Optional
+from typing import Tuple, Sequence, Optional, Dict, Any
 from functools import partial
 from abc import ABC, abstractmethod
 
@@ -263,6 +263,89 @@ class PairStack(nn.Module):
                 inplace=inplace_safe,
         )
 
+        return z
+
+    def forward_triangle_ops(self,
+        z: torch.Tensor,
+        pair_mask: torch.Tensor,
+        chunk_size: Optional[int] = None,
+        use_deepspeed_evo_attention: bool = False,
+        use_lma: bool = False,
+        inplace_safe: bool = False,
+        _attn_chunk_size: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Run only the 4 triangle operations (no pair_transition)."""
+        if _attn_chunk_size is None:
+            _attn_chunk_size = chunk_size
+
+        tmu_update = self.tri_mul_out(
+            z, mask=pair_mask, inplace_safe=inplace_safe, _add_with_inplace=True,
+        )
+        if not inplace_safe:
+            z = z + self.ps_dropout_row_layer(tmu_update)
+        else:
+            z = tmu_update
+        del tmu_update
+
+        tmu_update = self.tri_mul_in(
+            z, mask=pair_mask, inplace_safe=inplace_safe, _add_with_inplace=True,
+        )
+        if not inplace_safe:
+            z = z + self.ps_dropout_row_layer(tmu_update)
+        else:
+            z = tmu_update
+        del tmu_update
+
+        z = add(z,
+                self.ps_dropout_row_layer(
+                    self.tri_att_start(
+                        z, mask=pair_mask, chunk_size=_attn_chunk_size,
+                        use_memory_efficient_kernel=False,
+                        use_deepspeed_evo_attention=use_deepspeed_evo_attention,
+                        use_lma=use_lma, inplace_safe=inplace_safe,
+                    )
+                ),
+                inplace=inplace_safe,
+                )
+
+        z = z.transpose(-2, -3)
+        if inplace_safe:
+            z = z.contiguous()
+
+        z = add(z,
+                self.ps_dropout_row_layer(
+                    self.tri_att_end(
+                        z, mask=pair_mask.transpose(-1, -2),
+                        chunk_size=_attn_chunk_size,
+                        use_memory_efficient_kernel=False,
+                        use_deepspeed_evo_attention=use_deepspeed_evo_attention,
+                        use_lma=use_lma, inplace_safe=inplace_safe,
+                    )
+                ),
+                inplace=inplace_safe,
+                )
+
+        z = z.transpose(-2, -3)
+        if inplace_safe:
+            z = z.contiguous()
+
+        return z
+
+    def forward_pair_transition(self,
+        z: torch.Tensor,
+        pair_mask: Optional[torch.Tensor] = None,
+        _mask_trans: bool = True,
+        chunk_size: Optional[int] = None,
+        inplace_safe: bool = False,
+    ) -> torch.Tensor:
+        """Run only pair_transition."""
+        pair_trans_mask = pair_mask if _mask_trans else None
+        z = add(z,
+                self.pair_transition(
+                    z, mask=pair_trans_mask, chunk_size=chunk_size,
+                ),
+                inplace=inplace_safe,
+        )
         return z
 
 
@@ -548,6 +631,66 @@ class EvoformerBlock(MSABlock):
             m, _ = input_tensors
         else:
             m = input_tensors[0]
+
+        return m, z
+
+    def forward_msa_opm(self,
+        m: torch.Tensor,
+        z: torch.Tensor,
+        msa_mask: torch.Tensor,
+        pair_mask: torch.Tensor,
+        chunk_size: Optional[int] = None,
+        use_deepspeed_evo_attention: bool = False,
+        use_lma: bool = False,
+        use_flash: bool = False,
+        inplace_safe: bool = False,
+        _mask_trans: bool = True,
+        _attn_chunk_size: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Run MSA attention + OPM only (everything before PairStack)."""
+        msa_trans_mask = msa_mask if _mask_trans else None
+        if _attn_chunk_size is None:
+            _attn_chunk_size = chunk_size
+
+        if self.opm_first:
+            m, z = self._compute_opm(
+                input_tensors=[m, z], msa_mask=msa_mask,
+                chunk_size=chunk_size, inplace_safe=inplace_safe)
+
+        m = add(m,
+                self.msa_dropout_layer(
+                    self.msa_att_row(
+                        m, z=z, mask=msa_mask, chunk_size=_attn_chunk_size,
+                        use_memory_efficient_kernel=False,
+                        use_deepspeed_evo_attention=use_deepspeed_evo_attention,
+                        use_lma=use_lma,
+                    )
+                ),
+                inplace=inplace_safe,
+                )
+
+        if not self.no_column_attention:
+            m = add(m,
+                    self.msa_att_col(
+                        m, mask=msa_mask, chunk_size=chunk_size,
+                        use_deepspeed_evo_attention=use_deepspeed_evo_attention,
+                        use_lma=use_lma, use_flash=use_flash,
+                    ),
+                    inplace=inplace_safe,
+                    )
+
+        m = add(
+            m,
+            self.msa_transition(
+                m, mask=msa_trans_mask, chunk_size=chunk_size,
+            ),
+            inplace=inplace_safe,
+        )
+
+        if not self.opm_first:
+            m, z = self._compute_opm(
+                input_tensors=[m, z], msa_mask=msa_mask,
+                chunk_size=chunk_size, inplace_safe=inplace_safe)
 
         return m, z
 
@@ -960,6 +1103,8 @@ class EvoformerStack(nn.Module):
         z: torch.Tensor,
         msa_mask: torch.Tensor,
         pair_mask: torch.Tensor,
+        outputs: Dict[str, Any],
+        cycle_no: int,
         chunk_size: int,
         use_deepspeed_evo_attention: bool = False,
         use_lma: bool = False,
@@ -1013,11 +1158,17 @@ class EvoformerStack(nn.Module):
         blocks_per_ckpt = self.blocks_per_ckpt
         if(not torch.is_grad_enabled()):
             blocks_per_ckpt = None
+
+        # Store evoformer input so block 0's input can be recovered
+        if outputs is not None:
+            outputs[f"recycle_{cycle_no}_evoformer_input"] = (m, z)
         
         m, z = checkpoint_blocks(
             blocks,
             args=(m, z),
             blocks_per_ckpt=blocks_per_ckpt,
+            outputs=outputs,
+            cycle_no=cycle_no,
         )
 
         s = self.linear(m[..., 0, :, :])

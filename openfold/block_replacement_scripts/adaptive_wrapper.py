@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""
+Adaptive training wrapper that modifies OpenFold models for adaptive weighting.
+
+This module provides functions to modify an existing OpenFold model to support
+adaptive weighting between original and replacement Evoformer blocks.
+"""
+
+import torch
+import torch.nn as nn
+from pathlib import Path
+from typing import Dict, Optional, Tuple
+import json
+import sys
+
+# Add openfold to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# Import adaptive evoformer blocks
+from openfold.block_replacement_scripts.adaptive_evoformer_blocks import (
+    replace_evoformer_blocks_with_adaptive,
+    AdaptiveWeightPredictor
+)
+
+
+def setup_adaptive_training_model(
+    model: nn.Module,
+    config_path: Path,
+    model_config: dict,
+) -> Tuple[nn.Module, Dict[str, any]]:
+    """
+    Modify an OpenFold model for adaptive training.
+    
+    Args:
+        model: The OpenFold model to modify
+        config_path: Path to adaptive training configuration
+        model_config: Model configuration dictionary
+        
+    Returns:
+        model: Modified model with adaptive blocks
+        training_info: Dictionary with training information
+    """
+    # Load adaptive config
+    with open(config_path, 'r') as f:
+        adaptive_config = json.load(f)
+    
+    # Note: We can't access trainer.is_global_zero here, so these prints will happen on all ranks
+    # They will be filtered in the wrapper's _setup_adaptive_training method
+    
+    # Get model dimensions
+    c_m = model_config.model.evoformer_stack.c_m
+    c_z = model_config.model.evoformer_stack.c_z
+    
+    # Replace Evoformer blocks with adaptive versions
+    model, weight_predictors = replace_evoformer_blocks_with_adaptive(
+        model=model,
+        trained_models_dir=Path(adaptive_config['trained_models_dir']),
+        linear_type=adaptive_config['linear_type'],
+        c_m=c_m,
+        c_z=c_z,
+        hidden_dim=None,  # Use default based on linear type
+        replace_blocks=None,  # Replace all available blocks
+    )
+    
+    # Create training info
+    training_info = {
+        'weight_predictors': weight_predictors,
+        'replace_loss_scaler': adaptive_config['replace_loss_scaler'],
+        'linear_type': adaptive_config['linear_type'],
+        'num_adaptive_blocks': len(weight_predictors),
+        'log_structure_every_k_epoch': adaptive_config.get('log_structure_every_k_epoch', 1),
+        'disable_per_block_logging': adaptive_config.get('disable_per_block_logging', False),
+    }
+    
+    # Print is handled in wrapper
+    return model, training_info
+
+
+def compute_adaptive_replace_loss(
+    model: torch.nn.Module,
+    replace_loss_scaler: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Compute replace loss that penalizes mean of adaptive weights.
+    
+    This function collects the actual predicted weights from the adaptive blocks
+    during the forward pass, rather than using dummy inputs.
+    
+    Args:
+        model: The model containing adaptive blocks with predicted weights
+        replace_loss_scaler: Scaling factor for replace loss
+        device: Device to create tensors on
+        
+    Returns:
+        Replace loss value
+    """
+    # Collect all predicted weights from adaptive blocks
+    all_weights = []
+
+    # Find all AdaptiveEvoformerBlock instances and get their predicted weights
+    for name, module in model.named_modules():
+        # Check if this module has stored predicted weights from forward pass
+        if hasattr(module, '_predicted_weights') and module._predicted_weights:
+            for block_idx, weight in module._predicted_weights.items():
+                # Flatten weight to scalar (take mean if batch dimension exists)
+                weight_scalar = weight.mean()
+                all_weights.append(weight_scalar)
+
+    if not all_weights:
+        return torch.tensor(0.0, device=device, requires_grad=True)
+    
+    # Compute mean weight across all blocks
+    mean_weight = torch.stack(all_weights).mean()
+    
+    # Penalize high weights (encourage use of replacement blocks)
+    # weight=0 means full replacement, weight=1 means full original evoformer
+    # So we want to penalize high mean_weight values
+    replace_loss = mean_weight
+    
+    return replace_loss * replace_loss_scaler
+
+
+def compute_block_match_loss(
+    model: torch.nn.Module,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Compute per-block matching loss between original and replacement block outputs.
+    
+    This encourages the replacement block to match the original block's output,
+    making learning easier by providing direct supervision at each block.
+    
+    Args:
+        model: The model containing adaptive blocks with stored outputs
+        device: Device to create tensors on
+        
+    Returns:
+        Sum of MSE losses across all blocks (for both m and z)
+    """
+    total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+    num_blocks = 0
+
+    # Find all AdaptiveEvoformerBlock instances and get their stored outputs
+    for name, module in model.named_modules():
+        if hasattr(module, '_block_outputs') and module._block_outputs:
+            for block_idx, outputs in module._block_outputs.items():
+                original_m = outputs['original_m']
+                original_z = outputs['original_z']
+                replacement_m = outputs['replacement_m']
+                replacement_z = outputs['replacement_z']
+                
+                # Compute MSE loss for MSA representation (m)
+                loss_m = torch.nn.functional.mse_loss(replacement_m, original_m)
+                
+                # Compute MSE loss for pair representation (z)
+                loss_z = torch.nn.functional.mse_loss(replacement_z, original_z)
+                
+                # Add both losses
+                total_loss = total_loss + loss_m + loss_z
+                num_blocks += 1
+
+    return total_loss
+
+
+def freeze_model_except_adaptive_components(model: nn.Module) -> int:
+    """
+    Freeze all model parameters except adaptive weight predictors and replacement blocks.
+
+    Args:
+        model: The model to freeze
+
+    Returns:
+        Number of trainable parameters
+    """
+    # First, freeze everything
+    for param in model.parameters():
+        param.requires_grad = False
+
+    # Then unfreeze adaptive components (weight predictors and replacement blocks)
+    trainable_params = 0
+
+    for name, module in model.named_modules():
+        if isinstance(module, AdaptiveWeightPredictor):
+            # Unfreeze weight predictors
+            for param in module.parameters():
+                param.requires_grad = True
+                trainable_params += param.numel()
+        elif hasattr(module, 'replacement_block'):
+            # Unfreeze replacement blocks
+            for param in module.replacement_block.parameters():
+                param.requires_grad = True
+                trainable_params += param.numel()
+
+    return trainable_params

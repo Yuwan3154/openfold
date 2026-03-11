@@ -299,7 +299,10 @@ def make_sequence_features_with_custom_template(
         mmcif_path: str,
         pdb_id: str,
         chain_id: str,
-        kalign_binary_path: str) -> FeatureDict:
+        kalign_binary_path: str,
+        rm_template_sequence: bool = False,
+        skip_alignment: bool = False,
+) -> FeatureDict:
     """
     process a single fasta file using features derived from a single template rather than an alignment
     """
@@ -313,7 +316,11 @@ def make_sequence_features_with_custom_template(
 
     msa_data = [sequence]
     deletion_matrix = [[0 for _ in sequence]]
-    msa_data_obj = parsers.Msa(sequences=msa_data, deletion_matrix=deletion_matrix, descriptions=None)
+    msa_data_obj = parsers.Msa(
+        sequences=msa_data,
+        deletion_matrix=deletion_matrix,
+        descriptions=[pdb_id],
+    )
 
     msa_features = make_msa_features([msa_data_obj])
     template_features = get_custom_template_features(
@@ -321,13 +328,98 @@ def make_sequence_features_with_custom_template(
         query_sequence=sequence,
         pdb_id=pdb_id,
         chain_id=chain_id,
-        kalign_binary_path=kalign_binary_path
+        kalign_binary_path=kalign_binary_path,
+        rm_template_sequence=rm_template_sequence,
+        skip_alignment=skip_alignment,
     )
 
     return {
         **sequence_features,
         **msa_features,
         **template_features.features
+    }
+
+
+def make_sequence_features_with_distogram_template(
+    sequence: str,
+    distogram_probs: np.ndarray,
+    mask: np.ndarray,
+    *,
+    pdb_id: str = "distogram_template",
+    rm_template_sequence: bool = False,
+) -> FeatureDict:
+    """
+    Build an AlphaFold/OpenFold feature dict using a single \"distogram-only\" template.
+
+    This template contains:
+    - template aatype (from sequence)
+    - template pseudo-beta mask (from mask)
+    - template distogram probabilities (provided)
+    - placeholder zeros for coordinate-derived template fields
+
+    Args:
+        sequence: Query sequence, length L
+        distogram_probs: [L, L, no_bins] float32, probabilities over distance bins
+        mask: [L] float32/bool, residue mask (1 valid, 0 padded)
+        pdb_id: Description/domain name placeholder
+
+    Returns:
+        Feature dict compatible with OpenFold feature pipeline.
+    """
+    num_res = len(sequence)
+    if distogram_probs.shape[0] != num_res or distogram_probs.shape[1] != num_res:
+        raise ValueError(
+            f"distogram_probs must be [L,L,B]; got {distogram_probs.shape} for L={num_res}"
+        )
+    if mask.shape[0] != num_res:
+        raise ValueError(f"mask must be [L]; got {mask.shape} for L={num_res}")
+
+    sequence_features = make_sequence_features(
+        sequence=sequence,
+        description=pdb_id,
+        num_res=num_res,
+    )
+    msa_features = make_dummy_msa_feats(sequence)
+
+    # Template fields (single template axis)
+    no_bins = distogram_probs.shape[-1]
+    template_seq = ("X" * num_res) if rm_template_sequence else sequence
+    template_aatype_one_hot = residue_constants.sequence_to_onehot(
+        sequence=template_seq,
+        mapping=residue_constants.restype_order_with_x,
+        map_unknown_to_x=True,
+    ).astype(np.float32)  # [L, 21] (with X)
+
+    # Convert to HHblits aatype space with gap+X, matching empty_template_feats shape
+    # We simply place into restypes_with_x_and_gap onehot by mapping residue_constants.
+    # residue_constants.sequence_to_onehot with restype_order_with_x already returns 21,
+    # but templates expect len(restypes_with_x_and_gap) (=22) including '-'.
+    template_aatype = np.zeros((1, num_res, len(residue_constants.restypes_with_x_and_gap)), dtype=np.float32)
+    template_aatype[..., : template_aatype_one_hot.shape[-1]] = template_aatype_one_hot[None, ...]
+
+    mask_f = mask.astype(np.float32)
+    template_pseudo_beta_mask = mask_f[None, ...]  # [1, L]
+    template_pseudo_beta = np.zeros((1, num_res, 3), dtype=np.float32)
+    template_all_atom_positions = np.zeros((1, num_res, residue_constants.atom_type_num, 3), dtype=np.float32)
+    template_all_atom_mask = np.ones((1, num_res, residue_constants.atom_type_num), dtype=np.float32)
+    template_dgram_probs = distogram_probs.astype(np.float32)[None, ...]  # [1, L, L, B]
+
+    template_features = {
+        "template_aatype": template_aatype,
+        "template_all_atom_mask": template_all_atom_mask,
+        "template_all_atom_positions": template_all_atom_positions,
+        "template_pseudo_beta_mask": template_pseudo_beta_mask,
+        "template_pseudo_beta": template_pseudo_beta,
+        "template_dgram_probs": template_dgram_probs,
+        "template_domain_names": np.array([pdb_id.encode("utf-8")], dtype=object),
+        "template_sequence": np.array([template_seq.encode("utf-8")], dtype=object),
+        "template_sum_probs": np.array([[1.0]], dtype=np.float32),
+    }
+
+    return {
+        **sequence_features,
+        **msa_features,
+        **template_features,
     }
 
 
@@ -744,6 +836,10 @@ class DataPipeline:
 
             fp.close()
         else:
+            # Handle case where alignment directory doesn't exist (e.g., single sequence mode)
+            if not os.path.exists(alignment_dir):
+                return msa_data  # Return empty dict
+                
             for f in os.listdir(alignment_dir):
                 path = os.path.join(alignment_dir, f)
                 filename, ext = os.path.splitext(f)
@@ -792,6 +888,10 @@ class DataPipeline:
 
             fp.close()
         else:
+            # Handle case where alignment directory doesn't exist (e.g., single sequence mode)
+            if not os.path.exists(alignment_dir):
+                return all_hits  # Return empty dict
+                
             for f in os.listdir(alignment_dir):
                 path = os.path.join(alignment_dir, f)
                 ext = os.path.splitext(f)[-1]
@@ -850,6 +950,11 @@ class DataPipeline:
         alignment_dir: str,
     ) -> Mapping[str, Any]:
         seqemb_features = {}
+        
+        # Handle case where alignment directory doesn't exist (e.g., single sequence mode)
+        if not os.path.exists(alignment_dir):
+            return seqemb_features  # Return empty dict
+            
         for f in os.listdir(alignment_dir):
             path = os.path.join(alignment_dir, f)
             ext = os.path.splitext(f)[-1]

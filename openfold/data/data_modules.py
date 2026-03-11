@@ -22,6 +22,18 @@ from openfold.utils.tensor_utils import (
     tensor_tree_map,
 )
 
+# Import enhanced data utilities for recursive search and chain lists
+try:
+    from block_replacement_scripts.enhanced_data_utils import (
+        EnhancedStructureFinder,
+        build_chain_ids_from_structures_and_list
+    )
+    ENHANCED_UTILS_AVAILABLE = True
+except ImportError:
+    ENHANCED_UTILS_AVAILABLE = False
+    import warnings
+    warnings.warn("Enhanced data utilities not available. Using standard data loading.")
+
 
 class OpenFoldSingleDataset(torch.utils.data.Dataset):
     def __init__(self,
@@ -42,6 +54,8 @@ class OpenFoldSingleDataset(torch.utils.data.Dataset):
                  alignment_index: Optional[Any] = None,
                  _output_raw: bool = False,
                  _structure_index: Optional[Any] = None,
+                 chain_list_path: Optional[str] = None,
+                 enable_recursive_search: bool = True,
                  ):
         """
             Args:
@@ -86,6 +100,8 @@ class OpenFoldSingleDataset(torch.utils.data.Dataset):
         """
         super(OpenFoldSingleDataset, self).__init__()
         self.data_dir = data_dir
+        self.chain_list_path = chain_list_path
+        self.enable_recursive_search = enable_recursive_search
 
         self.chain_data_cache = None
         if chain_data_cache_path is not None:
@@ -113,10 +129,27 @@ class OpenFoldSingleDataset(torch.utils.data.Dataset):
                 "scripts/generate_mmcif_cache.py before running OpenFold"
             )
 
-        if alignment_index is not None:
-            self._chain_ids = list(alignment_index.keys())
+        # Initialize enhanced structure finder if available
+        self.structure_finder = None
+        if ENHANCED_UTILS_AVAILABLE and enable_recursive_search:
+            self.structure_finder = EnhancedStructureFinder(
+                data_dir, self.supported_exts, chain_list_path
+            )
+
+        # Build chain IDs using enhanced logic
+        if ENHANCED_UTILS_AVAILABLE and enable_recursive_search:
+            if alignment_index is not None:
+                self._chain_ids = list(alignment_index.keys())
+            else:
+                self._chain_ids = build_chain_ids_from_structures_and_list(
+                    data_dir, self.supported_exts, chain_list_path, alignment_dir
+                )
         else:
-            self._chain_ids = list(os.listdir(alignment_dir))
+            # Fall back to original logic
+            if alignment_index is not None:
+                self._chain_ids = list(alignment_index.keys())
+            else:
+                self._chain_ids = list(os.listdir(alignment_dir))
 
         if filter_path is not None:
             with open(filter_path, "r") as f:
@@ -153,18 +186,21 @@ class OpenFoldSingleDataset(torch.utils.data.Dataset):
             chain: i for i, chain in enumerate(self._chain_ids)
         }
 
-        # If it's running template search for a monomer, then use hhsearch
-        # as demonstrated in AlphaFold's run_alphafold.py code
-        # https://github.com/deepmind/alphafold/blob/6c4d833fbd1c6b8e7c9a21dae5d4ada2ce777e10/run_alphafold.py#L462C1-L477
-        template_featurizer = templates.HhsearchHitFeaturizer(
-            mmcif_dir=template_mmcif_dir,
-            max_template_date=max_template_date,
-            max_hits=max_template_hits,
-            kalign_binary_path=kalign_binary_path,
-            release_dates_path=template_release_dates_cache_path,
-            obsolete_pdbs_path=obsolete_pdbs_file_path,
-            _shuffle_top_k_prefiltered=shuffle_top_k_prefiltered,
-        )
+        # Create template featurizer only if templates are enabled
+        template_featurizer = None
+        if config.common.use_templates:
+            # If it's running template search for a monomer, then use hhsearch
+            # as demonstrated in AlphaFold's run_alphafold.py code
+            # https://github.com/deepmind/alphafold/blob/6c4d833fbd1c6b8e7c9a21dae5d4ada2ce777e10/run_alphafold.py#L462C1-L477
+            template_featurizer = templates.HhsearchHitFeaturizer(
+                mmcif_dir=template_mmcif_dir,
+                max_template_date=max_template_date,
+                max_hits=max_template_hits,
+                kalign_binary_path=kalign_binary_path,
+                release_dates_path=template_release_dates_cache_path,
+                obsolete_pdbs_path=obsolete_pdbs_file_path,
+                _shuffle_top_k_prefiltered=shuffle_top_k_prefiltered,
+            )
 
         self.data_pipeline = data_pipeline.DataPipeline(
             template_featurizer=template_featurizer,
@@ -214,30 +250,38 @@ class OpenFoldSingleDataset(torch.utils.data.Dataset):
             alignment_index = self.alignment_index[name]
 
         if self.mode == 'train' or self.mode == 'eval':
-            spl = name.rsplit('_', 1)
-            if len(spl) == 2:
-                file_id, chain_id = spl
+            # Use enhanced structure finder if available
+            if self.structure_finder is not None:
+                try:
+                    path, file_id, chain_id, ext = self.structure_finder.find_structure_path(name)
+                except ValueError as e:
+                    raise ValueError(f"Could not find structure for {name}: {e}")
             else:
-                file_id, = spl
-                chain_id = None
+                # Fall back to original logic
+                spl = name.rsplit('_', 1)
+                if len(spl) == 2:
+                    file_id, chain_id = spl
+                else:
+                    file_id, = spl
+                    chain_id = None
 
-            path = os.path.join(self.data_dir, file_id)
-            if self._structure_index is not None:
-                structure_index_entry = self._structure_index[name]
-                assert (len(structure_index_entry["files"]) == 1)
-                filename, _, _ = structure_index_entry["files"][0]
-                ext = os.path.splitext(filename)[1]
-            else:
-                ext = None
-                for e in self.supported_exts:
-                    if os.path.exists(path + e):
-                        ext = e
-                        break
+                path = os.path.join(self.data_dir, file_id)
+                if self._structure_index is not None:
+                    structure_index_entry = self._structure_index[name]
+                    assert (len(structure_index_entry["files"]) == 1)
+                    filename, _, _ = structure_index_entry["files"][0]
+                    ext = os.path.splitext(filename)[1]
+                else:
+                    ext = None
+                    for e in self.supported_exts:
+                        if os.path.exists(path + e):
+                            ext = e
+                            break
 
-                if ext is None:
-                    raise ValueError("Invalid file type")
+                    if ext is None:
+                        raise ValueError("Invalid file type: " + path)
 
-            path += ext
+                path += ext
             if ext == ".cif":
                 data = self._parse_mmcif(
                     path, file_id, chain_id, alignment_dir, alignment_index,
@@ -618,15 +662,22 @@ class OpenFoldDataset(torch.utils.data.Dataset):
             for _ in range(max_cache_len):
                 candidate_idx = next(idx_iter)
                 chain_id = dataset.idx_to_chain_id(candidate_idx)
-                chain_data_cache_entry = chain_data_cache[chain_id]
-                if not self.deterministic_train_filter(chain_data_cache_entry):
-                    continue
+                
+                # Handle case where chain_data_cache is None (e.g., single sequence training)
+                if chain_data_cache is None:
+                    # Skip filtering when no cache is available
+                    weights.append([0., 1.])  # Always include (probability 1.0)
+                    idx.append(candidate_idx)
+                else:
+                    chain_data_cache_entry = chain_data_cache[chain_id]
+                    if not self.deterministic_train_filter(chain_data_cache_entry):
+                        continue
 
-                p = self.get_stochastic_train_filter_prob(
-                    chain_data_cache_entry,
-                )
-                weights.append([1. - p, p])
-                idx.append(candidate_idx)
+                    p = self.get_stochastic_train_filter_prob(
+                        chain_data_cache_entry,
+                    )
+                    weights.append([1. - p, p])
+                    idx.append(candidate_idx)
 
             samples = torch.multinomial(
                 torch.tensor(weights),
@@ -870,6 +921,10 @@ class OpenFoldDataModule(pl.LightningDataModule):
                  _distillation_structure_index_path: Optional[str] = None,
                  alignment_index_path: Optional[str] = None,
                  distillation_alignment_index_path: Optional[str] = None,
+                 train_chain_list_path: Optional[str] = None,
+                 distillation_chain_list_path: Optional[str] = None,
+                 val_chain_list_path: Optional[str] = None,
+                 enable_recursive_search: bool = True,
                  **kwargs
                  ):
         super(OpenFoldDataModule, self).__init__()
@@ -898,6 +953,10 @@ class OpenFoldDataModule(pl.LightningDataModule):
         self.obsolete_pdbs_file_path = obsolete_pdbs_file_path
         self.batch_seed = batch_seed
         self.train_epoch_len = train_epoch_len
+        self.train_chain_list_path = train_chain_list_path
+        self.distillation_chain_list_path = distillation_chain_list_path
+        self.val_chain_list_path = val_chain_list_path
+        self.enable_recursive_search = enable_recursive_search
 
         if self.train_data_dir is None and self.predict_data_dir is None:
             raise ValueError(
@@ -945,7 +1004,8 @@ class OpenFoldDataModule(pl.LightningDataModule):
                               config=self.config,
                               kalign_binary_path=self.kalign_binary_path,
                               template_release_dates_cache_path=self.template_release_dates_cache_path,
-                              obsolete_pdbs_file_path=self.obsolete_pdbs_file_path)
+                              obsolete_pdbs_file_path=self.obsolete_pdbs_file_path,
+                              enable_recursive_search=self.enable_recursive_search)
 
         if self.training_mode:
             train_dataset = dataset_gen(
@@ -958,6 +1018,7 @@ class OpenFoldDataModule(pl.LightningDataModule):
                 treat_pdb_as_distillation=False,
                 mode="train",
                 alignment_index=self.alignment_index,
+                chain_list_path=self.train_chain_list_path,
             )
 
             distillation_dataset = None
@@ -972,6 +1033,7 @@ class OpenFoldDataModule(pl.LightningDataModule):
                     mode="train",
                     alignment_index=self.distillation_alignment_index,
                     _structure_index=self._distillation_structure_index,
+                    chain_list_path=self.distillation_chain_list_path,
                 )
 
                 d_prob = self.config.train.distillation_prob
@@ -1004,6 +1066,7 @@ class OpenFoldDataModule(pl.LightningDataModule):
                     filter_path=None,
                     max_template_hits=self.config.eval.max_template_hits,
                     mode="eval",
+                    chain_list_path=self.val_chain_list_path,
                 )
             else:
                 self.eval_dataset = None

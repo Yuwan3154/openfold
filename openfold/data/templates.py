@@ -84,6 +84,9 @@ TEMPLATE_FEATURES = {
     "template_aatype": np.int64,
     "template_all_atom_mask": np.float32,
     "template_all_atom_positions": np.float32,
+    "template_pseudo_beta_mask": np.float32,
+    "template_pseudo_beta": np.float32,
+    "template_dgram_probs": np.float32,
     "template_domain_names": object,
     "template_sequence": object,
     "template_sum_probs": np.float32,
@@ -102,6 +105,9 @@ def empty_template_feats(n_res):
         "template_all_atom_positions": np.zeros(
             (0, n_res, residue_constants.atom_type_num, 3), np.float32
         ),
+        "template_pseudo_beta_mask": np.zeros((0, n_res), np.float32),
+        "template_pseudo_beta": np.zeros((0, n_res, 3), np.float32),
+        "template_dgram_probs": np.zeros((0, n_res, n_res, 39), np.float32),
         "template_domain_names": np.array([''.encode()], dtype=object),
         "template_sequence": np.array([''.encode()], dtype=object),
         "template_sum_probs": np.zeros((0, 1), dtype=np.float32),
@@ -554,6 +560,8 @@ def _extract_template_features(
     template_chain_id: str,
     kalign_binary_path: str,
     _zero_center_positions: bool = True,
+    rm_template_sequence: bool = False,
+    skip_alignment: bool = False,
 ) -> Tuple[Dict[str, Any], Optional[str]]:
     """Parses atom positions in the target structure and aligns with the query.
 
@@ -599,40 +607,56 @@ def _extract_template_features(
         )
 
     warning = None
-    try:
-        seqres, chain_id, mapping_offset = _find_template_in_pdb(
-            template_chain_id=template_chain_id,
-            template_sequence=template_sequence,
-            mmcif_object=mmcif_object,
-        )
-    except SequenceNotInTemplateError:
-        # If PDB70 contains a different version of the template, we use the sequence
-        # from the mmcif_object.
-        chain_id = template_chain_id
-        warning = (
-            f"The exact sequence {template_sequence} was not found in "
-            f"{pdb_id}_{chain_id}. Realigning the template to the actual sequence."
-        )
-        logging.warning(warning)
-        # This throws an exception if it fails to realign the hit.
-        seqres, mapping = _realign_pdb_template_to_query(
-            old_template_sequence=template_sequence,
-            template_chain_id=template_chain_id,
-            mmcif_object=mmcif_object,
-            old_mapping=mapping,
-            kalign_binary_path=kalign_binary_path,
-        )
-        logging.info(
-            "Sequence in %s_%s: %s successfully realigned to %s",
-            pdb_id,
-            chain_id,
-            template_sequence,
-            seqres,
-        )
-        # The template sequence changed.
-        template_sequence = seqres
-        # No mapping offset, the query is aligned to the actual sequence.
+    if skip_alignment:
+        # Template is pre-aligned (e.g. Chroma/OpenFold output). Use chain directly.
+        if template_chain_id in mmcif_object.chain_to_seqres:
+            chain_id = template_chain_id
+            seqres = mmcif_object.chain_to_seqres[chain_id]
+        elif len(mmcif_object.chain_to_seqres) == 1:
+            chain_id = list(mmcif_object.chain_to_seqres.keys())[0]
+            seqres = mmcif_object.chain_to_seqres[chain_id]
+        else:
+            raise NoChainsError(
+                "Chain %s not found in %s" % (template_chain_id, pdb_id)
+            )
         mapping_offset = 0
+    else:
+        try:
+            seqres, chain_id, mapping_offset = _find_template_in_pdb(
+                template_chain_id=template_chain_id,
+                template_sequence=template_sequence,
+                mmcif_object=mmcif_object,
+            )
+            if rm_template_sequence:
+                seqres = "-" * len(seqres)
+        except SequenceNotInTemplateError:
+            # If PDB70 contains a different version of the template, we use the sequence
+            # from the mmcif_object.
+            chain_id = template_chain_id
+            warning = (
+                f"The exact sequence {template_sequence} was not found in "
+                f"{pdb_id}_{chain_id}. Realigning the template to the actual sequence."
+            )
+            logging.warning(warning)
+            # This throws an exception if it fails to realign the hit.
+            seqres, mapping = _realign_pdb_template_to_query(
+                old_template_sequence=template_sequence,
+                template_chain_id=template_chain_id,
+                mmcif_object=mmcif_object,
+                old_mapping=mapping,
+                kalign_binary_path=kalign_binary_path,
+            )
+            logging.info(
+                "Sequence in %s_%s: %s successfully realigned to %s",
+                pdb_id,
+                chain_id,
+                template_sequence,
+                seqres,
+            )
+            # The template sequence changed.
+            template_sequence = seqres
+            # No mapping offset, the query is aligned to the actual sequence.
+            mapping_offset = 0
 
     try:
         # Essentially set to infinity - we don't want to reject templates unless
@@ -953,6 +977,8 @@ def get_custom_template_features(
     pdb_id: str,
     chain_id: Optional[str] = "A",
     kalign_binary_path: Optional[str] = None,
+    rm_template_sequence: bool = False,
+    skip_alignment: bool = False,
 ):
     if os.path.isfile(mmcif_path):
         template_paths = [Path(mmcif_path)]
@@ -974,17 +1000,24 @@ def get_custom_template_features(
         mmcif_parse_result = mmcif_parsing.parse(
             file_id=pdb_id, mmcif_string=cif_string
         )
-        # mapping skipping "-"
-        mapping = {
-            x: x for x, curr_char in enumerate(query_sequence) if curr_char.isalnum()
-        }
-        realigned_sequence, realigned_mapping = _realign_pdb_template_to_query(
-            old_template_sequence=query_sequence,
-            template_chain_id=chain_id,
-            mmcif_object=mmcif_parse_result.mmcif_object,
-            old_mapping=mapping,
-            kalign_binary_path=kalign_binary_path,
-        )
+        if skip_alignment:
+            # Template is same length as query (e.g. Chroma/OpenFold output).
+            # Use 1:1 mapping, no kalign.
+            num_res = len(query_sequence)
+            realigned_mapping = {i: i for i in range(num_res)}
+            realigned_sequence = ("X" * num_res) if rm_template_sequence else query_sequence
+        else:
+            # mapping skipping "-"
+            mapping = {
+                x: x for x, curr_char in enumerate(query_sequence) if curr_char.isalnum()
+            }
+            realigned_sequence, realigned_mapping = _realign_pdb_template_to_query(
+                old_template_sequence=query_sequence,
+                template_chain_id=chain_id,
+                mmcif_object=mmcif_parse_result.mmcif_object,
+                old_mapping=mapping,
+                kalign_binary_path=kalign_binary_path,
+            )
         curr_features, curr_warnings = _extract_template_features(
             mmcif_object=mmcif_parse_result.mmcif_object,
             pdb_id=pdb_id,
@@ -994,10 +1027,17 @@ def get_custom_template_features(
             template_chain_id=chain_id,
             kalign_binary_path=kalign_binary_path,
             _zero_center_positions=True,
+            rm_template_sequence=rm_template_sequence,
+            skip_alignment=skip_alignment,
         )
-        curr_features["template_sum_probs"] = [
-            1.0
-        ]  # template given by user, 100% confident
+        num_res = len(query_sequence)
+        if "template_pseudo_beta_mask" not in curr_features:
+            curr_features["template_pseudo_beta_mask"] = np.zeros((num_res,), dtype=np.float32)
+        if "template_pseudo_beta" not in curr_features:
+            curr_features["template_pseudo_beta"] = np.zeros((num_res, 3), dtype=np.float32)
+        if "template_dgram_probs" not in curr_features:
+            curr_features["template_dgram_probs"] = np.zeros((num_res, num_res, 39), dtype=np.float32)
+        curr_features["template_sum_probs"] = np.array([1.0], dtype=np.float32)
         template_features = {
             curr_name: template_features.get(curr_name, []) + [curr_item]
             for curr_name, curr_item in curr_features.items()
@@ -1212,6 +1252,7 @@ class CustomHitFeaturizer(TemplateHitFeaturizer):
         self,
         query_sequence: str,
         hits: Sequence[parsers.TemplateHit],
+        rm_template_sequence: bool = False,
     ) -> TemplateSearchResult:
         """Computes the templates for given query sequence (more details above)."""
         logging.info("Featurizing mmcif_dir: %s", self._mmcif_dir)
@@ -1221,7 +1262,10 @@ class CustomHitFeaturizer(TemplateHitFeaturizer):
             pdb_id="test",
             chain_id="A",
             kalign_binary_path=self._kalign_binary_path,
-        )   
+            rm_template_sequence=rm_template_sequence,
+        )
+
+
 class HmmsearchHitFeaturizer(TemplateHitFeaturizer):
     def get_templates(
         self,

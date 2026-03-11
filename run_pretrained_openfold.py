@@ -367,6 +367,23 @@ def main(args):
                     fp.write(protein.to_pdb(unrelaxed_protein))
 
             logger.info(f"Output written to {unrelaxed_output_path}...")
+            
+            scores = {}
+            if "ptm" in out:
+                scores["ptm"] = float(out["ptm"])
+            elif "ptm_score" in out:
+                scores["ptm"] = float(out["ptm_score"])
+            if "iptm" in out:
+                scores["iptm"] = float(out["iptm"])
+            if "plddt" in out:
+                scores["mean_plddt"] = float(np.mean(out["plddt"]))
+            scores["keys"] = sorted(list(out.keys()))
+            scores_path = os.path.join(
+                output_directory, f'{output_name}_scores.json'
+            )
+            with open(scores_path, "w") as fp:
+                json.dump(scores, fp)
+            logger.info(f"Scores written to {scores_path}...")
 
             if not args.skip_relaxation:
                 # Relax the prediction.

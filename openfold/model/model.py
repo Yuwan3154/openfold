@@ -206,10 +206,7 @@ class AlphaFold(nn.Module):
         diff = torch.sqrt(sq_diff + eps).item()
         return diff <= self.config.recycle_early_stop_tolerance
 
-    def iteration(self, feats, prevs, _recycle=True):
-        # Primary output dictionary
-        outputs = {}
-
+    def iteration(self, feats, prevs, cycle_no, _recycle=True, outputs={}, return_representations=False):
         # This needs to be done manually for DeepSpeed's sake
         dtype = next(self.parameters()).dtype
         for k in feats:
@@ -425,6 +422,8 @@ class AlphaFold(nn.Module):
                 z,
                 msa_mask=msa_mask.to(dtype=m.dtype),
                 pair_mask=pair_mask.to(dtype=z.dtype),
+                outputs=outputs,
+                cycle_no=cycle_no,
                 chunk_size=self.globals.chunk_size,
                 use_deepspeed_evo_attention=self.globals.use_deepspeed_evo_attention,
                 use_lma=self.globals.use_lma,
@@ -436,6 +435,16 @@ class AlphaFold(nn.Module):
         outputs["msa"] = m[..., :n_seq, :, :]
         outputs["pair"] = z
         outputs["single"] = s
+
+        # Early return for representation-only mode (skip structure module)
+        if return_representations:
+            # For representation mode, we don't need structure predictions
+            # Return dummy values for recycling (they won't be used with 0 recycles)
+            m_1_prev = None
+            z_prev = None
+            x_prev = None
+            early_stop = True  # Signal to stop recycling
+            return outputs, m_1_prev, z_prev, x_prev, early_stop
 
         del z
 
@@ -551,6 +560,11 @@ class AlphaFold(nn.Module):
         num_iters = batch["aatype"].shape[-1]
         early_stop = False
         num_recycles = 0
+        outputs = {}
+        
+        # Extract non-tensor metadata before recycling loop
+        return_representations = batch.pop("return_representations", False)
+        
         for cycle_no in range(num_iters):
             # Select the features for the current recycling cycle
             fetch_cur_batch = lambda t: t[..., cycle_no]
@@ -568,13 +582,15 @@ class AlphaFold(nn.Module):
                 outputs, m_1_prev, z_prev, x_prev, early_stop = self.iteration(
                     feats,
                     prevs,
-                    _recycle=(num_iters > 1)
+                    cycle_no=cycle_no,
+                    _recycle=(num_iters > 1),
+                    outputs=outputs,
+                    return_representations=return_representations,
                 )
 
                 num_recycles += 1
 
                 if not is_final_iter:
-                    del outputs
                     prevs = [m_1_prev, z_prev, x_prev]
                     del m_1_prev, z_prev, x_prev
                 else:
@@ -585,7 +601,9 @@ class AlphaFold(nn.Module):
         if "asym_id" in batch:
             outputs["asym_id"] = feats["asym_id"]
 
-        # Run auxiliary heads
-        outputs.update(self.aux_heads(outputs))
+        # Run auxiliary heads only if we ran structure module
+        # (skip for representation-only mode)
+        if not return_representations:
+            outputs.update(self.aux_heads(outputs))
 
         return outputs
