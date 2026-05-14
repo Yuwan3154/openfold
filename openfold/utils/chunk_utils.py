@@ -365,6 +365,7 @@ class ChunkSizeTuner:
     
         def test_chunk_size(chunk_size):
             try:
+                torch.cuda.empty_cache()
                 with torch.no_grad():
                     fn(*args, chunk_size=chunk_size)
                 return True

@@ -180,6 +180,8 @@ def _run_triangle_st_checkpoint(
     msa_mask = kw.get('msa_mask')
     chunk_size = kw.get('chunk_size')
     use_deepspeed = kw.get('use_deepspeed_evo_attention', False)
+    use_cueq_attn = kw.get('use_cuequivariance_attention', False)
+    use_cueq_mult = kw.get('use_cuequivariance_multiplicative_update', False)
     use_lma = kw.get('use_lma', False)
     use_flash = kw.get('use_flash', False)
     inplace_safe = kw.get('inplace_safe', False)
@@ -191,6 +193,7 @@ def _run_triangle_st_checkpoint(
         return func.forward_msa_opm(
             m, z, msa_mask=msa_mask, pair_mask=pair_mask,
             chunk_size=chunk_size, use_deepspeed_evo_attention=use_deepspeed,
+            use_cuequivariance_attention=use_cueq_attn,
             use_lma=use_lma, use_flash=use_flash, inplace_safe=inplace_safe,
             _mask_trans=_mask_trans, _attn_chunk_size=_attn_chunk_size,
         )
@@ -201,7 +204,10 @@ def _run_triangle_st_checkpoint(
         z_orig = func.pair_stack.forward_triangle_ops(
             z_after_opm,
             pair_mask=pair_mask, chunk_size=chunk_size,
-            use_deepspeed_evo_attention=use_deepspeed, use_lma=use_lma,
+            use_deepspeed_evo_attention=use_deepspeed,
+            use_cuequivariance_attention=use_cueq_attn,
+            use_cuequivariance_multiplicative_update=use_cueq_mult,
+            use_lma=use_lma,
             inplace_safe=inplace_safe, _attn_chunk_size=_attn_chunk_size,
         )
 

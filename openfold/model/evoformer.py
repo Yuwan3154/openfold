@@ -279,6 +279,8 @@ class PairStack(nn.Module):
         pair_mask: torch.Tensor,
         chunk_size: Optional[int] = None,
         use_deepspeed_evo_attention: bool = False,
+        use_cuequivariance_attention: bool = False,
+        use_cuequivariance_multiplicative_update: bool = False,
         use_lma: bool = False,
         inplace_safe: bool = False,
         _attn_chunk_size: Optional[int] = None,
@@ -289,6 +291,7 @@ class PairStack(nn.Module):
 
         tmu_update = self.tri_mul_out(
             z, mask=pair_mask, inplace_safe=inplace_safe, _add_with_inplace=True,
+            use_cuequivariance_multiplicative_update=use_cuequivariance_multiplicative_update,
         )
         if not inplace_safe:
             z = z + self.ps_dropout_row_layer(tmu_update)
@@ -298,6 +301,7 @@ class PairStack(nn.Module):
 
         tmu_update = self.tri_mul_in(
             z, mask=pair_mask, inplace_safe=inplace_safe, _add_with_inplace=True,
+            use_cuequivariance_multiplicative_update=use_cuequivariance_multiplicative_update,
         )
         if not inplace_safe:
             z = z + self.ps_dropout_row_layer(tmu_update)
@@ -311,6 +315,7 @@ class PairStack(nn.Module):
                         z, mask=pair_mask, chunk_size=_attn_chunk_size,
                         use_memory_efficient_kernel=False,
                         use_deepspeed_evo_attention=use_deepspeed_evo_attention,
+                        use_cuequivariance_attention=use_cuequivariance_attention,
                         use_lma=use_lma, inplace_safe=inplace_safe,
                     )
                 ),
@@ -328,6 +333,7 @@ class PairStack(nn.Module):
                         chunk_size=_attn_chunk_size,
                         use_memory_efficient_kernel=False,
                         use_deepspeed_evo_attention=use_deepspeed_evo_attention,
+                        use_cuequivariance_attention=use_cuequivariance_attention,
                         use_lma=use_lma, inplace_safe=inplace_safe,
                     )
                 ),
@@ -657,6 +663,7 @@ class EvoformerBlock(MSABlock):
         pair_mask: torch.Tensor,
         chunk_size: Optional[int] = None,
         use_deepspeed_evo_attention: bool = False,
+        use_cuequivariance_attention: bool = False,
         use_lma: bool = False,
         use_flash: bool = False,
         inplace_safe: bool = False,
@@ -677,8 +684,9 @@ class EvoformerBlock(MSABlock):
                 self.msa_dropout_layer(
                     self.msa_att_row(
                         m, z=z, mask=msa_mask, chunk_size=_attn_chunk_size,
-                        use_memory_efficient_kernel=False,
+                        use_memory_efficient_kernel=not (use_lma or use_deepspeed_evo_attention or use_cuequivariance_attention),
                         use_deepspeed_evo_attention=use_deepspeed_evo_attention,
+                        use_cuequivariance_attention=use_cuequivariance_attention,
                         use_lma=use_lma,
                     )
                 ),
@@ -690,6 +698,7 @@ class EvoformerBlock(MSABlock):
                     self.msa_att_col(
                         m, mask=msa_mask, chunk_size=chunk_size,
                         use_deepspeed_evo_attention=use_deepspeed_evo_attention,
+                        use_cuequivariance_attention=use_cuequivariance_attention,
                         use_lma=use_lma, use_flash=use_flash,
                     ),
                     inplace=inplace_safe,
@@ -1199,14 +1208,17 @@ class EvoformerStack(nn.Module):
             blocks_per_ckpt = None
 
         # Store evoformer input so block 0's input can be recovered
-        if outputs is not None:
-            outputs[f"recycle_{cycle_no}_evoformer_input"] = (m, z)
-        
+        # Only store block intermediates during training (for gradient checkpointing).
+        # During inference, this wastes ~9.6 GB at n_res=512 (48 blocks × ~201 MB each).
+        _store_outputs = outputs if torch.is_grad_enabled() else None
+        if _store_outputs is not None:
+            _store_outputs[f"recycle_{cycle_no}_evoformer_input"] = (m, z)
+
         m, z = checkpoint_blocks(
             blocks,
             args=(m, z),
             blocks_per_ckpt=blocks_per_ckpt,
-            outputs=outputs,
+            outputs=_store_outputs,
             cycle_no=cycle_no,
         )
 

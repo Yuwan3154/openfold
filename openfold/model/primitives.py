@@ -42,6 +42,9 @@ if cueq_is_installed:
     from cuequivariance_torch.primitives.triangle import triangle_attention
 
     def cueq_would_fall_back(n_token: int, hidden_dim: int, dtype: torch.dtype):
+        # cuEquivariance triangle_attention requires Ampere (CC>=8.0); fall back on V100/Turing
+        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 8:
+            return True
         # for q_x, dimension -2 is the context length
         if n_token <= CUEQ_TRIATTN_FALLBACK_THRESHOLD:
             return True
@@ -738,14 +741,20 @@ def _deepspeed_evo_attn(
         v = reshape_dims(v)
         biases = [reshape_dims(b) for b in biases]
 
-    # DeepSpeed attn. kernel requires inputs to be type bf16 or fp16
-    # Cast to bf16 so kernel can be used during inference
+    # DeepSpeed attn. kernel requires inputs to be type bf16 or fp16.
+    # V100/Volta (compute capability < 8.0) doesn't support bfloat16;
+    # fall back to float16 which DS4Sci_EvoformerAttention also accepts.
     orig_dtype = q.dtype
     if orig_dtype not in [torch.bfloat16, torch.float16]:
-        o = DS4Sci_EvoformerAttention(q.to(dtype=torch.bfloat16),
-                                      k.to(dtype=torch.bfloat16),
-                                      v.to(dtype=torch.bfloat16),
-                                      [b.to(dtype=torch.bfloat16) for b in biases])
+        _cast_dtype = (
+            torch.bfloat16
+            if torch.cuda.get_device_capability(q.device)[0] >= 8
+            else torch.float16
+        )
+        o = DS4Sci_EvoformerAttention(q.to(dtype=_cast_dtype),
+                                      k.to(dtype=_cast_dtype),
+                                      v.to(dtype=_cast_dtype),
+                                      [b.to(dtype=_cast_dtype) for b in biases])
 
         o = o.to(dtype=orig_dtype)
     else:

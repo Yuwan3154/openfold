@@ -113,7 +113,7 @@ class PerResidueLDDTCaPredictor(nn.Module):
 
         self.relu = nn.ReLU()
 
-    def forward(self, s):
+    def _forward(self, s):
         s = self.layer_norm(s)
         s = self.linear_1(s)
         s = self.relu(s)
@@ -122,6 +122,13 @@ class PerResidueLDDTCaPredictor(nn.Module):
         s = self.linear_3(s)
 
         return s
+
+    def forward(self, s):
+        if(is_fp16_enabled()):
+            with torch.cuda.amp.autocast(enabled=False):
+                return self._forward(s.float())
+        else:
+            return self._forward(s)
 
 
 class DistogramHead(nn.Module):
@@ -159,7 +166,7 @@ class DistogramHead(nn.Module):
         logits = logits + logits.transpose(-2, -3)
         return logits
     
-    def forward(self, z): 
+    def forward(self, z):
         if(is_fp16_enabled()):
             with torch.cuda.amp.autocast(enabled=False):
                 return self._forward(z.float())
@@ -187,7 +194,7 @@ class TMScoreHead(nn.Module):
 
         self.linear = Linear(self.c_z, self.no_bins, init="final")
 
-    def forward(self, z):
+    def _forward(self, z):
         """
         Args:
             z:
@@ -198,6 +205,13 @@ class TMScoreHead(nn.Module):
         # [*, N, N, no_bins]
         logits = self.linear(z)
         return logits
+
+    def forward(self, z):
+        if(is_fp16_enabled()):
+            with torch.cuda.amp.autocast(enabled=False):
+                return self._forward(z.float())
+        else:
+            return self._forward(z)
 
 
 class MaskedMSAHead(nn.Module):
