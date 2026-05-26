@@ -89,7 +89,7 @@ class MSAAttention(nn.Module):
         )
 
     @torch.jit.ignore
-    def _chunk(self, 
+    def _chunk(self,
         m: torch.Tensor,
         biases: Optional[List[torch.Tensor]],
         chunk_size: int,
@@ -99,12 +99,15 @@ class MSAAttention(nn.Module):
         use_lma: bool,
         use_flash: bool,
         flash_mask: Optional[torch.Tensor],
+        use_torch_sdpa: bool = False,
+        use_torch_vanilla: bool = False,
+        use_torch_cueq: bool = False,
     ) -> torch.Tensor:
         def fn(m, biases, flash_mask):
             m = self.layer_norm_m(m)
             return self.mha(
-                q_x=m, 
-                kv_x=m, 
+                q_x=m,
+                kv_x=m,
                 biases=biases,
                 use_memory_efficient_kernel=use_memory_efficient_kernel,
                 use_deepspeed_evo_attention=use_deepspeed_evo_attention,
@@ -112,6 +115,9 @@ class MSAAttention(nn.Module):
                 use_lma=use_lma,
                 use_flash=use_flash,
                 flash_mask=flash_mask,
+                use_torch_sdpa=use_torch_sdpa,
+                use_torch_vanilla=use_torch_vanilla,
+                use_torch_cueq=use_torch_cueq,
             )
 
         inputs = {"m": m}
@@ -234,10 +240,10 @@ class MSAAttention(nn.Module):
 
         return m
 
-    def forward(self, 
-        m: torch.Tensor, 
-        z: Optional[torch.Tensor] = None, 
-        mask: Optional[torch.Tensor] = None, 
+    def forward(self,
+        m: torch.Tensor,
+        z: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
         chunk_size: Optional[int] = None,
         use_memory_efficient_kernel: bool = False,
         use_deepspeed_evo_attention: bool = False,
@@ -247,6 +253,9 @@ class MSAAttention(nn.Module):
         inplace_safe: bool = False,
         _chunk_logits: Optional[int] = None,
         _checkpoint_chunks: Optional[bool] = None,
+        use_torch_sdpa: bool = False,
+        use_torch_vanilla: bool = False,
+        use_torch_cueq: bool = False,
     ) -> torch.Tensor:
         """
         Args:
@@ -259,38 +268,54 @@ class MSAAttention(nn.Module):
                 [*, N_seq, N_res] MSA mask
             chunk_size:
                 Size of chunks into which the inputs are split along their
-                batch dimensions. A low value decreases memory overhead at the 
+                batch dimensions. A low value decreases memory overhead at the
                 cost of slower execution. Chunking is not performed by default.
-                
+
         """
-        if(_chunk_logits is not None):
+        _compile_path = use_torch_sdpa or use_torch_vanilla or use_torch_cueq
+        if(_chunk_logits is not None and not _compile_path):
             return self._chunked_msa_attn(
-                m=m, z=z, mask=mask, 
-                chunk_logits=_chunk_logits, 
+                m=m, z=z, mask=mask,
+                chunk_logits=_chunk_logits,
                 checkpoint=_checkpoint_chunks,
                 inplace_safe=inplace_safe,
             )
-        
-        if(use_flash):
+
+        # Compile-friendly bias prep:
+        #   use_torch_cueq wants the same bias form as legacy cuEq
+        #   (0/1 mask) — pass it through to _prep_inputs.
+        _cueq_mask_form = use_cuequivariance_attention or use_torch_cueq
+        if(use_flash and not _compile_path):
             assert z is None
             biases = None
-        else:    
+        else:
             m, mask_bias, z = self._prep_inputs(
                 m, z, mask, inplace_safe=inplace_safe,
-                use_cuequivariance_attention=use_cuequivariance_attention,
+                use_cuequivariance_attention=_cueq_mask_form,
             )
-    
+
             biases = [mask_bias]
-            if z is None and use_cuequivariance_attention:
-                z = m.new_zeros(1, self.no_heads, m.shape[-2], m.shape[-2]) 
-                
+            if z is None and _cueq_mask_form:
+                z = m.new_zeros(1, self.no_heads, m.shape[-2], m.shape[-2])
+
             if(z is not None):
                 biases.append(z)
 
+        # When the compile-friendly path is on, force the chunked branch to
+        # use SDPA / vanilla / cueq compile-friendly attention paths and
+        # never the memory-efficient kernel (which calls a
+        # torch.compile-incompatible CUDA extension), the deepspeed kernel,
+        # or the legacy cueq dispatch (handled via use_torch_cueq instead).
+        if _compile_path:
+            use_memory_efficient_kernel = False
+            use_deepspeed_evo_attention = False
+            use_cuequivariance_attention = False
+            use_flash = False
+
         if chunk_size is not None:
             m = self._chunk(
-                m, 
-                biases, 
+                m,
+                biases,
                 chunk_size,
                 use_memory_efficient_kernel=use_memory_efficient_kernel,
                 use_deepspeed_evo_attention=use_deepspeed_evo_attention,
@@ -298,19 +323,25 @@ class MSAAttention(nn.Module):
                 use_lma=use_lma,
                 use_flash=use_flash,
                 flash_mask=mask,
+                use_torch_sdpa=use_torch_sdpa,
+                use_torch_vanilla=use_torch_vanilla,
+                use_torch_cueq=use_torch_cueq,
             )
         else:
             m = self.layer_norm_m(m)
             m = self.mha(
-                q_x=m, 
-                kv_x=m, 
+                q_x=m,
+                kv_x=m,
                 biases=biases,
                 use_memory_efficient_kernel=use_memory_efficient_kernel,
                 use_deepspeed_evo_attention=use_deepspeed_evo_attention,
                 use_cuequivariance_attention=use_cuequivariance_attention,
                 use_lma=use_lma,
                 use_flash=use_flash,
-                flash_mask=mask,
+                flash_mask=mask if use_flash else None,
+                use_torch_sdpa=use_torch_sdpa,
+                use_torch_vanilla=use_torch_vanilla,
+                use_torch_cueq=use_torch_cueq,
             )
 
         return m
@@ -381,14 +412,17 @@ class MSAColumnAttention(nn.Module):
             inf=inf,
         )
 
-    def forward(self, 
-        m: torch.Tensor, 
-        mask: Optional[torch.Tensor] = None, 
+    def forward(self,
+        m: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
         chunk_size: Optional[int] = None,
         use_deepspeed_evo_attention: bool = False,
         use_cuequivariance_attention: bool = False,
         use_lma: bool = False,
         use_flash: bool = False,
+        use_torch_sdpa: bool = False,
+        use_torch_vanilla: bool = False,
+        use_torch_cueq: bool = False,
     ) -> torch.Tensor:
         """
         Args:
@@ -398,22 +432,25 @@ class MSAColumnAttention(nn.Module):
                 [*, N_seq, N_res] MSA mask
             chunk_size:
                 Size of chunks into which the inputs are split along their
-                batch dimensions. A low value decreases memory overhead at the 
+                batch dimensions. A low value decreases memory overhead at the
                 cost of slower execution. Chunking is not performed by default.
-        """ 
+        """
         # [*, N_res, N_seq, C_in]
         m = m.transpose(-2, -3)
         if mask is not None:
             mask = mask.transpose(-1, -2)
 
         m = self._msa_att(
-            m, 
-            mask=mask, 
+            m,
+            mask=mask,
             chunk_size=chunk_size,
             use_deepspeed_evo_attention=use_deepspeed_evo_attention,
             use_cuequivariance_attention=use_cuequivariance_attention,
             use_lma=use_lma,
             use_flash=use_flash,
+            use_torch_sdpa=use_torch_sdpa,
+            use_torch_vanilla=use_torch_vanilla,
+            use_torch_cueq=use_torch_cueq,
         )
 
         # [*, N_seq, N_res, C_in]

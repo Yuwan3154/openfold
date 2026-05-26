@@ -653,7 +653,7 @@ class TemplateEmbedder(nn.Module):
     def forward(
         self,
         batch,
-        z, 
+        z,
         pair_mask,
         templ_dim,
         chunk_size,
@@ -662,7 +662,10 @@ class TemplateEmbedder(nn.Module):
         use_cuequivariance_attention: bool = False,
         use_cuequivariance_multiplicative_update: bool = False,
         use_lma=False,
-        inplace_safe=False
+        inplace_safe=False,
+        use_torch_sdpa: bool = False,
+        use_torch_vanilla: bool = False,
+        use_torch_cueq: bool = False,
     ):
         # Embed the templates one at a time (with a poor man's vmap)
         pair_embeds = []
@@ -717,6 +720,9 @@ class TemplateEmbedder(nn.Module):
             use_lma=use_lma,
             inplace_safe=inplace_safe,
             _mask_trans=_mask_trans,
+            use_torch_sdpa=use_torch_sdpa,
+            use_torch_vanilla=use_torch_vanilla,
+            use_torch_cueq=use_torch_cueq,
         )
         del t_pair
 
@@ -726,6 +732,9 @@ class TemplateEmbedder(nn.Module):
             z,
             template_mask=batch["template_mask"].to(dtype=z.dtype),
             use_lma=use_lma,
+            use_torch_sdpa=use_torch_sdpa,
+            use_torch_vanilla=use_torch_vanilla,
+            use_torch_cueq=use_torch_cueq,
         )
 
         t_mask = torch.sum(batch["template_mask"], dim=-1) > 0

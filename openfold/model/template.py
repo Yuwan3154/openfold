@@ -111,6 +111,9 @@ class TemplatePointwiseAttention(nn.Module):
                 # This module suffers greatly from a small chunk size
                 chunk_size: Optional[int] = 256,
                 use_lma: bool = False,
+                use_torch_sdpa: bool = False,
+                use_torch_vanilla: bool = False,
+                use_torch_cueq: bool = False,
                 ) -> torch.Tensor:
         """
         Args:
@@ -136,10 +139,15 @@ class TemplatePointwiseAttention(nn.Module):
 
         # [*, N_res, N_res, 1, C_z]
         biases = [bias]
-        if chunk_size is not None and not self.training:
+        _compile_path = use_torch_sdpa or use_torch_vanilla or use_torch_cueq
+        if chunk_size is not None and not self.training and not _compile_path:
             z = self._chunk(z, t, biases, chunk_size, use_lma=use_lma)
         else:
-            z = self.mha(q_x=z, kv_x=t, biases=biases, use_lma=use_lma)
+            z = self.mha(
+                q_x=z, kv_x=t, biases=biases, use_lma=use_lma,
+                use_torch_sdpa=use_torch_sdpa, use_torch_vanilla=use_torch_vanilla,
+                use_torch_cueq=use_torch_cueq,
+            )
 
         # [*, N_res, N_res, C_z]
         z = z.squeeze(-2)
@@ -219,7 +227,10 @@ class TemplatePairStackBlock(nn.Module):
                           use_deepspeed_evo_attention: bool,
                           use_cuequivariance_attention: bool,
                           use_lma: bool,
-                          inplace_safe: bool):
+                          inplace_safe: bool,
+                          use_torch_sdpa: bool = False,
+                          use_torch_vanilla: bool = False,
+                          use_torch_cueq: bool = False):
         single = add(single,
                      self.dropout_row(
                          self.tri_att_start(
@@ -230,6 +241,9 @@ class TemplatePairStackBlock(nn.Module):
                              use_cuequivariance_attention=use_cuequivariance_attention,
                              use_lma=use_lma,
                              inplace_safe=inplace_safe,
+                             use_torch_sdpa=use_torch_sdpa,
+                             use_torch_vanilla=use_torch_vanilla,
+                             use_torch_cueq=use_torch_cueq,
                          )
                      ),
                      inplace_safe,
@@ -245,6 +259,9 @@ class TemplatePairStackBlock(nn.Module):
                              use_cuequivariance_attention=use_cuequivariance_attention,
                              use_lma=use_lma,
                              inplace_safe=inplace_safe,
+                             use_torch_sdpa=use_torch_sdpa,
+                             use_torch_vanilla=use_torch_vanilla,
+                             use_torch_cueq=use_torch_cueq,
                          )
                      ),
                      inplace_safe,
@@ -298,6 +315,9 @@ class TemplatePairStackBlock(nn.Module):
                 inplace_safe: bool = False,
                 _mask_trans: bool = True,
                 _attn_chunk_size: Optional[int] = None,
+                use_torch_sdpa: bool = False,
+                use_torch_vanilla: bool = False,
+                use_torch_cueq: bool = False,
                 ):
         if _attn_chunk_size is None:
             _attn_chunk_size = chunk_size
@@ -323,7 +343,10 @@ class TemplatePairStackBlock(nn.Module):
                                                 use_deepspeed_evo_attention=use_deepspeed_evo_attention,
                                                 use_cuequivariance_attention=use_cuequivariance_attention,
                                                 use_lma=use_lma,
-                                                inplace_safe=inplace_safe)
+                                                inplace_safe=inplace_safe,
+                                                use_torch_sdpa=use_torch_sdpa,
+                                                use_torch_vanilla=use_torch_vanilla,
+                                                use_torch_cueq=use_torch_cueq)
             else:
                 single = self.tri_mul_out_in(
                     single=self.tri_att_start_end(single=single,
@@ -332,7 +355,10 @@ class TemplatePairStackBlock(nn.Module):
                                                   use_deepspeed_evo_attention=use_deepspeed_evo_attention,
                                                   use_cuequivariance_attention=use_cuequivariance_attention,
                                                   use_lma=use_lma,
-                                                  inplace_safe=inplace_safe),
+                                                  inplace_safe=inplace_safe,
+                                                  use_torch_sdpa=use_torch_sdpa,
+                                                  use_torch_vanilla=use_torch_vanilla,
+                                                  use_torch_cueq=use_torch_cueq),
                     single_mask=single_mask,
                     use_cuequivariance_multiplicative_update=use_cuequivariance_multiplicative_update,
                     inplace_safe=inplace_safe)
@@ -431,6 +457,9 @@ class TemplatePairStack(nn.Module):
         use_lma: bool = False,
         inplace_safe: bool = False,
         _mask_trans: bool = True,
+        use_torch_sdpa: bool = False,
+        use_torch_vanilla: bool = False,
+        use_torch_cueq: bool = False,
     ):
         """
         Args:
@@ -441,10 +470,13 @@ class TemplatePairStack(nn.Module):
         Returns:
             [*, N_templ, N_res, N_res, C_t] template embedding update
         """
-        if mask.shape[-3] == 1:
-            expand_idx = list(mask.shape)
-            expand_idx[-3] = t.shape[-4]
-            mask = mask.expand(*expand_idx)
+        # Unconditional expand: if mask is already N_templ in this axis,
+        # expand is a no-op; if it's 1, expand broadcasts.  Dropping the
+        # `if mask.shape[-3] == 1:` branch removes a shape-conditional
+        # that would force a torch.compile re-specialisation.
+        expand_idx = list(mask.shape)
+        expand_idx[-3] = t.shape[-4]
+        mask = mask.expand(*expand_idx)
 
         blocks = [
             partial(
@@ -457,6 +489,9 @@ class TemplatePairStack(nn.Module):
                 use_lma=use_lma,
                 inplace_safe=inplace_safe,
                 _mask_trans=_mask_trans,
+                use_torch_sdpa=use_torch_sdpa,
+                use_torch_vanilla=use_torch_vanilla,
+                use_torch_cueq=use_torch_cueq,
             )
             for b in self.blocks
         ]

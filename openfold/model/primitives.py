@@ -19,6 +19,7 @@ from typing import Optional, Callable, List, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from scipy.stats import truncnorm
 
 deepspeed_is_installed = importlib.util.find_spec("deepspeed") is not None
@@ -482,7 +483,10 @@ class Attention(nn.Module):
         lma_q_chunk_size: int = DEFAULT_LMA_Q_CHUNK_SIZE,
         lma_kv_chunk_size: int = DEFAULT_LMA_KV_CHUNK_SIZE,
         use_flash: bool = False,
-        flash_mask: Optional[torch.Tensor] = None
+        flash_mask: Optional[torch.Tensor] = None,
+        use_torch_sdpa: bool = False,
+        use_torch_vanilla: bool = False,
+        use_torch_cueq: bool = False,
     ) -> torch.Tensor:
         """
         Args:
@@ -503,7 +507,7 @@ class Attention(nn.Module):
                 implementation is used instead
             use_lma:
                 Whether to use low-memory attention (Staats & Rabe 2021). If
-                none of the "use_<...>" flags are True, a stock PyTorch 
+                none of the "use_<...>" flags are True, a stock PyTorch
                 implementation is used instead
             lma_q_chunk_size:
                 Query chunk size (for LMA)
@@ -512,11 +516,61 @@ class Attention(nn.Module):
             use_cuequivariance_attention:
                 Whether to use cuEquivariance attention kernel.
                 When on, biases[0] contains 0/1 mask tensor for cuEquivariance attention (0 for invalid positions)
-
+            use_torch_sdpa:
+                If True, use torch.nn.functional.scaled_dot_product_attention
+                with the sum of biases folded into attn_mask. Compile-friendly
+                and dynamic-shape friendly. Mutually exclusive with the other
+                kernel flags.
+            use_torch_vanilla:
+                If True, use the plain _attention helper (matmul -> softmax ->
+                matmul). Compile-friendly and bit-identical to current eager.
+                Mutually exclusive with the other kernel flags.
 
         Returns
             [*, Q, C_q] attention update
         """
+        # Compile-friendly fast paths: bypass the full kernel dispatch.
+        # These are the only paths used by AlphaFold.forward_inference.
+        if use_torch_sdpa or use_torch_vanilla or use_torch_cueq:
+            if biases is None:
+                biases = []
+            if use_torch_cueq:
+                # cuEquivariance triangle_attention is a torch.library
+                # custom op (with register_fake) so it traces cleanly under
+                # torch.compile.  It expects:
+                #   q, k, v with internal kernel scaling — DON'T pre-scale.
+                #   biases[0] = 0/1 mask tensor (NOT the inf*(mask-1)
+                #               additive bias used by SDPA / vanilla).
+                #   biases[1] = additive triangle bias [*, H, Q, K].
+                # The cueq mask convention is set up by the callers
+                # (TriangleAttention.forward, MSAAttention._prep_inputs)
+                # via the existing `use_cuequivariance_attention` flag —
+                # so we require the caller to have already prepared mask
+                # in that form.  See cueq_would_fall_back precondition
+                # check in enable_compile_inference_path for shape sanity.
+                q, k, v = self._prep_qkv(q_x, kv_x, apply_scale=False)
+                if len(biases) < 2:
+                    raise ValueError(
+                        "use_torch_cueq requires exactly two biases: "
+                        "(mask_0_1, triangle_bias)"
+                    )
+                o = _cuequivariance_attn(q, k, v, biases[1], biases[0])
+                return self._wrap_up(o, q_x)
+
+            q, k, v = self._prep_qkv(q_x, kv_x, apply_scale=True)
+            if use_torch_sdpa:
+                attn_bias = None
+                for b in biases:
+                    attn_bias = b if attn_bias is None else attn_bias + b
+                o = F.scaled_dot_product_attention(
+                    q, k, v, attn_mask=attn_bias, is_causal=False, scale=1.0,
+                )
+            else:
+                o = _attention(q, k, v, biases)
+            # [*, Q, H, C_hidden]
+            o = o.transpose(-2, -3)
+            return self._wrap_up(o, q_x)
+
         if use_lma and (lma_q_chunk_size is None or lma_kv_chunk_size is None):
             raise ValueError(
                 "If use_lma is specified, lma_q_chunk_size and "
@@ -896,7 +950,11 @@ def _flash_attn(q, k, v, kv_mask):
     return out
 
 
-@torch.jit.ignore
+# NOTE: removed `@torch.jit.ignore` — it's a TorchScript decorator that
+# also blocks torch.compile from inlining this function (it's treated as a
+# graph break).  The cueq kernels (triangle_attention) are themselves
+# registered as torch.library custom ops with register_fake, so they trace
+# cleanly via Dynamo.
 def _cuequivariance_attn(
     q: torch.Tensor,
     k: torch.Tensor,

@@ -187,7 +187,10 @@ class PairStack(nn.Module):
         use_lma: bool = False,
         inplace_safe: bool = False,
         _mask_trans: bool = True,
-        _attn_chunk_size: Optional[int] = None
+        _attn_chunk_size: Optional[int] = None,
+        use_torch_sdpa: bool = False,
+        use_torch_vanilla: bool = False,
+        use_torch_cueq: bool = False,
     ) -> torch.Tensor:
         # DeepMind doesn't mask these transitions in the source, so _mask_trans
         # should be disabled to better approximate the exact activations of
@@ -236,6 +239,9 @@ class PairStack(nn.Module):
                         use_cuequivariance_attention=use_cuequivariance_attention,
                         use_lma=use_lma,
                         inplace_safe=inplace_safe,
+                        use_torch_sdpa=use_torch_sdpa,
+                        use_torch_vanilla=use_torch_vanilla,
+                        use_torch_cueq=use_torch_cueq,
                     )
                 ),
                 inplace=inplace_safe,
@@ -256,6 +262,9 @@ class PairStack(nn.Module):
                         use_cuequivariance_attention=use_cuequivariance_attention,
                         use_lma=use_lma,
                         inplace_safe=inplace_safe,
+                        use_torch_sdpa=use_torch_sdpa,
+                        use_torch_vanilla=use_torch_vanilla,
+                        use_torch_cueq=use_torch_cueq,
                     )
                 ),
                 inplace=inplace_safe,
@@ -535,6 +544,9 @@ class EvoformerBlock(MSABlock):
         _attn_chunk_size: Optional[int] = None,
         _offload_inference: bool = False,
         _offloadable_inputs: Optional[Sequence[torch.Tensor]] = None,
+        use_torch_sdpa: bool = False,
+        use_torch_vanilla: bool = False,
+        use_torch_cueq: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         msa_trans_mask = msa_mask if _mask_trans else None
@@ -570,6 +582,9 @@ class EvoformerBlock(MSABlock):
                         use_deepspeed_evo_attention=use_deepspeed_evo_attention,
                         use_cuequivariance_attention=use_cuequivariance_attention,
                         use_lma=use_lma,
+                        use_torch_sdpa=use_torch_sdpa,
+                        use_torch_vanilla=use_torch_vanilla,
+                        use_torch_cueq=use_torch_cueq,
                     )
                 ),
                 inplace=inplace_safe,
@@ -594,6 +609,9 @@ class EvoformerBlock(MSABlock):
                         use_cuequivariance_attention=use_cuequivariance_attention,
                         use_lma=use_lma,
                         use_flash=use_flash,
+                        use_torch_sdpa=use_torch_sdpa,
+                        use_torch_vanilla=use_torch_vanilla,
+                        use_torch_cueq=use_torch_cueq,
                     ),
                     inplace=inplace_safe,
                     )
@@ -642,7 +660,10 @@ class EvoformerBlock(MSABlock):
             use_lma=use_lma,
             inplace_safe=inplace_safe,
             _mask_trans=_mask_trans,
-            _attn_chunk_size=_attn_chunk_size
+            _attn_chunk_size=_attn_chunk_size,
+            use_torch_sdpa=use_torch_sdpa,
+            use_torch_vanilla=use_torch_vanilla,
+            use_torch_cueq=use_torch_cueq,
         )
 
         if (_offload_inference and inplace_safe):
@@ -786,9 +807,12 @@ class ExtraMSABlock(MSABlock):
         _attn_chunk_size: Optional[int] = None,
         _offload_inference: bool = False,
         _offloadable_inputs: Optional[Sequence[torch.Tensor]] = None,
+        use_torch_sdpa: bool = False,
+        use_torch_vanilla: bool = False,
+        use_torch_cueq: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if(_attn_chunk_size is None):
-            _attn_chunk_size = chunk_size        
+            _attn_chunk_size = chunk_size
 
         if(_offload_inference and inplace_safe):
             input_tensors = _offloadable_inputs
@@ -807,19 +831,23 @@ class ExtraMSABlock(MSABlock):
                                      inplace_safe=inplace_safe,
                                      _offload_inference=_offload_inference)
 
+        _compile_path = use_torch_sdpa or use_torch_vanilla or use_torch_cueq
         m = add(m,
             self.msa_dropout_layer(
                 self.msa_att_row(
-                    m.clone() if torch.is_grad_enabled() else m, 
-                    z=z.clone() if torch.is_grad_enabled() else z, 
-                    mask=msa_mask, 
+                    m.clone() if (torch.is_grad_enabled() and not _compile_path) else m,
+                    z=z.clone() if (torch.is_grad_enabled() and not _compile_path) else z,
+                    mask=msa_mask,
                     chunk_size=_attn_chunk_size,
                     use_lma=use_lma,
                     use_deepspeed_evo_attention=use_deepspeed_evo_attention,
                     use_cuequivariance_attention=use_cuequivariance_attention,
-                    use_memory_efficient_kernel=not (use_lma or use_deepspeed_evo_attention or use_cuequivariance_attention),
+                    use_memory_efficient_kernel=not (use_lma or use_deepspeed_evo_attention or use_cuequivariance_attention or _compile_path),
                     _checkpoint_chunks=
-                        self.ckpt if torch.is_grad_enabled() else False,
+                        self.ckpt if (torch.is_grad_enabled() and not _compile_path) else False,
+                    use_torch_sdpa=use_torch_sdpa,
+                    use_torch_vanilla=use_torch_vanilla,
+                    use_torch_cueq=use_torch_cueq,
                 )
             ),
             inplace=inplace_safe,
@@ -895,7 +923,10 @@ class ExtraMSABlock(MSABlock):
                 use_lma=use_lma,
                 inplace_safe=inplace_safe,
                 _mask_trans=_mask_trans,
-                _attn_chunk_size=_attn_chunk_size
+                _attn_chunk_size=_attn_chunk_size,
+                use_torch_sdpa=use_torch_sdpa,
+                use_torch_vanilla=use_torch_vanilla,
+                use_torch_cueq=use_torch_cueq,
             )
 
             m = input_tensors[0]
@@ -1032,9 +1063,9 @@ class EvoformerStack(nn.Module):
         if(tune_chunk_size):
             self.chunk_size_tuner = ChunkSizeTuner(2048)
 
-    def _prep_blocks(self, 
-        m: torch.Tensor, 
-        z: torch.Tensor, 
+    def _prep_blocks(self,
+        m: torch.Tensor,
+        z: torch.Tensor,
         chunk_size: int,
         use_deepspeed_evo_attention: bool,
         use_cuequivariance_attention: bool,
@@ -1045,6 +1076,9 @@ class EvoformerStack(nn.Module):
         pair_mask: Optional[torch.Tensor],
         inplace_safe: bool,
         _mask_trans: bool,
+        use_torch_sdpa: bool = False,
+        use_torch_vanilla: bool = False,
+        use_torch_cueq: bool = False,
     ):
         blocks = [
             partial(
@@ -1059,6 +1093,9 @@ class EvoformerStack(nn.Module):
                 use_flash=use_flash,
                 inplace_safe=inplace_safe,
                 _mask_trans=_mask_trans,
+                use_torch_sdpa=use_torch_sdpa,
+                use_torch_vanilla=use_torch_vanilla,
+                use_torch_cueq=use_torch_cueq,
             )
             for b in self.blocks
         ]
@@ -1152,6 +1189,9 @@ class EvoformerStack(nn.Module):
         use_flash: bool = False,
         inplace_safe: bool = False,
         _mask_trans: bool = True,
+        use_torch_sdpa: bool = False,
+        use_torch_vanilla: bool = False,
+        use_torch_cueq: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -1201,6 +1241,9 @@ class EvoformerStack(nn.Module):
             pair_mask=pair_mask,
             inplace_safe=inplace_safe,
             _mask_trans=_mask_trans,
+            use_torch_sdpa=use_torch_sdpa,
+            use_torch_vanilla=use_torch_vanilla,
+            use_torch_cueq=use_torch_cueq,
         )
 
         blocks_per_ckpt = self.blocks_per_ckpt
@@ -1284,9 +1327,9 @@ class ExtraMSAStack(nn.Module):
         if(tune_chunk_size):
             self.chunk_size_tuner = ChunkSizeTuner(2048)
 
-    def _prep_blocks(self, 
-        m: torch.Tensor, 
-        z: torch.Tensor, 
+    def _prep_blocks(self,
+        m: torch.Tensor,
+        z: torch.Tensor,
         chunk_size: int,
         use_deepspeed_evo_attention: bool,
         use_cuequivariance_attention: bool,
@@ -1296,12 +1339,15 @@ class ExtraMSAStack(nn.Module):
         pair_mask: Optional[torch.Tensor],
         inplace_safe: bool,
         _mask_trans: bool,
+        use_torch_sdpa: bool = False,
+        use_torch_vanilla: bool = False,
+        use_torch_cueq: bool = False,
     ):
         blocks = [
             partial(
-                b, 
-                msa_mask=msa_mask, 
-                pair_mask=pair_mask, 
+                b,
+                msa_mask=msa_mask,
+                pair_mask=pair_mask,
                 chunk_size=chunk_size,
                 use_deepspeed_evo_attention=use_deepspeed_evo_attention,
                 use_cuequivariance_attention=use_cuequivariance_attention,
@@ -1309,6 +1355,9 @@ class ExtraMSAStack(nn.Module):
                 use_lma=use_lma,
                 inplace_safe=inplace_safe,
                 _mask_trans=_mask_trans,
+                use_torch_sdpa=use_torch_sdpa,
+                use_torch_vanilla=use_torch_vanilla,
+                use_torch_cueq=use_torch_cueq,
             ) for b in self.blocks
         ]
 
@@ -1395,6 +1444,9 @@ class ExtraMSAStack(nn.Module):
         use_lma: bool = False,
         inplace_safe: bool = False,
         _mask_trans: bool = True,
+        use_torch_sdpa: bool = False,
+        use_torch_vanilla: bool = False,
+        use_torch_cueq: bool = False,
     ) -> torch.Tensor:
         """
         Args:
@@ -1430,10 +1482,13 @@ class ExtraMSAStack(nn.Module):
             pair_mask=pair_mask,
             inplace_safe=inplace_safe,
             _mask_trans=_mask_trans,
+            use_torch_sdpa=use_torch_sdpa,
+            use_torch_vanilla=use_torch_vanilla,
+            use_torch_cueq=use_torch_cueq,
         )
 
         for b in blocks:
-            if(self.ckpt and torch.is_grad_enabled()):
+            if(self.ckpt and torch.is_grad_enabled() and not (use_torch_sdpa or use_torch_vanilla or use_torch_cueq)):
                 m, z = checkpoint_fn(b, m, z)
             else:
                 m, z = b(m, z)

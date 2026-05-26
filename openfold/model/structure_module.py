@@ -310,6 +310,7 @@ class InvariantPointAttention(nn.Module):
         inplace_safe: bool = False,
         _offload_inference: bool = False,
         _z_reference_list: Optional[Sequence[torch.Tensor]] = None,
+        _force_no_inplace: bool = False,
     ) -> torch.Tensor:
         """
         Args:
@@ -321,6 +322,11 @@ class InvariantPointAttention(nn.Module):
                 [*, N_res] transformation object
             mask:
                 [*, N_res] mask
+            _force_no_inplace:
+                If True, route through the standard (non-inplace) softmax
+                branch and skip the fp16 autocast wrapper. Required for
+                torch.compile (the inplace branch calls a custom CUDA
+                extension that cannot be traced).
         Returns:
             [*, N_res, C_s] single representation update
         """
@@ -385,7 +391,7 @@ class InvariantPointAttention(nn.Module):
             z[0] = z[0].cpu()
 
         # [*, H, N_res, N_res]
-        if (is_fp16_enabled()):
+        if (is_fp16_enabled() and not _force_no_inplace):
             with torch.cuda.amp.autocast(enabled=False):
                 a = torch.matmul(
                     permute_final_dims(q.float(), (1, 0, 2)),  # [*, H, N_res, C_hidden]
@@ -403,7 +409,7 @@ class InvariantPointAttention(nn.Module):
         # [*, N_res, N_res, H, P_q, 3]
         pt_att = q_pts.unsqueeze(-4) - k_pts.unsqueeze(-5)
 
-        if (inplace_safe):
+        if (inplace_safe and not _force_no_inplace):
             pt_att *= pt_att
         else:
             pt_att = pt_att ** 2
@@ -417,7 +423,7 @@ class InvariantPointAttention(nn.Module):
             1.0 / (3 * (self.no_qk_points * 9.0 / 2))
         )
 
-        if (inplace_safe):
+        if (inplace_safe and not _force_no_inplace):
             pt_att *= head_weights
         else:
             pt_att = pt_att * head_weights
@@ -432,7 +438,7 @@ class InvariantPointAttention(nn.Module):
         # [*, H, N_res, N_res]
         pt_att = permute_final_dims(pt_att, (2, 0, 1))
 
-        if (inplace_safe):
+        if (inplace_safe and not _force_no_inplace):
             a += pt_att
             del pt_att
             a += square_mask.unsqueeze(-3)
@@ -459,7 +465,7 @@ class InvariantPointAttention(nn.Module):
         o = flatten_final_dims(o, 2)
 
         # [*, H, 3, N_res, P_v]
-        if (inplace_safe):
+        if (inplace_safe and not _force_no_inplace):
             v_pts = permute_final_dims(v_pts, (1, 3, 0, 2))
             o_pt = [
                 torch.matmul(a, v.to(a.dtype))
@@ -941,6 +947,7 @@ class StructureModule(nn.Module):
         mask=None,
         inplace_safe=False,
         _offload_inference=False,
+        _force_no_inplace=False,
     ):
         """
         Args:
@@ -992,18 +999,19 @@ class StructureModule(nn.Module):
         for i in range(self.no_blocks):
             # [*, N, C_s]
             s = s + self.ipa(
-                s, 
-                z, 
-                rigids, 
-                mask, 
+                s,
+                z,
+                rigids,
+                mask,
                 inplace_safe=inplace_safe,
-                _offload_inference=_offload_inference, 
-                _z_reference_list=z_reference_list
+                _offload_inference=_offload_inference,
+                _z_reference_list=z_reference_list,
+                _force_no_inplace=_force_no_inplace,
             )
             s = self.ipa_dropout(s)
             s = self.layer_norm_ipa(s)
             s = self.transition(s)
-           
+
             # [*, N]
             rigids = rigids.compose_q_update_vec(self.bb_update(s))
 
@@ -1165,6 +1173,7 @@ class StructureModule(nn.Module):
         mask=None,
         inplace_safe=False,
         _offload_inference=False,
+        _force_no_inplace=False,
     ):
         """
         Args:
@@ -1176,13 +1185,19 @@ class StructureModule(nn.Module):
                 [*, N_res] amino acid indices
             mask:
                 Optional [*, N_res] sequence mask
+            _force_no_inplace:
+                If True, route IPA through the non-inplace branch (required
+                for torch.compile). Monomer only; ignored in multimer mode.
         Returns:
             A dictionary of outputs
         """
         if(self.is_multimer):
             outputs = self._forward_multimer(evoformer_output_dict, aatype, mask, inplace_safe, _offload_inference)
         else:
-            outputs = self._forward_monomer(evoformer_output_dict, aatype, mask, inplace_safe, _offload_inference)
+            outputs = self._forward_monomer(
+                evoformer_output_dict, aatype, mask, inplace_safe,
+                _offload_inference, _force_no_inplace=_force_no_inplace,
+            )
 
         return outputs
 
