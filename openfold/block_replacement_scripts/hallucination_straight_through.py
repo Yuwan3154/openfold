@@ -604,6 +604,7 @@ def load_model(
     enable_deepspeed_attention: bool = False,
     disable_chunking: bool = False,
     wrap_all_blocks: bool = False,
+    dtype: str = "bf16",
     triangle_st_only: bool = False,
     triangle_kernel_size: int = 3,
     triangle_dilation_pattern: Optional[Tuple[int, ...]] = None,
@@ -702,8 +703,9 @@ def load_model(
             dilation_repeats=dilation_repeats,
             replacement_mode=replacement_mode,
         )
-    if device.type == "cuda":
+    if device.type == "cuda" and dtype == "bf16":
         model = model.bfloat16()
+    # dtype == "fp32" keeps the model in default float32 weights
 
     # Wrap remaining blocks for maximum memory savings
     if wrap_all_blocks and allow_replacements:
@@ -771,6 +773,7 @@ def optimize_sequence(
     optimizer: str = "SGD",
     norm_grad: bool = True,
     ckpt_replacement_only: bool = False,
+    dtype: str = "bf16",
 ) -> Tuple[torch.Tensor, list, list, torch.Tensor, float, Optional[float], Optional[float]]:
     if init_seq == "0":
         seq_logits = nn.Parameter(torch.zeros(seq_len, 20, device=device))
@@ -823,8 +826,10 @@ def optimize_sequence(
         # Skip running structure module during optimization when not needed
         if effective_coor_scale == 0.0:
             batch["return_representations"] = True
+        _autocast_dtype = torch.bfloat16 if dtype == "bf16" else torch.float32
+        _autocast_enabled = (device.type == "cuda") and (dtype != "fp32")
         with torch.autocast(
-            device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"
+            device_type=device.type, dtype=_autocast_dtype, enabled=_autocast_enabled
         ):
             outputs = model(batch)
 
@@ -1033,7 +1038,46 @@ def main():
         default=False,
         help="Freeze all params except replacement blocks for memory savings.",
     )
+    parser.add_argument(
+        "--disable_attention_opts",
+        action="store_true",
+        default=False,
+        help="Force vanilla attention path (no DeepSpeed/LMA/Flash). Highest-accuracy reference; matches the existing disable_attention_opts arg of load_model().",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Optional integer seed for torch/numpy/random. If unset, runs are nondeterministic.",
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="bf16",
+        choices=["bf16", "fp32"],
+        help="Forward dtype: bf16 (default, fast) or fp32 (accurate reference).",
+    )
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        default=False,
+        help="Set torch.use_deterministic_algorithms(True) and cuBLAS workspace for bit-exact runs (slower).",
+    )
     args = parser.parse_args()
+
+    if args.seed is not None:
+        import random as _random
+        _random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+    if args.deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        if torch.backends.cudnn.is_available():
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
     if args.dist_scale == 0.0 and args.coor_scale == 0.0:
         raise ValueError("dist_scale and coor_scale cannot both be 0")
     if args.straight_through_all and args.straight_through_selection != "static_blocks":
@@ -1098,6 +1142,8 @@ def main():
         straight_through=True,
         disable_chunking=args.disable_chunking,
         wrap_all_blocks=args.wrap_all_blocks,
+        disable_attention_opts=args.disable_attention_opts,
+        dtype=args.dtype,
     )
     if args.disable_extra_msa:
         model.config.extra_msa.enabled = False
@@ -1136,6 +1182,7 @@ def main():
         optimizer=args.optimizer,
         norm_grad=args.norm_grad,
         ckpt_replacement_only=args.ckpt_replacement_only,
+        dtype=args.dtype,
     )
 
     peak_mem_allocated_bytes = None

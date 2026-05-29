@@ -324,24 +324,48 @@ _atom_site.pdbx_PDB_model_num 1
         return self._create_features_from_sequence(chain_id, sequence)
 
     def _run_inference_with_hooks(self, model: AlphaFold, feature_dict: Dict[str, np.ndarray]):
-        """Run inference and collect block data via the built-in outputs mechanism"""
-        
-        # Process features
+        """Capture per-block I/O (recycle 0) via forward hooks under no_grad.
+
+        The model only fills built-in recycle_*_block_* outputs when grad is enabled,
+        and a grad-enabled full forward OOMs. Instead we hook evoformer.blocks, record
+        the first firing of each block (= recycle 0), and synthesize the
+        recycle_0_block_* / recycle_0_evoformer_input dict that _save_protein_data reads.
+        """
         processed_feature_dict = self.feature_processor.process_features(
             feature_dict, mode='predict', is_multimer=False
         )
-        
-        # Convert to tensors
         processed_feature_dict = {
             k: torch.as_tensor(v, device=self.device)
             for k, v in processed_feature_dict.items()
         }
-        
-        # Run inference - OpenFold will automatically capture intermediate outputs
-        # when they are available (the model has built-in support for this)
-        with torch.no_grad():
-            outputs = model(processed_feature_dict)
-        
+
+        capture_out = {}
+        capture_in0 = {}
+        hooks = []
+
+        def make_hook(idx):
+            def hook(module, inputs, outputs):
+                if idx in capture_out:
+                    return
+                capture_out[idx] = (outputs[0].detach().clone(), outputs[1].detach().clone())
+                if idx == 0:
+                    capture_in0[0] = (inputs[0].detach().clone(), inputs[1].detach().clone())
+            return hook
+
+        for idx, block in enumerate(model.evoformer.blocks):
+            hooks.append(block.register_forward_hook(make_hook(idx)))
+        try:
+            with torch.no_grad():
+                _ = model(processed_feature_dict)
+        finally:
+            for h in hooks:
+                h.remove()
+
+        outputs = {}
+        for idx, (m_out, z_out) in capture_out.items():
+            outputs[f"recycle_0_block_{idx}"] = (m_out, z_out)
+        if 0 in capture_in0:
+            outputs["recycle_0_evoformer_input"] = capture_in0[0]
         return outputs
 
     def collect_data(self):

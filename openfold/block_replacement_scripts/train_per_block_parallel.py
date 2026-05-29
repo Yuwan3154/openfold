@@ -453,6 +453,9 @@ class ParallelBlockPretrainer(pl.LightningModule):
         blocks_to_train: Optional[Tuple[int, ...]] = None,
         learning_rate: float = 1e-4,
         weight_decay: float = 1e-4,
+        residual_gate: bool = False,
+        residual_out_proj: bool = False,
+        skip_cache_preflight: bool = False,
     ):
         super().__init__()
         self.config = config
@@ -485,7 +488,14 @@ class ParallelBlockPretrainer(pl.LightningModule):
         self.blocks_to_train = tuple(blocks_to_train) if blocks_to_train is not None else None
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
-        
+        self.residual_gate = bool(residual_gate)
+        self.residual_out_proj = bool(residual_out_proj)
+        self.skip_cache_preflight = bool(skip_cache_preflight)
+        # Allow Lightning to load checkpoints that lack the new res_gate / out_proj_* keys
+        # (e.g., warm-starting the gated arch from a pre-gated r2 checkpoint).
+        if self.residual_gate or self.residual_out_proj:
+            self.strict_loading = False
+
         # Get dimensions from config
         self.c_m = config.model.evoformer_stack.c_m
         self.c_z = config.model.evoformer_stack.c_z
@@ -493,12 +503,15 @@ class ParallelBlockPretrainer(pl.LightningModule):
         # Create teacher model with block capture
         self.teacher = None
         self._teacher_model = None
-        if self.block_data_dir is None:
+        if self.block_data_dir is None or self.skip_cache_preflight:
+            # Eager-load teacher when (a) no cache (every step uses teacher) or
+            # (b) cache-as-we-train mode (preflight skipped; teacher fills cache on miss).
             print("Loading teacher model...", flush=True)
             self._teacher_model = self._load_teacher_model()
         else:
             print(
-                "Cache-only mode enabled (block_data_dir is set). Teacher model will NOT be initialized.",
+                "Cache-only mode enabled (block_data_dir is set, preflight on). "
+                "Teacher model will NOT be initialized.",
                 flush=True,
             )
         
@@ -512,6 +525,15 @@ class ParallelBlockPretrainer(pl.LightningModule):
     def _load_teacher_model(self) -> AlphaFold:
         """Load the pretrained teacher model"""
         config = model_config(self.config_preset, train=False, low_prec=False)
+        # Speedup kernels: cuequivariance attention + multiplicative-update if installed,
+        # else flash-attn. Forward-only, frozen teacher; bf16 inference numerics are
+        # near-equivalent.
+        import importlib.util
+        if importlib.util.find_spec("cuequivariance") is not None:
+            config.globals.use_cuequivariance_attention = True
+            config.globals.use_cuequivariance_multiplicative_update = True
+        else:
+            config.globals.use_flash = True
         model = AlphaFold(config)
         
         # Load weights
@@ -570,6 +592,8 @@ class ParallelBlockPretrainer(pl.LightningModule):
                         dilation_pattern=self.dilation_pattern,
                         dilation_repeats=self.dilation_repeats,
                         mode=self.replacement_mode,
+                        residual_gate=self.residual_gate,
+                        residual_out_proj=self.residual_out_proj,
                     )
                 self.replacement_blocks[str(block_idx)] = replacement_block
                 blocks_random_init += 1
@@ -628,6 +652,8 @@ class ParallelBlockPretrainer(pl.LightningModule):
                     dilation_pattern=self.dilation_pattern,
                     dilation_repeats=self.dilation_repeats,
                     mode=self.replacement_mode,
+                    residual_gate=self.residual_gate,
+                    residual_out_proj=self.residual_out_proj,
                 )
 
             # Load checkpoint if present
@@ -644,7 +670,10 @@ class ParallelBlockPretrainer(pl.LightningModule):
                         k.replace("replacement_block.", ""): v for k, v in state_dict.items()
                     }
 
-                replacement_block.load_state_dict(state_dict, strict=True)
+                # strict=False when the new arch flags are on (the loaded per-block
+                # checkpoint precedes the res_gate / out_proj_* additions).
+                strict = not (self.residual_gate or self.residual_out_proj)
+                replacement_block.load_state_dict(state_dict, strict=strict)
                 blocks_loaded_from_ckpt += 1
             else:
                 blocks_random_init += 1
@@ -676,7 +705,7 @@ class ParallelBlockPretrainer(pl.LightningModule):
 
     def on_fit_start(self):
         # In cache-only mode, ensure teacher is never initialized.
-        if self.block_data_dir is not None:
+        if self.block_data_dir is not None and not self.skip_cache_preflight:
             if self.teacher is not None or self._teacher_model is not None:
                 raise RuntimeError("Cache-only mode forbids teacher initialization, but teacher is present")
 
@@ -889,7 +918,7 @@ class ParallelBlockPretrainer(pl.LightningModule):
             else:
                 # Teacher path (single-sample only when block_data_dir is not set)
                 cache_misses += 1
-                if self.block_data_dir is not None:
+                if self.block_data_dir is not None and not self.skip_cache_preflight:
                     raise RuntimeError("Cache-only mode: unexpected missing cached data")
 
                 if block_data is None:
@@ -1246,7 +1275,7 @@ class ParallelBlockPretrainer(pl.LightningModule):
             else:
                 # Teacher path (single-sample only when block_data_dir is not set)
                 cache_misses += 1
-                if self.block_data_dir is not None:
+                if self.block_data_dir is not None and not self.skip_cache_preflight:
                     raise RuntimeError("Cache-only mode: unexpected missing cached data")
 
                 if block_data is None:
@@ -1554,6 +1583,9 @@ def main(args, parser):
         blocks_to_train=getattr(args, "blocks_to_train", None),
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
+        residual_gate=args.residual_gate,
+        residual_out_proj=args.residual_out_proj,
+        skip_cache_preflight=args.skip_cache_preflight,
     )
     
     # Setup callbacks
@@ -1774,6 +1806,28 @@ if __name__ == '__main__':
         default="per_block",
         choices=["per_block", "shared_proj"],
         help="Convolutional replacement architecture mode (conv mode)",
+    )
+    parser.add_argument(
+        "--residual_gate",
+        action="store_true",
+        default=False,
+        help="Add additive Highway-style gate on the residual path (R1).",
+    )
+    parser.add_argument(
+        "--residual_out_proj",
+        action="store_true",
+        default=False,
+        help="Add end-only identity-init output linear after the residual stack (R3).",
+    )
+    parser.add_argument(
+        "--skip_cache_preflight",
+        action="store_true",
+        default=False,
+        help=(
+            "Skip the on_fit_start cache preflight check that requires all per-block files "
+            "to exist. Enables cache-as-we-train: teacher runs on cache miss and writes the "
+            "result so subsequent epochs hit the cache. Teacher is eager-loaded per rank."
+        ),
     )
     parser.add_argument(
         "--replacement_checkpoint_subdir",

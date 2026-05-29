@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 
 class _MResNetBlock(nn.Module):
-    def __init__(self, c_m: int, kernel_size: int, dilation: int):
+    def __init__(self, c_m: int, kernel_size: int, dilation: int, residual_gate: bool = False):
         super().__init__()
         if c_m % 2 != 0:
             raise ValueError(f"c_m must be even for down-projection, got {c_m}")
@@ -36,6 +36,14 @@ class _MResNetBlock(nn.Module):
         self.ln_out = nn.LayerNorm(c_hidden)
         self.up = nn.Linear(c_hidden, c_m)
 
+        self.residual_gate = bool(residual_gate)
+        if self.residual_gate:
+            # Highway-style additive gate on the residual path: out = g(x)*x + delta
+            # Zero-weight + bias=5 -> sigmoid(5) ~ 0.9933 ~ identity at init
+            self.res_gate = nn.Linear(c_m, c_m)
+            nn.init.zeros_(self.res_gate.weight)
+            nn.init.constant_(self.res_gate.bias, 5.0)
+
     def forward(self, m: torch.Tensor, msa_mask: Optional[torch.Tensor]) -> torch.Tensor:
         # m: [B, S, N, C_m]
         residual = m
@@ -61,11 +69,14 @@ class _MResNetBlock(nn.Module):
         if msa_mask is not None:
             x = x * msa_mask[..., None]
 
+        if self.residual_gate:
+            g = torch.sigmoid(self.res_gate(residual))
+            return g * residual + x
         return residual + x
 
 
 class _ZResNetBlock(nn.Module):
-    def __init__(self, c_z: int, kernel_size: int, dilation: int):
+    def __init__(self, c_z: int, kernel_size: int, dilation: int, residual_gate: bool = False):
         super().__init__()
         if c_z % 2 != 0:
             raise ValueError(f"c_z must be even for down-projection, got {c_z}")
@@ -93,6 +104,12 @@ class _ZResNetBlock(nn.Module):
         self.ln_out = nn.LayerNorm(c_hidden)
         self.up = nn.Linear(c_hidden, c_z)
 
+        self.residual_gate = bool(residual_gate)
+        if self.residual_gate:
+            self.res_gate = nn.Linear(c_z, c_z)
+            nn.init.zeros_(self.res_gate.weight)
+            nn.init.constant_(self.res_gate.bias, 5.0)
+
     def forward(self, z: torch.Tensor, pair_mask: Optional[torch.Tensor]) -> torch.Tensor:
         # z: [B, N, N, C_z]
         residual = z
@@ -117,6 +134,9 @@ class _ZResNetBlock(nn.Module):
         if pair_mask is not None:
             x = x * pair_mask[..., None]
 
+        if self.residual_gate:
+            g = torch.sigmoid(self.res_gate(residual))
+            return g * residual + x
         return residual + x
 
 
@@ -127,6 +147,7 @@ class _MSharedProjConvStack(nn.Module):
         kernel_size: int,
         dilation_pattern: Sequence[int],
         repeats: int,
+        residual_gate: bool = False,
     ):
         super().__init__()
         if c_m % 2 != 0:
@@ -173,6 +194,14 @@ class _MSharedProjConvStack(nn.Module):
         self.up = nn.Linear(c_hidden, c_m)
         self.repeats = repeats
 
+        self.residual_gate = bool(residual_gate)
+        if self.residual_gate:
+            # Shared per-repeat additive Highway gate on the residual path.
+            # Zero-weight + bias=5 -> sigmoid(5) ~ 0.9933 ~ identity at init.
+            self.res_gate = nn.Linear(c_m, c_m)
+            nn.init.zeros_(self.res_gate.weight)
+            nn.init.constant_(self.res_gate.bias, 5.0)
+
     def forward(self, m: torch.Tensor, msa_mask: Optional[torch.Tensor]) -> torch.Tensor:
         # m: [B, S, N, C_m]
         residual = m
@@ -203,7 +232,11 @@ class _MSharedProjConvStack(nn.Module):
             x = x * layer_gate
             if msa_mask is not None:
                 x = x * msa_mask[..., None]
-            residual = residual + x
+            if self.residual_gate:
+                g = torch.sigmoid(self.res_gate(residual))
+                residual = g * residual + x
+            else:
+                residual = residual + x
 
         return residual
 
@@ -215,6 +248,7 @@ class _ZSharedProjConvStack(nn.Module):
         kernel_size: int,
         dilation_pattern: Sequence[int],
         repeats: int,
+        residual_gate: bool = False,
     ):
         super().__init__()
         if c_z % 2 != 0:
@@ -261,6 +295,12 @@ class _ZSharedProjConvStack(nn.Module):
         self.up = nn.Linear(c_hidden, c_z)
         self.repeats = repeats
 
+        self.residual_gate = bool(residual_gate)
+        if self.residual_gate:
+            self.res_gate = nn.Linear(c_z, c_z)
+            nn.init.zeros_(self.res_gate.weight)
+            nn.init.constant_(self.res_gate.bias, 5.0)
+
     def forward(self, z: torch.Tensor, pair_mask: Optional[torch.Tensor]) -> torch.Tensor:
         # z: [B, N, N, C_z]
         residual = z
@@ -290,7 +330,11 @@ class _ZSharedProjConvStack(nn.Module):
             x = x * layer_gate
             if pair_mask is not None:
                 x = x * pair_mask[..., None]
-            residual = residual + x
+            if self.residual_gate:
+                g = torch.sigmoid(self.res_gate(residual))
+                residual = g * residual + x
+            else:
+                residual = residual + x
 
         return residual
 
@@ -316,6 +360,8 @@ class DilatedConvEvoformerReplacement(nn.Module):
         dilation_pattern: Optional[Sequence[int]] = None,
         dilation_repeats: int = 1,
         mode: str = "per_block",
+        residual_gate: bool = False,
+        residual_out_proj: bool = False,
     ):
         super().__init__()
         self.c_m = c_m
@@ -331,10 +377,16 @@ class DilatedConvEvoformerReplacement(nn.Module):
         expanded = dilation_pattern * self.dilation_repeats
         self.dilations = tuple(int(d) for d in expanded)
         self.mode = str(mode)
+        self.residual_gate = bool(residual_gate)
+        self.residual_out_proj = bool(residual_out_proj)
 
         if self.mode == "per_block":
-            self.m_blocks = nn.ModuleList([_MResNetBlock(c_m=c_m, kernel_size=kernel_size, dilation=d) for d in self.dilations])
-            self.z_blocks = nn.ModuleList([_ZResNetBlock(c_z=c_z, kernel_size=kernel_size, dilation=d) for d in self.dilations])
+            self.m_blocks = nn.ModuleList(
+                [_MResNetBlock(c_m=c_m, kernel_size=kernel_size, dilation=d, residual_gate=self.residual_gate) for d in self.dilations]
+            )
+            self.z_blocks = nn.ModuleList(
+                [_ZResNetBlock(c_z=c_z, kernel_size=kernel_size, dilation=d, residual_gate=self.residual_gate) for d in self.dilations]
+            )
             self.m_stack = None
             self.z_stack = None
         elif self.mode == "shared_proj":
@@ -345,15 +397,28 @@ class DilatedConvEvoformerReplacement(nn.Module):
                 kernel_size=kernel_size,
                 dilation_pattern=self.dilation_pattern,
                 repeats=self.dilation_repeats,
+                residual_gate=self.residual_gate,
             )
             self.z_stack = _ZSharedProjConvStack(
                 c_z=c_z,
                 kernel_size=kernel_size,
                 dilation_pattern=self.dilation_pattern,
                 repeats=self.dilation_repeats,
+                residual_gate=self.residual_gate,
             )
         else:
             raise ValueError(f"Invalid mode: {self.mode}. Expected 'per_block' or 'shared_proj'.")
+
+        if self.residual_out_proj:
+            # End-only output projection applied after the m/z stacks return.
+            # Identity init (W=I, b=0) makes it a no-op at init.
+            self.out_proj_m = nn.Linear(c_m, c_m)
+            self.out_proj_z = nn.Linear(c_z, c_z)
+            with torch.no_grad():
+                self.out_proj_m.weight.copy_(torch.eye(c_m))
+                self.out_proj_m.bias.zero_()
+                self.out_proj_z.weight.copy_(torch.eye(c_z))
+                self.out_proj_z.bias.zero_()
 
     def forward(
         self,
@@ -363,8 +428,13 @@ class DilatedConvEvoformerReplacement(nn.Module):
         pair_mask: torch.Tensor,
         chunk_size: Optional[int] = None,
         use_deepspeed_evo_attention: bool = False,
+        use_cuequivariance_attention: bool = False,
+        use_cuequivariance_multiplicative_update: bool = False,
         use_lma: bool = False,
         use_flash: bool = False,
+        use_torch_sdpa: bool = False,
+        use_torch_vanilla: bool = False,
+        use_torch_cueq: bool = False,
         inplace_safe: bool = False,
         _mask_trans: bool = True,
         _attn_chunk_size: Optional[int] = None,
@@ -374,8 +444,13 @@ class DilatedConvEvoformerReplacement(nn.Module):
         del (
             chunk_size,
             use_deepspeed_evo_attention,
+            use_cuequivariance_attention,
+            use_cuequivariance_multiplicative_update,
             use_lma,
             use_flash,
+            use_torch_sdpa,
+            use_torch_vanilla,
+            use_torch_cueq,
             inplace_safe,
             _attn_chunk_size,
             _offload_inference,
@@ -411,6 +486,16 @@ class DilatedConvEvoformerReplacement(nn.Module):
                     z = blk(z, pair_trans_mask)
             else:
                 z = self.z_stack(z, pair_trans_mask)
+
+        if self.residual_out_proj:
+            if m is not None:
+                m = self.out_proj_m(m)
+                if msa_trans_mask is not None:
+                    m = m * msa_trans_mask[..., None]
+            if z is not None:
+                z = self.out_proj_z(z)
+                if pair_trans_mask is not None:
+                    z = z * pair_trans_mask[..., None]
 
         if squeeze_m and m is not None:
             m = m.squeeze(0)
