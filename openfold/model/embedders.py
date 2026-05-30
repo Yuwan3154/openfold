@@ -709,6 +709,14 @@ class TemplateEmbedder(nn.Module):
 
         del pair_embeds
 
+        # Joint-discontinuous masking: drop template pairs across ordered segments.
+        # All template slots share the query segment structure and pair_mask is
+        # template-agnostic, so apply the identical block-diagonal once (slot 0).
+        seg_compat = batch.get("template_segment_compat_2d", None)
+        if seg_compat is not None:
+            seg_compat = seg_compat.select(templ_dim, 0)
+            pair_mask = pair_mask * seg_compat.to(dtype=pair_mask.dtype)
+
         # [*, S_t, N, N, C_z]
         t = self.template_pair_stack(
             t_pair,
