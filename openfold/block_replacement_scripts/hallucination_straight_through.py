@@ -364,6 +364,7 @@ def _wrap_replacements_from_checkpoint(
 ) -> int:
     """Replace Evoformer blocks with checkpointed replacements when available."""
     wrapped = 0
+    _gated = any(("res_gate" in k or "out_proj" in k) for k in state_dict)
     for idx in range(len(model.evoformer.blocks)):
         rep_prefix = f"replacement_blocks.{idx}."
         if any(k.startswith(rep_prefix) for k in state_dict):
@@ -378,6 +379,8 @@ def _wrap_replacements_from_checkpoint(
                     dilation_pattern=dilation_pattern,
                     dilation_repeats=int(dilation_repeats),
                     mode=str(replacement_mode),
+                    residual_gate=_gated,
+                    residual_out_proj=_gated,
                 )
             else:
                 raise ValueError(
