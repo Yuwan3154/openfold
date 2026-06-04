@@ -751,7 +751,7 @@ class ParallelBlockPretrainer(pl.LightningModule):
                                     if len(missing) < 20:
                                         missing.append(f"{split_name}: {cache_path}")
 
-            ok_tensor = torch.tensor([1 if ok else 0], dtype=torch.int32)
+            ok_tensor = torch.tensor([1 if ok else 0], dtype=torch.int32, device=self.device)
             if is_dist:
                 torch.distributed.broadcast(ok_tensor, src=0)
 
