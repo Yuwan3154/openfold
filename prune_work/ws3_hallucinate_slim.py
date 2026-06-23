@@ -95,7 +95,8 @@ def usalign_tm(pdb_a, pdb_b):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--target_pdb", default="/home/jupyter-chenxi/data/7ad5_example/7ad5_A_cath_3.40.50.720_0_cg2all.pdb")
+    # NATURAL deposited structure (NOT a diffusion-sampled / cg2all-reconstructed one). Make via ws3_prep_natural_target.py.
+    ap.add_argument("--target_pdb", default="/home/jupyter-chenxi/data/7ad5_natural/7ad5_A.pdb")
     ap.add_argument("--chain", default="A")
     ap.add_argument("--slim_ckpt", default="/home/jupyter-chenxi/runs/slim_struct_v1/lightning_logs/version_4/checkpoints/best-037-009500.ckpt")
     ap.add_argument("--jax", default="/home/jupyter-chenxi/params/params_model_1_ptm.npz")

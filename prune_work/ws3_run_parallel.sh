@@ -6,9 +6,11 @@ cd /home/jupyter-chenxi/openfold
 export PYTHONPATH=/home/jupyter-chenxi/openfold/openfold
 PY=/home/jupyter-chenxi/miniconda3/envs/cue_openfold_gated/bin/python
 PYMOL=/home/jupyter-chenxi/miniconda3/envs/pymol/bin/pymol
-ROOT=${OUT_ROOT:-/home/jupyter-chenxi/runs/ws3_multistart}
-TARGET=${TARGET_PDB:-/home/jupyter-chenxi/data/7ad5_example/7ad5_A_cath_3.40.50.720_0_cg2all.pdb}
+ROOT=${OUT_ROOT:-/home/jupyter-chenxi/runs/ws3_natural}
+# NATURAL deposited target (NOT diffusion-sampled/cg2all). Auto-prep the default if missing.
+TARGET=${TARGET_PDB:-/home/jupyter-chenxi/data/7ad5_natural/7ad5_A.pdb}
 STEPS=${STEPS:-300}
+[ -f "$TARGET" ] || $PY prune_work/ws3_prep_natural_target.py --out "$TARGET"
 [ -f "$TARGET" ] || { echo "ERROR: target not found: $TARGET"; exit 1; }
 mkdir -p "$ROOT"
 
