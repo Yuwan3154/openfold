@@ -714,8 +714,16 @@ def compute_tm(
 
     weighted = per_alignment * residue_weights
 
+    # Degenerate templates (low-quality cg2all-reconstructed decoys, or fp16
+    # underflow) can make `weighted` non-finite -> torch.max is NaN -> the
+    # equality is all-False -> empty nonzero -> IndexError. Treat such inputs as
+    # pTM 0 (rank to the bottom) instead of crashing.
+    finite = torch.isfinite(weighted)
+    if not bool(finite.any()):
+        return per_alignment.new_zeros(())
+    weighted = torch.where(finite, weighted, torch.full_like(weighted, float("-inf")))
     argmax = (weighted == torch.max(weighted)).nonzero()[0]
-    return per_alignment[tuple(argmax)]
+    return torch.nan_to_num(per_alignment[tuple(argmax)], nan=0.0)
 
 
 def tm_loss(
