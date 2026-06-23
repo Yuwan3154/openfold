@@ -24,9 +24,10 @@ cmd.load(f"{out_dir}/full_pred.pdb", "full")
 cmd.pair_fit("slim and name CA", "target and name CA")
 cmd.pair_fit("full and name CA", "target and name CA")
 
+cmd.dss()  # assign secondary structure from coords (else cg2all target renders as bare coil)
 cmd.hide("everything")
 cmd.show("cartoon")
-cmd.color("grey70", "target")
+cmd.color("grey50", "target")
 cmd.color("marine", "slim")
 cmd.color("orange", "full")
 
