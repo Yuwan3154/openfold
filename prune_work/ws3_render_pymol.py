@@ -16,6 +16,8 @@ from pymol import cmd, util
 
 out_dir = sys.argv[1] if len(sys.argv) > 1 else "."
 
+cmd.bg_color("white")  # user's exact setting: set first (helps ray_trace_mode 1 edge rendering)
+
 cmd.load(f"{out_dir}/target.pdb", "target")
 cmd.load(f"{out_dir}/slim_pred.pdb", "slim")
 cmd.load(f"{out_dir}/full_pred.pdb", "full")
@@ -34,7 +36,7 @@ cmd.color("orange", "full")
 # --- user's preferred publication style ---
 util.performance(0)                  # Display > Quality > Maximum Quality
 cmd.set("light_count", 1)
-cmd.set("ray_trace_mode", 0)         # smooth shaded (no outlines)
+cmd.set("ray_trace_mode", 1)         # black-outline cartoon (publication look)
 cmd.set("antialias", 0)
 cmd.set("ray_opaque_background", 0)  # TRANSPARENT background = default for all pngs
 
