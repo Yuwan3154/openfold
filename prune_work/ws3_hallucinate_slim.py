@@ -17,6 +17,8 @@ the STE toggles inside optimize_sequence are inert).
 """
 import argparse
 import json
+import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -81,8 +83,13 @@ def out_to_pdb(out, seq_idx):
     return to_pdb(prot)
 
 
+_USALIGN = shutil.which("USalign") or os.path.expanduser("~/.local/bin/USalign")
+
+
 def usalign_tm(pdb_a, pdb_b):
-    r = subprocess.run(["USalign", str(pdb_a), str(pdb_b)], capture_output=True, text=True, check=False)
+    if not os.path.exists(_USALIGN) and shutil.which(_USALIGN) is None:
+        raise FileNotFoundError(f"USalign not found (tried {_USALIGN}); set PATH or pass full path")
+    r = subprocess.run([_USALIGN, str(pdb_a), str(pdb_b)], capture_output=True, text=True, check=False)
     return H._parse_usalign_tm_score(r.stdout)
 
 
