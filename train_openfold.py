@@ -14,6 +14,8 @@ from pytorch_lightning.plugins.environments import MPIEnvironment
 from pytorch_lightning import seed_everything
 from pytorch_lightning.utilities.rank_zero import rank_zero_info
 import torch
+import torch.multiprocessing as _tmp
+_tmp.set_sharing_strategy("file_system")
 import wandb
 from deepspeed.utils import zero_to_fp32 
 
@@ -45,6 +47,11 @@ from openfold.block_replacement_scripts.custom_evoformer_replacement import (
     replace_evoformer_block, 
     freeze_all_except_replaced_block
 )
+from openfold.block_replacement_scripts.pruned_evoformer import (
+    prune_blocks,
+    freeze_all_except_evoformer,
+    freeze_all_except_heads,
+)
 
 # Import AdaptiveOpenFoldWrapper for adaptive training
 try:
@@ -55,7 +62,7 @@ except ImportError:
 
 
 class OpenFoldWrapper(pl.LightningModule):
-    def __init__(self, config, replace_block_index=None, replacement_hidden_dim=None, learning_rate=1e-3):
+    def __init__(self, config, replace_block_index=None, replacement_hidden_dim=None, learning_rate=1e-3, warmup_no_steps=1000):
         super(OpenFoldWrapper, self).__init__()
         self.config = config
         self.model = AlphaFold(config)
@@ -63,6 +70,7 @@ class OpenFoldWrapper(pl.LightningModule):
         self.replace_block_index = replace_block_index
         self.replacement_hidden_dim = replacement_hidden_dim
         self.learning_rate = learning_rate
+        self.warmup_no_steps = warmup_no_steps
 
         # Apply block replacement if specified
         if replace_block_index is not None:
@@ -162,6 +170,26 @@ class OpenFoldWrapper(pl.LightningModule):
 
         ground_truth = batch.pop('gt_features', None)
 
+        # Direction-2 hybrid: frozen full-48 teacher forward (no grad) on the same batch -> single/pair targets.
+        _teacher = getattr(self, "distill_teacher", None)
+        _dw = getattr(self, "distill_weight", 0.0)
+        _teacher_out = None
+        if _teacher is not None and _dw > 0:
+            _dev = batch["aatype"].device
+            if next(_teacher.parameters()).device != _dev:
+                _teacher.to(_dev)
+            # NOTE: do NOT set return_representations on the shared batch -- it makes
+            # AlphaFold.iteration early-return before the structure module (no outputs['sm'])
+            # and would crash the student loss. Default forward already exposes outputs['single']/['pair'].
+            _tb = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in batch.items()}
+            with torch.no_grad():
+                _teacher_out = _teacher(_tb)
+
+        # Cached-teacher distillation: pop targets before the forward (they carry no recycling dim)
+        _ck = ["single", "msa_row0", "pair", "distogram", "plddt", "pae"]
+        _cache_t = {k: batch.pop("teacher_" + k) for k in _ck if "teacher_" + k in batch}
+        batch.pop("num_res_crop_start", None)
+
         # Run the model
         outputs = self(batch)
 
@@ -177,6 +205,48 @@ class OpenFoldWrapper(pl.LightningModule):
         loss, loss_breakdown = self.loss(
             outputs, batch, _return_breakdown=True
         )
+
+        # Direction-2 hybrid: add teacher-distillation MSE on final single/pair representations.
+        if _teacher_out is not None:
+            _tg = getattr(self, "distill_targets", "s,z")
+            _dl = outputs["single"].float().new_zeros(())
+            if "s" in _tg and "single" in outputs and "single" in _teacher_out:
+                _dl = _dl + torch.nn.functional.mse_loss(outputs["single"].float(), _teacher_out["single"].float())
+            if "z" in _tg and "pair" in outputs and "pair" in _teacher_out:
+                _dl = _dl + torch.nn.functional.mse_loss(outputs["pair"].float(), _teacher_out["pair"].float())
+            loss = loss + _dw * _dl
+            loss_breakdown["distill_mse"] = _dl.detach()
+
+        # Cached-teacher distillation: embedding MSE (single/msa-row/pair) + KL (distogram/pLDDT/pAE), masked by seq_mask
+        if _cache_t:
+            import torch.nn.functional as _F
+            _m = batch["seq_mask"].float()
+            _m1 = _m.unsqueeze(-1)
+            _m2d = _m[:, :, None] * _m[:, None, :]
+            _m2 = _m2d.unsqueeze(-1)
+            def _mse1(pp, tt):
+                d = (pp.float() - tt.float()) ** 2
+                return (d * _m1).sum() / (_m1.sum() * pp.shape[-1]).clamp_min(1.0)
+            def _mse2(pp, tt):
+                d = (pp.float() - tt.float()) ** 2
+                return (d * _m2).sum() / (_m2.sum() * pp.shape[-1]).clamp_min(1.0)
+            def _kl1(sl, tl):
+                tp = _F.softmax(tl.float(), -1); sp = _F.log_softmax(sl.float(), -1)
+                kl = (tp * (tp.clamp_min(1e-9).log() - sp)).sum(-1)
+                return (kl * _m).sum() / _m.sum().clamp_min(1.0)
+            def _kl2(sl, tl):
+                tp = _F.softmax(tl.float(), -1); sp = _F.log_softmax(sl.float(), -1)
+                kl = (tp * (tp.clamp_min(1e-9).log() - sp)).sum(-1)
+                return (kl * _m2d).sum() / _m2d.sum().clamp_min(1.0)
+            _cl = (_mse1(outputs["single"], _cache_t["single"])
+                   + _mse1(outputs["msa"][:, 0], _cache_t["msa_row0"])
+                   + _mse2(outputs["pair"], _cache_t["pair"])
+                   + _kl2(outputs["distogram_logits"], _cache_t["distogram"])
+                   + _kl1(outputs["lddt_logits"], _cache_t["plddt"])
+                   + _kl2(outputs["tm_logits"], _cache_t["pae"]))
+            _cw = float(getattr(self, "cache_distill_weight", 1.0))
+            loss = loss + _cw * _cl
+            loss_breakdown["cache_distill"] = _cl.detach()
 
         # Log it
         self._log(loss_breakdown, batch, outputs)
@@ -297,7 +367,9 @@ class OpenFoldWrapper(pl.LightningModule):
 
         lr_scheduler = AlphaFoldLRScheduler(
             optimizer,
-            last_epoch=self.last_lr_step
+            last_epoch=self.last_lr_step,
+            max_lr=learning_rate,
+            warmup_no_steps=getattr(self, "warmup_no_steps", 1000),
         )
 
         return {
@@ -344,7 +416,7 @@ def get_model_state_dict_from_ds_checkpoint(checkpoint_dir):
     ds_checkpoint_dir = os.path.join(checkpoint_dir, tag)
     _DS_CHECKPOINT_VERSION = 2  # based on manual parsing of checkpoint files
     state_file = zero_to_fp32.get_model_state_file(ds_checkpoint_dir, _DS_CHECKPOINT_VERSION)
-    return torch.load(state_file)
+    return torch.load(state_file, weights_only=False)
 
 def main(args):
     # Set float32 matmul precision for Tensor Cores
@@ -361,6 +433,9 @@ def main(args):
         train=True, 
         low_prec=is_low_precision,
     )
+    _mri = os.environ.get("MAX_RECYCLING_ITERS")
+    if _mri is not None:
+        config.data.common.max_recycling_iters = int(_mri)   # student trains at the cache recycle count
     if args.experiment_config_json: 
         with open(args.experiment_config_json, 'r') as f:
             custom_config_dict = json.load(f)
@@ -374,11 +449,14 @@ def main(args):
         config.data.common.max_msa_clusters = 1
         config.data.train.max_extra_msa = 1
         config.data.train.max_msa_clusters = 1
-        # Disable templates entirely for single sequence mode
-        # (Use finetuning_no_templ_ptm preset with .pt weights instead of JAX .npz)
-        config.model.template.enabled = False
-        config.data.common.use_templates = False
-        config.data.common.use_template_torsion_angles = False
+        # Disable templates entirely for single sequence mode, UNLESS --single_seq_keep_templates
+        # (single-seq + templates: MSA-free query but keep the template channel, e.g. BindCraft-style design).
+        if not getattr(args, "single_seq_keep_templates", False):
+            config.model.template.enabled = False
+            config.data.common.use_templates = False
+            config.data.common.use_template_torsion_angles = False
+        else:
+            rank_zero_info("single_seq_keep_templates: templates KEPT enabled in single-seq mode")
         # Disable MSA-specific losses for single sequence training
         rank_zero_info("Disabling masked_msa loss for single sequence mode")
         config.loss.masked_msa.weight = 0.0
@@ -405,13 +483,13 @@ def main(args):
 
     # Handle checkpoint loading
     if args.resume_from_ckpt:
-        if args.resume_model_weights_only:
+        if args.resume_model_weights_only and not getattr(args, "evoformer_keep_block_indices", None):
             # Load the checkpoint
             if os.path.isdir(args.resume_from_ckpt):
                 sd = zero_to_fp32.get_fp32_state_dict_from_zero_checkpoint(
                     args.resume_from_ckpt)
             else:
-                sd = torch.load(args.resume_from_ckpt)
+                sd = torch.load(args.resume_from_ckpt, weights_only=False)
             # Process the state dict
             # Use strict=False if we're doing block replacement or single sequence mode (model structure changed)
             strict_loading = not (
@@ -439,14 +517,14 @@ def main(args):
             if os.path.isdir(args.resume_from_ckpt):
                 sd = get_model_state_dict_from_ds_checkpoint(args.resume_from_ckpt)
             else:
-                sd = torch.load(args.resume_from_ckpt)
+                sd = torch.load(args.resume_from_ckpt, weights_only=False)
             last_global_step = int(sd['global_step'])
             model_module.resume_last_lr_step(last_global_step)
             logging.info("Successfully loaded last lr step...")
 
     # Handle JAX weight loading with template workaround for single sequence mode
     if args.resume_from_jax_params:
-        if args.enable_single_seq_mode:
+        if args.enable_single_seq_mode and not getattr(args, "single_seq_keep_templates", False):
             rank_zero_info("JAX loading with template workaround for single sequence mode...")
             # Temporarily enable templates for JAX loading
             original_template_enabled = config.model.template.enabled
@@ -484,6 +562,74 @@ def main(args):
             model_module.load_from_jax(args.resume_from_jax_params)
             logging.info(f"Successfully loaded JAX parameters at {args.resume_from_jax_params}...")
 
+    # Apply requested LR-warmup length to the final wrapper (after any single-seq reconstruction).
+    if hasattr(model_module, "warmup_no_steps"):
+        model_module.warmup_no_steps = getattr(args, "warmup_no_steps", 1000)
+
+    # Direction 2: keep only a SUBSET of the 48 Evoformer blocks (shallower full-block model),
+    # warm-started from the matching AF2 block weights (full 48 loaded above, then sliced).
+    if getattr(args, "evoformer_keep_block_indices", None):
+        import torch.nn as _nn
+        _keep = [int(x) for x in str(args.evoformer_keep_block_indices).split(",") if x.strip() != ""]
+        _blocks = model_module.model.evoformer.blocks
+        model_module.model.evoformer.blocks = _nn.ModuleList([_blocks[i] for i in _keep])
+        model_module.ema = ExponentialMovingAverage(model=model_module.model, decay=config.ema.decay)
+        rank_zero_info("Evoformer subset: kept %d of %d blocks: %s" % (len(_keep), len(_blocks), _keep))
+        # Weights-only resume for the SLIM block-subset model: load AFTER the 48->24 slice so the
+        # 24-block ckpt keys match (the early pre-slice load is skipped when keep_block_indices is set).
+        if args.resume_from_ckpt and args.resume_model_weights_only:
+            if os.path.isdir(args.resume_from_ckpt):
+                _wsd = zero_to_fp32.get_fp32_state_dict_from_zero_checkpoint(args.resume_from_ckpt)
+            else:
+                _wsd = torch.load(args.resume_from_ckpt, weights_only=False)
+            if 'module' in _wsd:
+                _wsd = {k[len('module.'):]: v for k, v in _wsd['module'].items()}
+            elif 'state_dict' in _wsd:
+                _wsd = _wsd['state_dict']
+            else:
+                _wsd = {'model.' + k: v for k, v in _wsd.items()}
+            import_openfold_weights_(model=model_module, state_dict=_wsd, strict=True)
+            model_module.ema = ExponentialMovingAverage(model=model_module.model, decay=config.ema.decay)
+            rank_zero_info("weights-only resume (post-slice): loaded sliced ckpt into %d-block model" % len(_keep))
+    # Evoformer-only fine-tune for the SLIM block-subset model (freeze embedder/structure-module/heads; no within-block prune).
+    if getattr(args, "freeze_non_evoformer", False):
+        freeze_all_except_evoformer(model_module.model)
+        model_module.ema = ExponentialMovingAverage(model=model_module.model, decay=config.ema.decay)
+        _ntr = sum(p.numel() for p in model_module.model.parameters() if p.requires_grad)
+        _nall = sum(p.numel() for p in model_module.model.parameters())
+        rank_zero_info("freeze_non_evoformer: Evoformer-only trainable %d / %d" % (_ntr, _nall))
+
+    # WS2: confidence-head-only fine-tune (freeze everything except the confidence heads).
+    if getattr(args, "freeze_all_except_heads", False):
+        _ntr, _nall = freeze_all_except_heads(
+            model_module.model, train_distogram=getattr(args, "train_distogram_head", False))
+        model_module.ema = ExponentialMovingAverage(model=model_module.model, decay=config.ema.decay)
+        rank_zero_info("freeze_all_except_heads: heads-only trainable %d / %d" % (_ntr, _nall))
+
+    # Prune the Evoformer AFTER warm-start weight load; fine-tune Evoformer-only.
+    if getattr(args, "prune_evoformer", False):
+        rank_zero_info("Pruning 48 EvoformerBlocks (drop column + triangle attention); Evoformer-only fine-tune.")
+        prune_blocks(model_module.model.evoformer)
+        freeze_all_except_evoformer(model_module.model)
+        model_module.ema = ExponentialMovingAverage(model=model_module.model, decay=config.ema.decay)
+        n_tr = sum(prm.numel() for prm in model_module.model.parameters() if prm.requires_grad)
+        n_all = sum(prm.numel() for prm in model_module.model.parameters())
+        rank_zero_info("Pruned: trainable (Evoformer-only) params %d / %d" % (n_tr, n_all))
+
+    # Direction-2 hybrid: build a frozen FULL-48-block teacher for online representation distillation.
+    if getattr(args, "distill_teacher_jax_params", None) and getattr(args, "distill_weight", 0.0) > 0:
+        _teacher = AlphaFold(config)  # full 48 blocks (config unchanged; student was sliced above)
+        _tb = os.path.splitext(os.path.basename(os.path.normpath(args.distill_teacher_jax_params)))[0]
+        import_jax_weights_(_teacher, args.distill_teacher_jax_params, version="_".join(_tb.split("_")[1:]))
+        _teacher.eval()
+        for _p in _teacher.parameters():
+            _p.requires_grad_(False)
+        model_module.distill_teacher = _teacher
+        model_module.distill_weight = float(args.distill_weight)
+        model_module.distill_targets = args.distill_targets
+        rank_zero_info("Distillation: frozen full-48 teacher loaded; weight=%s targets=%s"
+                       % (args.distill_weight, args.distill_targets))
+
     # TorchScript components of the model
     if (args.script_modules):
         script_preset_(model_module)
@@ -506,33 +652,25 @@ def main(args):
 
     callbacks = []
     
-    # Enhanced checkpoint saving configuration
-    checkpoint_config = {}
-    if hasattr(args, 'checkpoint_save_top_k') and args.checkpoint_save_top_k is not None:
-        checkpoint_config['save_top_k'] = args.checkpoint_save_top_k
-    else:
-        checkpoint_config['save_top_k'] = -1 if args.checkpoint_every_epoch else 1
-    
-    if hasattr(args, 'checkpoint_monitor') and args.checkpoint_monitor:
-        checkpoint_config['monitor'] = args.checkpoint_monitor
-    elif not args.checkpoint_every_epoch:
-        # Use validation loss for best checkpoint when not saving every epoch
-        checkpoint_config['monitor'] = 'val/loss' if hasattr(args, 'val_data_dir') and args.val_data_dir else 'train/loss'
-        checkpoint_config['mode'] = 'min'
-    
-    if args.checkpoint_every_epoch:
-        checkpoint_config['every_n_epochs'] = 1
-        checkpoint_config['auto_insert_metric_name'] = False
-    elif hasattr(args, 'checkpoint_every_n_steps') and args.checkpoint_every_n_steps:
-        checkpoint_config['every_n_train_steps'] = args.checkpoint_every_n_steps
-        checkpoint_config['auto_insert_metric_name'] = False
-    elif hasattr(args, 'checkpoint_every_n_epochs') and args.checkpoint_every_n_epochs:
-        checkpoint_config['every_n_epochs'] = args.checkpoint_every_n_epochs
-        checkpoint_config['auto_insert_metric_name'] = False
-    
-    # Always create a checkpoint callback
-    mc = ModelCheckpoint(**checkpoint_config)
-    callbacks.append(mc)
+    # Checkpointing: BEST by validation loss (early-stopping target to mitigate single-seq
+    # overfitting) + LAST (save_last) for resume + optional periodic for the recovery curve.
+    monitor_metric = (getattr(args, 'checkpoint_monitor', None)
+                      or ('val/loss' if (hasattr(args, 'val_data_dir') and args.val_data_dir) else 'train/loss'))
+    # max for structural-quality metrics (val/lddt_ca, val/gdt_ts, val/tm); min for any *_loss (e.g. val/plddt_loss).
+    monitor_mode = 'max' if (any(k in monitor_metric for k in ('lddt', 'gdt', 'tm')) and 'loss' not in monitor_metric) else 'min'
+    best_ckpt = ModelCheckpoint(
+        monitor=monitor_metric, mode=monitor_mode, save_top_k=1, save_last=False,
+        filename='best-{epoch:03d}-{step:06d}', auto_insert_metric_name=False,
+    )
+    callbacks.append(best_ckpt)
+    # Frequent rolling last.ckpt (every_n_train_steps) so an interruption loses <=~15 min of work.
+    # save_top_k=0 -> NO monitored/accumulating files; save_last=True -> only last.ckpt (overwritten).
+    _periodic_n = getattr(args, 'checkpoint_every_n_steps', None)
+    if _periodic_n:
+        callbacks.append(ModelCheckpoint(
+            every_n_train_steps=_periodic_n, save_top_k=0, save_last=True,
+        ))
+    rank_zero_info(f"Checkpoint: best by {monitor_metric} ({monitor_mode}) [1] + last.ckpt every {_periodic_n} steps")
 
     if (args.early_stopping):
         # Use training metric for early stopping if no validation data is available
@@ -627,6 +765,8 @@ def main(args):
         'strategy': strategy,
         'callbacks': callbacks,
         'logger': loggers,
+        'gradient_clip_val': 0.1,
+        'gradient_clip_algorithm': 'norm',
     })
     trainer = pl.Trainer(**trainer_args)
 
@@ -635,6 +775,12 @@ def main(args):
         ckpt_path = None
     else:
         ckpt_path = args.resume_from_ckpt
+
+    if getattr(args, "validate_only", False):
+        rank_zero_info("validate_only: refreshing EMA from loaded weights and running trainer.validate.")
+        model_module.ema = ExponentialMovingAverage(model=model_module.model, decay=config.ema.decay)
+        trainer.validate(model_module, datamodule=data_module)
+        return
 
     trainer.fit(
         model_module,
@@ -877,6 +1023,53 @@ if __name__ == "__main__":
     parser.add_argument(
         "--enable_single_seq_mode", action="store_true", default=False,
         help="Enable single sequence mode (no MSA/templates required)"
+    )
+    parser.add_argument(
+        "--single_seq_keep_templates", action="store_true", default=False,
+        help="In single-seq mode, KEEP templates enabled (MSA-free query + template channel; standard jax load)."
+    )
+    parser.add_argument(
+        "--prune_evoformer", action="store_true", default=False,
+        help="Prune all 48 EvoformerBlocks (drop column + triangle attention); fine-tune Evoformer-only."
+    )
+    parser.add_argument(
+        "--evoformer_keep_block_indices", type=str, default=None,
+        help="Direction 2: keep only this comma-separated subset of the 48 Evoformer blocks "
+             "(e.g. '0,3,7,10,14,17,21,24,28,31,35,38,42,45,47'), warm-started from the matching "
+             "AF2 block weights. Full blocks kept intact (no within-block pruning)."
+    )
+    parser.add_argument(
+        "--freeze_non_evoformer", action="store_true", default=False,
+        help="Freeze all params except the (sliced) Evoformer blocks -> Evoformer-only fine-tune."
+    )
+    parser.add_argument(
+        "--freeze_all_except_heads", action="store_true", default=False,
+        help="WS2: freeze everything except the confidence heads (plddt, experimentally_resolved, tm) -> heads-only fine-tune."
+    )
+    parser.add_argument(
+        "--train_distogram_head", action="store_true", default=False,
+        help="With --freeze_all_except_heads, also keep the distogram head trainable."
+    )
+    parser.add_argument(
+        "--distill_teacher_jax_params", type=str, default=None,
+        help="Direction 2 hybrid: JAX npz for a frozen FULL-48-block teacher; its final single/pair "
+             "representations are matched (MSE) by the subset student each step."
+    )
+    parser.add_argument(
+        "--distill_weight", type=float, default=0.0,
+        help="Weight of the teacher-distillation MSE term (0 = off)."
+    )
+    parser.add_argument(
+        "--distill_targets", type=str, default="s,z",
+        help="Which teacher representations to distill: 's' (single), 'z' (pair), or 's,z'."
+    )
+    parser.add_argument(
+        "--warmup_no_steps", type=int, default=1000,
+        help="Linear LR warmup steps (default 1000; pruned single-seq fine-tune uses 3000)."
+    )
+    parser.add_argument(
+        "--validate_only", action="store_true", default=False,
+        help="Run trainer.validate on the provided data and exit (no training)."
     )
     parser.add_argument(
         "--learning_rate", type=float, default=1e-3,

@@ -1,0 +1,10 @@
+{
+  "loss.fape.weight": 0.0,
+  "loss.supervised_chi.weight": 0.0,
+  "loss.violation.weight": 0.0,
+  "loss.masked_msa.weight": 0.0,
+  "loss.distogram.weight": 0.0,
+  "loss.plddt_loss.weight": 0.01,
+  "loss.experimentally_resolved.weight": 0.01,
+  "loss.tm.weight": 0.1
+}
