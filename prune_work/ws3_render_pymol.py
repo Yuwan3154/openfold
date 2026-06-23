@@ -34,7 +34,7 @@ cmd.color("orange", "full")
 # --- user's preferred publication style ---
 util.performance(0)                  # Display > Quality > Maximum Quality
 cmd.set("light_count", 1)
-cmd.set("ray_trace_mode", 1)         # black-outline cartoon look
+cmd.set("ray_trace_mode", 0)         # smooth shaded (no outlines)
 cmd.set("antialias", 0)
 cmd.set("ray_opaque_background", 0)  # TRANSPARENT background = default for all pngs
 
