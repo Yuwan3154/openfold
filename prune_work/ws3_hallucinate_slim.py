@@ -104,12 +104,15 @@ def main():
     ap.add_argument("--lr", type=float, default=1.0)           # main() default
     ap.add_argument("--optimizer", default="SGD")              # main() default
     ap.add_argument("--init_seq", default="0")                 # main() default
+    ap.add_argument("--seed", type=int, default=None, help="torch seed (for gaussian-init multi-start)")
     ap.add_argument("--norm_grad", action=argparse.BooleanOptionalAction, default=True)  # ColabDesign-standard normalized-grad
     ap.add_argument("--dtype", default="fp32")                 # conservative for a single reported run
     ap.add_argument("--out_dir", default="/home/jupyter-chenxi/runs/ws3_hallucinate")
     args = ap.parse_args()
 
     device = torch.device("cuda:0")
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
     keep = [int(x) for x in args.keep.split(",")]
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -165,6 +168,7 @@ def main():
         "optimizer": args.optimizer,
         "norm_grad": bool(args.norm_grad),
         "init_seq": args.init_seq,
+        "seed": args.seed,
         "dtype": args.dtype,
         "opt_time_s": float(opt_time_s),
         "final_dist_loss": None if final_dist_loss is None else float(final_dist_loss),
