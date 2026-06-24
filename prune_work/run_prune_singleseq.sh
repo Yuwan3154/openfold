@@ -19,6 +19,7 @@ VAL=${VAL_LIST:-$L/slim_struct_val.list}                   # ABSOLUTE (200)
 OUT=${OUT_DIR:-/home/jupyter-chenxi/runs/prune_singleseq_v1}
 MAXEP=${MAX_EPOCHS:-100}
 SAVE_TOP_K=${SAVE_TOP_K:-5}
+EPL=${TRAIN_EPOCH_LEN:-1000}   # steps/epoch; override small for a smoke
 [ -f "$TRAIN" ] || { echo "ERROR: train list not found: $TRAIN (cwd=$(pwd))"; exit 1; }
 [ -f "$VAL" ]   || { echo "ERROR: val list not found: $VAL (cwd=$(pwd))"; exit 1; }
 python train_openfold.py "$MM" "$ALN" "$MM" "$OUT" 2018-04-30 \
@@ -29,6 +30,6 @@ python train_openfold.py "$MM" "$ALN" "$MM" "$OUT" 2018-04-30 \
   --train_chain_list_path "$TRAIN" \
   --val_data_dir "$MM" --val_alignment_dir "$ALN" --val_chain_list_path "$VAL" \
   --precision bf16 --learning_rate 1e-4 --warmup_no_steps 3000 \
-  --train_epoch_len 1000 --max_epochs "$MAXEP" --num_sanity_val_steps 0 \
+  --train_epoch_len "$EPL" --max_epochs "$MAXEP" --num_sanity_val_steps 0 \
   --checkpoint_every_n_steps 20 --checkpoint_monitor val/lddt_ca --checkpoint_save_top_k "$SAVE_TOP_K" \
   --log_lr --log_every_n_steps 20 --seed 42 --distributed_backend nccl
