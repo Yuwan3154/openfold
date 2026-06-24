@@ -22,11 +22,14 @@ SAVE_TOP_K=${SAVE_TOP_K:-5}
 EPL=${TRAIN_EPOCH_LEN:-1000}   # steps/epoch; override small for a smoke
 [ -f "$TRAIN" ] || { echo "ERROR: train list not found: $TRAIN (cwd=$(pwd))"; exit 1; }
 [ -f "$VAL" ]   || { echo "ERROR: val list not found: $VAL (cwd=$(pwd))"; exit 1; }
+# Auto-resume: if a checkpoint exists, resume full state; else warm-start from AF2 jax (first launch).
+CK=$(ls -t "$OUT"/lightning_logs/version_*/checkpoints/last.ckpt 2>/dev/null | head -1)
+if [ -n "$CK" ]; then RESUME=(--resume_from_ckpt "$CK"); echo "RESUME from $CK"; else RESUME=(--resume_from_jax_params "$JAX"); echo "WARM-START from jax (no ckpt)"; fi
 python train_openfold.py "$MM" "$ALN" "$MM" "$OUT" 2018-04-30 \
   --config_preset finetuning_ptm \
   --kalign_binary_path "$KAL" --obsolete_pdbs_file_path "$OBS" --template_release_dates_cache_path "$CACHE" \
   --prune_evoformer --enable_single_seq_mode --single_seq_keep_templates --freeze_non_evoformer \
-  --resume_from_jax_params "$JAX" \
+  "${RESUME[@]}" \
   --train_chain_list_path "$TRAIN" \
   --val_data_dir "$MM" --val_alignment_dir "$ALN" --val_chain_list_path "$VAL" \
   --precision bf16 --learning_rate 1e-4 --warmup_no_steps 3000 \
