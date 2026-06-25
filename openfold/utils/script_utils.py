@@ -33,7 +33,6 @@ from pytorch_lightning.utilities.deepspeed import (
     convert_zero_checkpoint_to_fp32_state_dict
 )
 
-from .tensorrt_utils import instrument_with_trt_compile
 from .precision_utils import wrap_for_precision
 
 logging.basicConfig()
@@ -68,6 +67,7 @@ def make_output_directory(output_dir, model_name, multiple_model_mode):
 
 def _accelerate(model, config):
     if config.trt.mode is not None:
+        from .tensorrt_utils import instrument_with_trt_compile  # lazy: avoids cuda-python import when TRT unused
         instrument_with_trt_compile(model, config)
     if config.precision is not None and config.precision in ['bf16', 'fp16']:
         model.evoformer = wrap_for_precision(model.evoformer, config.precision)
