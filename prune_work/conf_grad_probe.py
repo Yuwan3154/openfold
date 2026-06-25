@@ -106,6 +106,10 @@ for i, batch in enumerate(loader):
     if i >= args.n:
         break
     batch = to_cuda(batch)
+    none_keys = [k for k, v in batch.items() if v is None]
+    batch = {k: v for k, v in batch.items() if v is not None}
+    if i == 0:
+        print(f"batch: {len(batch)} keys; dropped None: {none_keys}", flush=True)
     out = m(batch)
     b = tensor_tree_map(lambda t: t[..., -1], batch)
     _, gs = gvec(L_struct, out, b)
