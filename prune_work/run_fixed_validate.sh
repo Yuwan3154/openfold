@@ -25,6 +25,6 @@ python train_openfold.py "$MM" "$ALN" "$MM" "$OUT" 2018-04-30 \
   --kalign_binary_path "$KAL" --obsolete_pdbs_file_path "$OBS" --template_release_dates_cache_path "$CACHE" \
   --evoformer_keep_block_indices "$KEEP" --freeze_non_evoformer \
   --resume_from_ckpt "$CKPT" --resume_model_weights_only true --validate_only \
-  --train_data_dir "$MM" --train_alignment_dir "$ALN" --train_chain_list_path "$L/slim_struct_train.list" \
+  --train_chain_list_path "$L/slim_struct_train.list" \
   --val_data_dir "$MM" --val_alignment_dir "$ALN" --val_chain_list_path "$VAL" \
   --precision bf16 --seed 42 --log_every_n_steps 1 --distributed_backend nccl
