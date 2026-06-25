@@ -40,5 +40,7 @@ m.evoformer.blocks = nn.ModuleList([m.evoformer.blocks[i] for i in SLIM12_FROM24
 print(f"trimmed to {len(m.evoformer.blocks)} blocks (orig-48 indices {[KEEP_24[i] for i in SLIM12_FROM24]})")
 
 out_sd = {"model." + k: v for k, v in m.state_dict().items()}
-torch.save({"state_dict": out_sd}, args.out)
-print(f"wrote {args.out} ({len(out_sd)} tensors)")
+# global_step=0: train_openfold.py reads sd['global_step'] for the weights-only+keep-blocks resume
+# path (sets last_lr_step) -> 0 = fresh warmup from step 0 for the new run.
+torch.save({"state_dict": out_sd, "global_step": 0, "epoch": 0}, args.out)
+print(f"wrote {args.out} ({len(out_sd)} tensors, global_step=0)")
