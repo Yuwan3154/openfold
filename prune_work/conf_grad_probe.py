@@ -93,7 +93,8 @@ def to_cuda(x):
 
 
 def gvec(L, out, b):
-    val = L(out, b)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        val = L(out, b)
     g = torch.autograd.grad(val, params, retain_graph=True, allow_unused=True)
     flat = torch.cat([(gi if gi is not None else torch.zeros_like(p)).flatten().float()
                       for gi, p in zip(g, params)])
@@ -110,7 +111,8 @@ for i, batch in enumerate(loader):
     batch = {k: v for k, v in batch.items() if v is not None}
     if i == 0:
         print(f"batch: {len(batch)} keys; dropped None: {none_keys}", flush=True)
-    out = m(batch)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        out = m(batch)
     b = tensor_tree_map(lambda t: t[..., -1], batch)
     _, gs = gvec(L_struct, out, b)
     _, gc = gvec(L_conf, out, b)
