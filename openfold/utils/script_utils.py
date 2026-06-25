@@ -149,7 +149,9 @@ def parse_fasta(data):
     ][1:]
     tags, seqs = lines[::2], lines[1::2]
 
-    tags = [re.split('\W| \|', t)[0] for t in tags]
+    # split on whitespace or '|' only (NOT all \W) so IDs containing '-' (e.g.
+    # "5sbj-assembly1_A") are kept intact and match their precomputed-alignment dir.
+    tags = [re.split(r'\s|\|', t)[0] for t in tags]
 
     return tags, seqs
 
