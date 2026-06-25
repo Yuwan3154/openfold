@@ -44,6 +44,8 @@ args = ap.parse_args()
 
 cfg = model_config("finetuning_ptm")
 cfg.data.train.crop_size = args.crop
+cfg.globals.chunk_size = None          # training path: no chunked-inference (which asserts not-training)
+cfg.globals.offload_inference = False
 
 m = AlphaFold(cfg)
 m.evoformer.blocks = nn.ModuleList([m.evoformer.blocks[i] for i in KEEP])
