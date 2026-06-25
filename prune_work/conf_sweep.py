@@ -23,7 +23,7 @@ ap = argparse.ArgumentParser(description=__doc__)
 ap.add_argument("--mults", default="1,3,10,30", help="comma list of conf-weight multipliers to sweep")
 ap.add_argument("--steps", type=int, default=100)
 ap.add_argument("--lr", default="5e-4")
-ap.add_argument("--gpu", default="0")
+ap.add_argument("--gpus", default="0,1,2,3", help="comma list of GPUs; one M per GPU, in waves")
 ap.add_argument("--root", default="/tmp/conf_sweep")
 args = ap.parse_args()
 
@@ -81,17 +81,27 @@ def summarize(series):
 def main():
     init = build_init()
     mults = [m.strip() for m in args.mults.split(",") if m.strip()]
+    gpus = [g.strip() for g in args.gpus.split(",") if g.strip()]
     os.makedirs(args.root, exist_ok=True)
+    outs = {m: f"{args.root}/M{m}" for m in mults}
+    # run in parallel waves: one M per GPU
+    for w in range(0, len(mults), len(gpus)):
+        wave = mults[w:w + len(gpus)]
+        procs = []
+        for m, gpu in zip(wave, gpus):
+            env = {**os.environ, "CONF_MULT": m, "STEPS": str(args.steps), "LR": args.lr,
+                   "OUT_DIR": outs[m], "INIT_CKPT": init, "CUDA_VISIBLE_DEVICES": gpu}
+            logf = open(f"{args.root}/M{m}.log", "w")
+            print(f"launch M={m} on GPU {gpu}", flush=True)
+            procs.append(subprocess.Popen(["bash", f"{REPO}/prune_work/run_conf_smoke.sh"],
+                                          env=env, stdout=logf, stderr=subprocess.STDOUT))
+        for p in procs:
+            p.wait()
     rows = []
-    for m in mults:
-        out = f"{args.root}/M{m}"
-        env = {**os.environ, "CONF_MULT": m, "STEPS": str(args.steps), "LR": args.lr,
-               "OUT_DIR": out, "INIT_CKPT": init, "CUDA_VISIBLE_DEVICES": args.gpu}
-        print(f"=== running M={m} ===", flush=True)
-        subprocess.run(["bash", f"{REPO}/prune_work/run_conf_smoke.sh"], env=env)
-        s, conf_t, struct_t = summarize(read_train_scalars(out))
+    for i, m in enumerate(mults):
+        s, conf_t, struct_t = summarize(read_train_scalars(outs[m]))
         rows.append((m, s))
-        if rows[0] is not None and m == mults[0]:
+        if i == 0 and s is not None:
             print("conf tags:", conf_t, "| struct tags:", struct_t, flush=True)
 
     print("\n=== CONF-WEIGHT SWEEP ===")
