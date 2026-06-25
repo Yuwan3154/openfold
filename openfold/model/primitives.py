@@ -15,6 +15,7 @@
 # limitations under the License.
 import importlib
 import math
+import os
 from typing import Optional, Callable, List, Tuple
 import numpy as np
 import torch
@@ -30,7 +31,12 @@ if deepspeed_is_installed:
 if ds4s_is_installed:
     from deepspeed.ops.deepspeed4science import DS4Sci_EvoformerAttention
 
-fa_is_installed = importlib.util.find_spec("flash_attn") is not None
+# OPENFOLD_DISABLE_FLASH_ATTN=1 skips the import when flash_attn's prebuilt .so is
+# ABI-incompatible with the node (e.g. GLIBC_2.32 missing); falls back to default attention.
+fa_is_installed = (
+    importlib.util.find_spec("flash_attn") is not None
+    and os.environ.get("OPENFOLD_DISABLE_FLASH_ATTN") != "1"
+)
 if fa_is_installed:
     from flash_attn.bert_padding import unpad_input
     from flash_attn.flash_attn_interface import flash_attn_varlen_kvpacked_func
