@@ -84,7 +84,7 @@ def to_cuda(x):
 
 
 def prep(batch):
-    return to_cuda({k: v for k, v in batch.items() if v is not None})
+    return {k: v for k, v in batch.items() if v is not None}  # keep on CPU; to_cuda only when used
 
 
 dm = OpenFoldDataModule(
@@ -106,11 +106,13 @@ def evaluate():
     m.eval()
     sc, cf = 0.0, 0.0
     for batch in eval_batches:
+        gb = to_cuda(batch)
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            out = m(batch)
-            b = tensor_tree_map(lambda t: t[..., -1], batch)
+            out = m(gb)
+            b = tensor_tree_map(lambda t: t[..., -1], gb)
             sc += float(L_struct(out, b)); cf += float(L_conf(out, b))
-        del out
+        del out, gb
+        torch.cuda.empty_cache()
     n = len(eval_batches)
     return sc / n, cf / n
 
@@ -122,7 +124,7 @@ m.train()
 m.template_embedder.eval()
 opt = torch.optim.Adam([p for p in m.evoformer.parameters() if p.requires_grad], lr=args.lr, eps=1e-5)
 for step in range(args.steps):
-    batch = prep(next(it))
+    batch = to_cuda(prep(next(it)))
     with torch.autocast("cuda", dtype=torch.bfloat16):
         out = m(batch)
         b = tensor_tree_map(lambda t: t[..., -1], batch)
