@@ -24,7 +24,6 @@ import torch
 
 from openfold.model.model import AlphaFold
 from openfold.np import residue_constants, protein
-from openfold.np.relax import relax
 from openfold.utils.import_weights import (
     import_jax_weights_,
     import_openfold_weights_
@@ -257,6 +256,7 @@ def prep_output(out, batch, feature_dict, feature_processor, config_preset, mult
 
 
 def relax_protein(config, model_device, unrelaxed_protein, output_directory, output_name, cif_output=False):
+    from openfold.np.relax import relax  # lazy: avoids pdbfixer/openmm import when --skip_relaxation
     amber_relaxer = relax.AmberRelaxation(
         use_gpu=(model_device != "cpu"),
         **config.relax,
