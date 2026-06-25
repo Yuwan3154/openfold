@@ -7,8 +7,8 @@ struct: val/lddt_ca higher=better (delta<0 = DEGRADED), val/fape lower=better. c
 Phases run 4-way (one M per GPU). before is computed once and shared.
 """
 import argparse
-import glob
 import os
+import re
 import subprocess
 
 PY = "/home/jupyter-chenxi/miniconda3/envs/cue_openfold_gated/bin/python"
@@ -23,7 +23,7 @@ ap.add_argument("--steps", type=int, default=100)
 ap.add_argument("--lr", default="5e-4")
 ap.add_argument("--warmup", default="10")
 ap.add_argument("--gpus", default="0,1,2,3")
-ap.add_argument("--val_list", default=f"{L}/fixed_eval.list")
+ap.add_argument("--val_list", default=f"{L}/fe_eval16.list")  # pre-cutoff train proteins (post-cutoff val lacks alignments -> stalls)
 ap.add_argument("--root", default="/tmp/fe2")
 args = ap.parse_args()
 
@@ -32,14 +32,15 @@ gpus = [g.strip() for g in args.gpus.split(",") if g.strip()]
 os.makedirs(args.root, exist_ok=True)
 
 
-def read_val(outdir):
-    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
-    vd = sorted(glob.glob(f"{outdir}/lightning_logs/version_*"))
-    if not vd:
+def read_val(logf):
+    # validate_only prints the val summary to the log (no TB events file); parse "val/<name>  <value>".
+    if not os.path.exists(logf):
         return {}
-    ea = EventAccumulator(vd[-1]); ea.Reload()
-    tags = ea.Tags().get("scalars", [])
-    return {t: ea.Scalars(t)[-1].value for t in VAL_TAGS if t in tags}
+    txt = open(logf).read()
+    out = {}
+    for name, val in re.findall(r"val/(\w+)\s+([-\d.]+)", txt):
+        out["val/" + name] = float(val)
+    return out
 
 
 def run_validate(ckpt, outdir, gpu, logf):
@@ -51,7 +52,7 @@ def run_validate(ckpt, outdir, gpu, logf):
 
 def run_train(m, outdir, gpu, logf):
     env = {**os.environ, "CONF_MULT": m, "STEPS": str(args.steps), "LR": args.lr, "WARMUP": args.warmup,
-           "CKPT_EVERY": str(args.steps), "VAL_LIST": f"{L}/s12_val.list" if os.path.exists(f"{L}/s12_val.list") else f"{L}/fixed_eval.list",
+           "CKPT_EVERY": str(args.steps), "VAL_LIST": f"{L}/fe_test4.list",  # training end-val (ignored) kept tiny
            "OUT_DIR": outdir, "INIT_CKPT": INIT, "CUDA_VISIBLE_DEVICES": gpu}
     return subprocess.Popen(["bash", f"{REPO}/prune_work/run_conf_smoke.sh"], env=env,
                             stdout=open(logf, "w"), stderr=subprocess.STDOUT)
@@ -67,7 +68,7 @@ def wave(items, fn):
 # Phase 0: before = validate(init)
 print("=== Phase 0: validate(init) ===", flush=True)
 run_validate(INIT, f"{args.root}/before", gpus[0], f"{args.root}/before.log").wait()
-before = read_val(f"{args.root}/before")
+before = read_val(f"{args.root}/before.log")
 print("before:", {k: round(v, 4) for k, v in before.items()}, flush=True)
 
 # Phase 1: train each M -> raw ckpt
@@ -89,7 +90,7 @@ hdr = f"{'M':>7} {'lddt_before':>11} {'lddt_after':>10} {'d_lddt':>8} {'fape_b':
 print(hdr)
 bl = before.get("val/lddt_ca", float("nan"))
 for m in mults:
-    a = read_val(f"{args.root}/after_M{m}")
+    a = read_val(f"{args.root}/after_M{m}.log")
     if not a:
         print(f"{m:>7}  (no after metrics)"); continue
     la = a.get("val/lddt_ca", float("nan"))
