@@ -23,6 +23,7 @@ ap = argparse.ArgumentParser(description=__doc__)
 ap.add_argument("--mults", default="1,3,10,30", help="comma list of conf-weight multipliers to sweep")
 ap.add_argument("--steps", type=int, default=100)
 ap.add_argument("--lr", default="5e-4")
+ap.add_argument("--warmup", default="10", help="short warmup so the ~100 steps run near-constant LR (real signal)")
 ap.add_argument("--gpus", default="0,1,2,3", help="comma list of GPUs; one M per GPU, in waves")
 ap.add_argument("--root", default="/tmp/conf_sweep")
 args = ap.parse_args()
@@ -90,6 +91,7 @@ def main():
         procs = []
         for m, gpu in zip(wave, gpus):
             env = {**os.environ, "CONF_MULT": m, "STEPS": str(args.steps), "LR": args.lr,
+                   "WARMUP": args.warmup,
                    "OUT_DIR": outs[m], "INIT_CKPT": init, "CUDA_VISIBLE_DEVICES": gpu}
             logf = open(f"{args.root}/M{m}.log", "w")
             print(f"launch M={m} on GPU {gpu}", flush=True)
