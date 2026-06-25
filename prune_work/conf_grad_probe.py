@@ -50,8 +50,7 @@ ck = torch.load(args.init, map_location="cpu", weights_only=False)
 sd = {k[len("model."):]: v for k, v in ck["state_dict"].items() if k.startswith("model.")}
 miss, unexp = m.load_state_dict(sd, strict=False)
 print(f"loaded init {args.init}: missing={len(miss)} unexpected={len(unexp)}", flush=True)
-m = m.cuda().float().train()   # train: re-enables Evoformer activation checkpointing (low memory) + dropout, as in the smoke
-m.template_embedder.eval()     # template_pair_stack asserts not-training; templates run in eval during training anyway
+m = m.cuda().float().eval()  # eval: deterministic (separate-forward-safe), template assert ok; small crop keeps memory low
 for p in m.parameters():
     p.requires_grad_(False)
 for p in m.evoformer.parameters():
