@@ -140,7 +140,7 @@ def main(args):
         uniclust30_database_path=args.uniclust30_database_path,
         uniprot_database_path=args.uniprot_database_path,
         template_searcher=template_searcher,
-        use_small_bfd=args.bfd_database_path is None,
+        use_small_bfd=args.use_small_bfd,
         no_cpus=args.cpus_per_task,
     )
 
@@ -260,6 +260,11 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--filter", type=bool, default=True,
+    )
+    parser.add_argument(
+        "--use_small_bfd", action="store_true", default=False,
+        help="Search small BFD with jackhmmer (reduced_dbs) instead of full BFD "
+             "with hhblits. Pass the small-BFD fasta as --bfd_database_path.",
     )
 
     args = parser.parse_args()
