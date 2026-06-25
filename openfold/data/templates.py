@@ -926,6 +926,16 @@ def _process_single_hit(
         else:
             features["template_sum_probs"] = [hit.sum_probs]
 
+        # _extract_template_features does not emit these; supply zeros so every
+        # TEMPLATE_FEATURES key is present (mirrors the featurizer at L1034-1039).
+        num_res = len(query_sequence)
+        if "template_pseudo_beta_mask" not in features:
+            features["template_pseudo_beta_mask"] = np.zeros((num_res,), dtype=np.float32)
+        if "template_pseudo_beta" not in features:
+            features["template_pseudo_beta"] = np.zeros((num_res, 3), dtype=np.float32)
+        if "template_dgram_probs" not in features:
+            features["template_dgram_probs"] = np.zeros((num_res, num_res, 39), dtype=np.float32)
+
         # It is possible there were some errors when parsing the other chains in the
         # mmCIF file, but the template features for the chain we want were still
         # computed. In such case the mmCIF parsing errors are not relevant.
