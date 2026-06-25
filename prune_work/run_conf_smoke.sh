@@ -42,5 +42,5 @@ python train_openfold.py "$MM" "$ALN" "$MM" "$OUT" 2018-04-30 \
   --val_data_dir "$MM" --val_alignment_dir "$ALN" --val_chain_list_path "$VAL" \
   --precision bf16 --learning_rate "$LR" --warmup_no_steps "$WARMUP" \
   --train_epoch_len "$STEPS" --max_epochs 1 --num_sanity_val_steps 0 \
-  --checkpoint_every_n_steps 999999 --checkpoint_monitor val/lddt_ca --checkpoint_save_top_k 0 \
+  --checkpoint_every_n_steps ${CKPT_EVERY:-999999} --checkpoint_monitor val/lddt_ca --checkpoint_save_top_k 0 \
   --log_lr --log_every_n_steps 1 --seed 42 --distributed_backend nccl
