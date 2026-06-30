@@ -942,7 +942,7 @@ class ExtraMSABlock(MSABlock):
 
         if (torch.is_grad_enabled() and self.ckpt):
             checkpoint_fn = get_checkpoint_fn()
-            m, z = checkpoint_fn(fn, input_tensors)
+            m, z = checkpoint_fn(fn, input_tensors, use_reentrant=False)
         else:
             m, z = fn(input_tensors)
 
@@ -1489,7 +1489,7 @@ class ExtraMSAStack(nn.Module):
 
         for b in blocks:
             if(self.ckpt and torch.is_grad_enabled() and not (use_torch_sdpa or use_torch_vanilla or use_torch_cueq)):
-                m, z = checkpoint_fn(b, m, z)
+                m, z = checkpoint_fn(b, m, z, use_reentrant=False)
             else:
                 m, z = b(m, z)
 
