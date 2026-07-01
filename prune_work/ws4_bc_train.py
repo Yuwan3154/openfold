@@ -35,6 +35,8 @@ EVAL_EVERY = int(os.environ.get("EVAL_EVERY", "20"))
 RECYCLE = int(os.environ.get("RECYCLE", "1"))
 SCALE = float(os.environ.get("SCALE", "3.0"))
 USE_CKPT = os.environ.get("USE_CKPT", "0") == "1"   # enable checkpointed double-backprop (memory for L>128; needs evoformer use_reentrant=False fix)
+USE_IPA_CKPT = os.environ.get("USE_IPA_CKPT", "0") == "1"   # also checkpoint the structure-module (IPA) recycling loop; independent of USE_CKPT for isolated A/B testing
+PROBE_LONGEST = os.environ.get("PROBE_LONGEST", "0") == "1"   # smoke mode: put the LONGEST chains in val (worst-case memory gate)
 EPS = 1e-6
 BASE = "/home/jupyter-chenxi"
 JAX = f"{BASE}/params/params_model_1_ptm.npz"
@@ -65,7 +67,7 @@ def kill_ckpt(m):
             mod.blocks_per_ckpt = None
 
 
-def enable_ckpt(m):
+def enable_ckpt(m, ipa=False):
     # checkpoint every evoformer + extra-MSA block (max memory savings); needs the use_reentrant=False fix
     if hasattr(m.evoformer, "blocks_per_ckpt"):
         m.evoformer.blocks_per_ckpt = 1
@@ -75,6 +77,8 @@ def enable_ckpt(m):
         for b in getattr(m.extra_msa_stack, "blocks", []):
             if hasattr(b, "ckpt"):
                 b.ckpt = True
+    if ipa and hasattr(m, "structure_module"):
+        m.structure_module.ckpt = True
 
 
 def build_student():
@@ -84,7 +88,10 @@ def build_student():
     sd = torch.load(CK2, map_location="cpu", weights_only=False)["state_dict"]
     m.load_state_dict({k[6:]: v for k, v in sd.items() if k.startswith("model.")}, strict=False)
     m = m.to(DEV).eval()
-    (enable_ckpt if USE_CKPT else kill_ckpt)(m)
+    if USE_CKPT:
+        enable_ckpt(m, ipa=USE_IPA_CKPT)
+    else:
+        kill_ckpt(m)
     return m
 
 
@@ -121,7 +128,10 @@ for p in sorted(glob.glob(f"{GC}/*.pt")):
     c = os.path.basename(p)[:-3]
     if c in cdc and len(cdc[c]["seq"]) <= MAXLEN:
         cached.append(c)
-random.Random(0).shuffle(cached)
+if PROBE_LONGEST:
+    cached.sort(key=lambda c: len(cdc[c]["seq"]), reverse=True)   # worst-case memory probe: longest chains in val
+else:
+    random.Random(0).shuffle(cached)
 val_chains = cached[:VAL_N]
 train_chains = cached[VAL_N:]
 pts = ["native", "soft"] if POINTS == "both" else [POINTS]
