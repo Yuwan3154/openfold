@@ -1000,12 +1000,17 @@ class StructureModule(nn.Module):
             fmt="quat",
         )
         def _block_fn(carry):
-            # carry = [s, rigids_t]; rigids_t is the [*, N, 7] quat+trans packing
-            # of the Rigid carried across iterations (torch.utils.checkpoint's
-            # non-reentrant mode only tracks plain Tensor args/returns, and Rigid
-            # is a lightweight Python wrapper, not a Tensor, so it is decomposed
-            # to/from its tensor form at the checkpoint boundary).
-            s, rigids_t = carry
+            # carry = [s, rigids_t, z, z_reference_list]; rigids_t is the [*, N, 7]
+            # quat+trans packing of the Rigid carried across iterations
+            # (torch.utils.checkpoint's non-reentrant mode only tracks plain Tensor
+            # args/returns, and Rigid is a lightweight Python wrapper, not a
+            # Tensor, so it is decomposed to/from its tensor form at the
+            # checkpoint boundary). z/z_reference_list are passed explicitly
+            # rather than closed over: the caller `del`s both right after this
+            # loop, and checkpoint recompute runs during a LATER backward call,
+            # after _forward_monomer has already returned -- a closure over them
+            # would raise "free variable... not associated with a value" then.
+            s, rigids_t, z, z_reference_list = carry
             rigids = Rigid.from_tensor_7(rigids_t)
 
             # [*, N, C_s]
@@ -1066,13 +1071,14 @@ class StructureModule(nn.Module):
         outputs = []
         rigids_t = rigids.to_tensor_7()
         for i in range(self.no_blocks):
+            carry = [s, rigids_t, z, z_reference_list]
             if (torch.is_grad_enabled() and self.ckpt):
                 checkpoint_fn = get_checkpoint_fn()
                 s, rigids_t, frames_t, sidechain_frames_t, unnormalized_angles, angles, pred_xyz = checkpoint_fn(
-                    _block_fn, [s, rigids_t], use_reentrant=False
+                    _block_fn, carry, use_reentrant=False
                 )
             else:
-                s, rigids_t, frames_t, sidechain_frames_t, unnormalized_angles, angles, pred_xyz = _block_fn([s, rigids_t])
+                s, rigids_t, frames_t, sidechain_frames_t, unnormalized_angles, angles, pred_xyz = _block_fn(carry)
 
             preds = {
                 "frames": frames_t,
