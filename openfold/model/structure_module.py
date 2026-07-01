@@ -36,6 +36,7 @@ from openfold.utils.feats import (
     frames_and_literature_positions_to_atom14_pos,
     torsion_angles_to_frames,
 )
+from openfold.utils.checkpointing import get_checkpoint_fn
 from openfold.utils.precision_utils import is_fp16_enabled
 from openfold.utils.rigid_utils import Rotation, Rigid
 from openfold.utils.tensor_utils import (
@@ -893,6 +894,9 @@ class StructureModule(nn.Module):
         self.epsilon = epsilon
         self.inf = inf
         self.is_multimer = is_multimer
+        # Per-block activation checkpointing of the recycling loop below (opt-in,
+        # mirrors evoformer.py's self.ckpt convention); off by default.
+        self.ckpt = False
 
         # Buffers to be lazily initialized later
         # self.default_frames
@@ -995,8 +999,15 @@ class StructureModule(nn.Module):
             self.training,
             fmt="quat",
         )
-        outputs = []
-        for i in range(self.no_blocks):
+        def _block_fn(carry):
+            # carry = [s, rigids_t]; rigids_t is the [*, N, 7] quat+trans packing
+            # of the Rigid carried across iterations (torch.utils.checkpoint's
+            # non-reentrant mode only tracks plain Tensor args/returns, and Rigid
+            # is a lightweight Python wrapper, not a Tensor, so it is decomposed
+            # to/from its tensor form at the checkpoint boundary).
+            s, rigids_t = carry
+            rigids = Rigid.from_tensor_7(rigids_t)
+
             # [*, N, C_s]
             s = s + self.ipa(
                 s,
@@ -1020,7 +1031,7 @@ class StructureModule(nn.Module):
             # here
             backb_to_global = Rigid(
                 Rotation(
-                    rot_mats=rigids.get_rots().get_rot_mats(), 
+                    rot_mats=rigids.get_rots().get_rot_mats(),
                     quats=None
                 ),
                 rigids.get_trans(),
@@ -1045,10 +1056,27 @@ class StructureModule(nn.Module):
             )
 
             scaled_rigids = rigids.scale_translation(self.trans_scale_factor)
-            
+            frames_t = scaled_rigids.to_tensor_7()
+            sidechain_frames_t = all_frames_to_global.to_tensor_4x4()
+
+            rigids = rigids.stop_rot_gradient()
+
+            return [s, rigids.to_tensor_7(), frames_t, sidechain_frames_t, unnormalized_angles, angles, pred_xyz]
+
+        outputs = []
+        rigids_t = rigids.to_tensor_7()
+        for i in range(self.no_blocks):
+            if (torch.is_grad_enabled() and self.ckpt):
+                checkpoint_fn = get_checkpoint_fn()
+                s, rigids_t, frames_t, sidechain_frames_t, unnormalized_angles, angles, pred_xyz = checkpoint_fn(
+                    _block_fn, [s, rigids_t], use_reentrant=False
+                )
+            else:
+                s, rigids_t, frames_t, sidechain_frames_t, unnormalized_angles, angles, pred_xyz = _block_fn([s, rigids_t])
+
             preds = {
-                "frames": scaled_rigids.to_tensor_7(),
-                "sidechain_frames": all_frames_to_global.to_tensor_4x4(),
+                "frames": frames_t,
+                "sidechain_frames": sidechain_frames_t,
                 "unnormalized_angles": unnormalized_angles,
                 "angles": angles,
                 "positions": pred_xyz,
@@ -1056,8 +1084,6 @@ class StructureModule(nn.Module):
             }
 
             outputs.append(preds)
-
-            rigids = rigids.stop_rot_gradient()
 
         del z, z_reference_list
 
