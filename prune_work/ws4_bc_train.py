@@ -45,6 +45,11 @@ CDC = f"{BASE}/data/pdb_mmcif/chain_data_cache.json"
 GC = f"{BASE}/data/grad_cache_bc"
 KEEP = [int(x) for x in "0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30,32,34,36,38,40,42,44,47".split(",")]
 DEV = "cuda:0"
+CKPT_DIR = os.environ.get("CKPT_DIR", f"{BASE}/ckpts_ws4bc")
+CKPT_TAG = os.environ.get("CKPT_TAG", f"{STUDENT}_{POINTS}_lr{LR}_b{BATCH}_L{MAXLEN}")
+LAST_CKPT = f"{CKPT_DIR}/{CKPT_TAG}_last.pt"
+BEST_CKPT = f"{CKPT_DIR}/{CKPT_TAG}_best.pt"
+os.makedirs(CKPT_DIR, exist_ok=True)
 
 
 def build_cfg():
@@ -184,7 +189,18 @@ tr_sample = train_items[:VAL_N]
 order = train_items[:]
 ptr = 0
 best = -2.0
-for step in range(1, STEPS + 1):
+start_step = 1
+if os.path.exists(LAST_CKPT):
+    ck = torch.load(LAST_CKPT, map_location=DEV, weights_only=False)
+    student.evoformer.load_state_dict(ck["evoformer"])
+    opt.load_state_dict(ck["optimizer"])
+    start_step = ck["step"] + 1
+    best = ck["best"]
+    order = ck["order"]
+    ptr = ck["ptr"]
+    print(f"RESUMED from {LAST_CKPT} at step {ck['step']} (best={best:.4f})", flush=True)
+
+for step in range(start_step, STEPS + 1):
     if step < WARM:
         lr = LR * step / WARM
     elif SCHED == "const":
@@ -212,7 +228,17 @@ for step in range(1, STEPS + 1):
     if step % EVAL_EVERY == 0:
         tp, tf = evaluate(student, tr_sample)
         vp, vf = evaluate(student, val_items)
-        if vp > best: best = vp
+        if vp > best:
+            best = vp
+            torch.save(student.evoformer.state_dict(), BEST_CKPT)
+        torch.save({
+            "evoformer": student.evoformer.state_dict(),
+            "optimizer": opt.state_dict(),
+            "step": step,
+            "best": best,
+            "order": order,
+            "ptr": ptr,
+        }, LAST_CKPT)
         print(f"step {step:3d} lr={lr:.1e} | train perpos={tp:.4f} flat={tf:.4f} | val perpos={vp:.4f} flat={vf:.4f} best={best:.4f} mem={torch.cuda.max_memory_allocated()/1e9:.1f}GB", flush=True)
 print(f"FINAL best val perpos={best:.4f} (baseline {b0[0]:.4f})", flush=True)
 print("DONE")
