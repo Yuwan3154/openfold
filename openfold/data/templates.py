@@ -693,6 +693,13 @@ def _extract_template_features(
 
     for k, v in mapping.items():
         template_index = v + mapping_offset
+        # A padded/bucketed query (torch.compile length bucketing) can be longer than
+        # the real template (e.g. skip_alignment builds an identity map over the FULL
+        # padded query length). Positions beyond the real template have no atom data --
+        # leave them as the zero-initialized "unmapped" entries above instead of
+        # indexing out of range.
+        if template_index >= len(all_atom_positions):
+            continue
         templates_all_atom_positions[k] = all_atom_positions[template_index][0]
         templates_all_atom_masks[k] = all_atom_masks[template_index][0]
         output_templates_sequence[k] = template_sequence[v]
