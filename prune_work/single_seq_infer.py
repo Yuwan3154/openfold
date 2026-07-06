@@ -28,6 +28,10 @@ def build_cfg(recycle=3):
     cfg.globals.chunk_size = None
     for g in ["use_deepspeed_evo_attention", "use_lma", "use_flash"]:
         setattr(cfg.globals, g, False)
+    # NOTE: use_deepspeed_evo_attention JIT-compiles a CUTLASS-dependent CUDA op that fails on
+    # this box (missing $CUTLASS_PATH) -- tried it for speed, it broke 614/614 sequences. Reverted.
+    # use_flash also doesn't apply (incompatible with AF2's pair-bias attention). Plain attention
+    # it is -- slow under WS5 CPU/GPU contention, fine on a free GPU.
     cfg.data.common.max_recycling_iters = recycle
     cfg.model.template.enabled = False
     cfg.data.common.use_templates = False
