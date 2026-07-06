@@ -2,6 +2,7 @@
 Reuses the same feature-construction / pruning / loss-extraction helpers as ws4_bc_train.py so the
 inference path here is architecturally identical to what WS5 was actually trained under.
 """
+import glob
 import os
 import sys
 import torch
@@ -32,6 +33,19 @@ def build_cfg(recycle=3):
     cfg.data.common.use_templates = False
     cfg.data.common.use_template_torsion_angles = False
     return cfg
+
+
+WS5_CKPT_DIR = f"{BASE}/runs/prune_singleseq_v1/lightning_logs/version_3/checkpoints"
+
+
+def resolve_ws5_ckpt(ckpt_dir=WS5_CKPT_DIR):
+    """WS5 is still training; Lightning's ModelCheckpoint renames/deletes the old 'best-*.ckpt'
+    file every time a new best is found, so any hardcoded filename goes stale. Resolve the
+    current one by mtime instead of embedding a specific epoch/step in the path."""
+    candidates = glob.glob(os.path.join(ckpt_dir, "best-*.ckpt"))
+    if not candidates:
+        raise FileNotFoundError(f"no best-*.ckpt found in {ckpt_dir}")
+    return max(candidates, key=os.path.getmtime)
 
 
 def load_ws5(ckpt_path, device="cuda:0", recycle=3):

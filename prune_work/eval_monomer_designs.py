@@ -14,12 +14,10 @@ import urllib.request
 import zipfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from single_seq_infer import load_ws5, score_sequence
+from single_seq_infer import load_ws5, score_sequence, resolve_ws5_ckpt
 from eval_stats import auroc
 
-CKPT = os.environ.get(
-    "CKPT",
-    "/home/jupyter-chenxi/runs/prune_singleseq_v1/lightning_logs/version_3/checkpoints/best-041-010836.ckpt")
+CKPT = os.environ.get("CKPT") or None  # resolved lazily below (checkpoint filename rotates while WS5 trains)
 OUT_CSV = os.environ.get("OUT_CSV", "/home/jupyter-chenxi/prune_work/eval_out/monomer_designs_scored.csv")
 DEVICE = os.environ.get("DEVICE", "cuda:0")
 SUPP_URL = "https://www.ebi.ac.uk/europepmc/webservices/rest/PMC12817478/supplementaryFiles"
@@ -40,7 +38,7 @@ def main():
     rows = fetch_dataset()
     print(f"loaded {len(rows)} designs from Garcia/Dixit/Rocklin supplementary CSV", flush=True)
 
-    model = load_ws5(CKPT, device=DEVICE)
+    model = load_ws5(CKPT or resolve_ws5_ckpt(), device=DEVICE)
     os.makedirs(os.path.dirname(OUT_CSV), exist_ok=True)
 
     scored = []

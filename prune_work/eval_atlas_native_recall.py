@@ -29,12 +29,10 @@ import numpy as np
 from Bio.PDB import PDBParser
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from single_seq_infer import load_ws5, score_sequence
+from single_seq_infer import load_ws5, score_sequence, resolve_ws5_ckpt
 from openfold.np import residue_constants as rc
 
-CKPT = os.environ.get(
-    "CKPT",
-    "/home/jupyter-chenxi/runs/prune_singleseq_v1/lightning_logs/version_3/checkpoints/best-041-010836.ckpt")
+CKPT = os.environ.get("CKPT") or None  # resolved lazily below (checkpoint filename rotates while WS5 trains)
 OUT_CSV = os.environ.get("OUT_CSV", "/home/jupyter-chenxi/prune_work/eval_out/atlas_native_recall.csv")
 DEVICE = os.environ.get("DEVICE", "cuda:0")
 N_SAMPLE = int(os.environ.get("N_SAMPLE", "200"))
@@ -94,7 +92,7 @@ def main():
     print(f"ATLAS has {len(pdb_chains)} entries total", flush=True)
     random.Random(0).shuffle(pdb_chains)
 
-    model = load_ws5(CKPT, device=DEVICE)
+    model = load_ws5(CKPT or resolve_ws5_ckpt(), device=DEVICE)
     os.makedirs(os.path.dirname(OUT_CSV), exist_ok=True)
     cache_dir = "/home/jupyter-chenxi/prune_work/eval_out/pdb_cache"
     os.makedirs(cache_dir, exist_ok=True)
