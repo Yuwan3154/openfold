@@ -19,6 +19,30 @@ from openfold.data import data_transforms as dt
 KALIGN = f"{BASE}/miniconda3/envs/cue_openfold_gated/bin/kalign"
 
 
+def finish_template_features(raw_aatype, raw_positions, raw_mask, device):
+    """Shared post-processing tail: raw_* are numpy arrays already carrying a leading
+    template-axis (shape (n_templ, ...), n_templ=1 for a single template) -- e.g. sliced
+    top-1 output from templates.HhsearchHitFeaturizer.get_templates(), or a single
+    _extract_template_features() result wrapped with [None]. Wires OpenFold's own transforms
+    (fix_templates_aatype/make_template_mask/make_pseudo_beta/atom37_to_torsion_angles) rather
+    than re-deriving them."""
+    num_res = raw_aatype.shape[-1]
+    protein = {
+        "template_aatype": torch.as_tensor(raw_aatype, dtype=torch.float32),
+        "template_all_atom_positions": torch.as_tensor(raw_positions, dtype=torch.float32),
+        "template_all_atom_mask": torch.as_tensor(raw_mask, dtype=torch.float32),
+    }
+    protein = dt.fix_templates_aatype(protein)          # one-hot -> OpenFold-ordered indices
+    protein = dt.make_template_mask(protein)            # template_mask = ones[n_templ]
+    protein = dt.make_pseudo_beta(prefix="template_")(protein)          # @curry1
+    protein = dt.atom37_to_torsion_angles(prefix="template_")(protein)  # @curry1
+
+    assert protein["template_aatype"].shape[0] == 1
+    assert protein["template_all_atom_positions"].shape == (1, num_res, 37, 3)
+
+    return {k: v.to(device) for k, v in protein.items()}
+
+
 def build_template_features(mmcif_path, pdb_id, target_chain_id, query_sequence, target_offset, device):
     """query_sequence = the FULL concatenated query (e.g. binder_seq + target_seq).
     target_offset = the index within query_sequence where the target chain's sequence starts
@@ -44,18 +68,6 @@ def build_template_features(mmcif_path, pdb_id, target_chain_id, query_sequence,
     if warning:
         print(f"template_feat_builder warning: {warning}", flush=True)
 
-    num_res = len(query_sequence)
-    protein = {
-        "template_aatype": torch.as_tensor(raw["template_aatype"], dtype=torch.float32)[None],
-        "template_all_atom_positions": torch.as_tensor(raw["template_all_atom_positions"], dtype=torch.float32)[None],
-        "template_all_atom_mask": torch.as_tensor(raw["template_all_atom_mask"], dtype=torch.float32)[None],
-    }
-    protein = dt.fix_templates_aatype(protein)          # one-hot -> OpenFold-ordered indices
-    protein = dt.make_template_mask(protein)            # template_mask = ones[n_templ]
-    protein = dt.make_pseudo_beta(prefix="template_")(protein)          # @curry1
-    protein = dt.atom37_to_torsion_angles(prefix="template_")(protein)  # @curry1
-
-    assert protein["template_aatype"].shape == (1, num_res)
-    assert protein["template_all_atom_positions"].shape == (1, num_res, 37, 3)
-
-    return {k: v.to(device) for k, v in protein.items()}
+    return finish_template_features(
+        raw["template_aatype"][None], raw["template_all_atom_positions"][None],
+        raw["template_all_atom_mask"][None], device)
