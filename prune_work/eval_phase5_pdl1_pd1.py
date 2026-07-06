@@ -88,12 +88,14 @@ def main():
           f"binder_plddt_mean={out['binder_plddt_mean']:.4f}", flush=True)
 
     # sanity floor: does the model reproduce the thing it was templated on?
-    target_self_rmsd = rmsd(out["target_ca"][target_valid], target_real_ca[target_valid])
-    print(f"predicted-target vs real-PDL1 RMSD ({target_valid.sum()}/{len(target_valid)} "
-          f"resolved residues, no realignment needed, same numbering): "
-          f"{target_self_rmsd:.3f} A", flush=True)
-
+    # AF2's output lives in an arbitrary internal frame, not the PDB deposition's frame -- must
+    # Kabsch-align before comparing, or the RMSD is meaningless (raw comparison mistake caught post-hoc).
     r, t = kabsch(out["target_ca"][target_valid], target_real_ca[target_valid])
+    target_aligned = out["target_ca"][target_valid] @ r.T + t
+    target_self_rmsd = rmsd(target_aligned, target_real_ca[target_valid])
+    print(f"predicted-target vs real-PDL1 RMSD, Kabsch-aligned ({target_valid.sum()}/{len(target_valid)} "
+          f"resolved residues): {target_self_rmsd:.3f} A", flush=True)
+
     binder_pred_aligned = out["binder_ca"] @ r.T + t
     binder_rmsd = rmsd(binder_pred_aligned[binder_valid], binder_real_ca[binder_valid])
     print(f"predicted-binder (after aligning target onto real PD-L1) vs real PD-1 RMSD "

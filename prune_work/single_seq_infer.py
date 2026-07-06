@@ -124,6 +124,33 @@ def score_sequence(model, seq, device="cuda:0", recycle=3):
     }
 
 
+@torch.no_grad()
+def score_sequence_templated(model, seq, template_feats, device="cuda:0", recycle=3):
+    """Single-chain, single-sequence (no MSA) but WITH a real template -- template_feats built by
+    template_feat_builder.build_template_features(query_sequence=seq, target_offset=0) so the
+    template covers the WHOLE query (self-template ablation: how much does WS5's self-consistency
+    depend on template availability, matching its own --single_seq_keep_templates training)."""
+    logits = seq_to_logits(seq, device)
+    ri = torch.arange(len(seq), device=device)
+    batch = make_feature_batch(logits, ri, recycle_dim=recycle + 1)
+
+    def add_cycle(x):
+        return x.unsqueeze(-1).expand(*x.shape, recycle + 1)
+
+    batch.update({k: add_cycle(v) for k, v in template_feats.items()})
+
+    out = model(batch)
+    tml = out["tm_logits"]; tml = tml[0] if tml.dim() == 4 else tml
+    lddt = out["lddt_logits"]; lddt = lddt[0] if lddt.dim() == 3 else lddt
+    fap = out["final_atom_positions"]; fap = fap[0] if fap.dim() == 4 else fap
+    ca = fap[:, rc.atom_order["CA"], :]
+    plddt = bcl.get_plddt(lddt)
+    return {
+        "plddt_mean": plddt.mean().item(),
+        "ca_coords": ca.detach().cpu().numpy(),
+    }
+
+
 CHAIN_GAP = 200  # residue-index offset between chains -- the AF2-multimer/AF2-initial-guess
                  # "chain break" convention (Bennett et al. 2023); far outside AF2's relpos
                  # clipping window (+/-32) so the model can't infer chain adjacency from index.
