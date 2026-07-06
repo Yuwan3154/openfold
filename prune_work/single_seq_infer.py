@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from openfold.config import model_config
 from openfold.model.model import AlphaFold
 from openfold.np import residue_constants as rc
+from openfold.utils.import_weights import import_jax_weights_
 
 BASE = "/home/jupyter-chenxi"
 sys.path.insert(0, f"{BASE}/openfold/openfold/block_replacement_scripts")
@@ -66,6 +67,36 @@ def load_ws5(ckpt_path, device="cuda:0", recycle=3):
     assert not missing, f"unexpected missing keys (real mismatch, not template-only): {missing}"
     assert all(k.startswith("template_embedder.") for k in unexpected), \
         f"unexpected non-template keys (real mismatch): {[k for k in unexpected if not k.startswith('template_embedder.')]}"
+    return m.to(device).eval()
+
+
+STOCK_JAX_PARAMS = f"{BASE}/params/params_model_1_ptm.npz"  # same file WS5 itself warm-starts from
+
+
+def build_cfg_stock(recycle=3):
+    """Stock, FULL (non-pruned) AF2 -- model_1_ptm preset, single-sequence (no MSA) + no
+    template. Control for WS6's no-template self-consistency numbers: is near-zero recall
+    specific to WS5's pruning/distillation/training regime, or does even the official model
+    collapse under single-sequence+no-template conditions?"""
+    cfg = model_config("model_1_ptm", train=False, low_prec=False)
+    cfg.globals.chunk_size = None
+    for g in ["use_deepspeed_evo_attention", "use_lma", "use_flash"]:
+        setattr(cfg.globals, g, False)
+    cfg.data.common.max_recycling_iters = recycle
+    cfg.data.common.max_extra_msa = 1
+    cfg.data.common.max_msa_clusters = 1
+    cfg.model.template.enabled = False
+    cfg.data.common.use_templates = False
+    cfg.data.common.use_template_torsion_angles = False
+    return cfg
+
+
+def load_af2_stock(jax_path=STOCK_JAX_PARAMS, device="cuda:0", recycle=3):
+    """No prune_blocks() -- FULL 48-block evoformer, loaded directly from the official jax
+    weights via OpenFold's own import_jax_weights_ (same utility train_openfold.py itself uses
+    for the --resume_from_jax_params path)."""
+    m = AlphaFold(build_cfg_stock(recycle))
+    import_jax_weights_(m, jax_path, version="model_1_ptm")
     return m.to(device).eval()
 
 
