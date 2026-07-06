@@ -26,7 +26,9 @@ def finish_template_features(raw_aatype, raw_positions, raw_mask, device):
     _extract_template_features() result wrapped with [None]. Wires OpenFold's own transforms
     (fix_templates_aatype/make_template_mask/make_pseudo_beta/atom37_to_torsion_angles) rather
     than re-deriving them."""
-    num_res = raw_aatype.shape[-1]
+    # raw_aatype is still ONE-HOT here ((n_templ, num_res, n_categories)) -- residue axis is 1,
+    # NOT -1 (that's the one-hot category axis, collapsed away by fix_templates_aatype below).
+    num_res = raw_aatype.shape[1]
     protein = {
         "template_aatype": torch.as_tensor(raw_aatype, dtype=torch.float32),
         "template_all_atom_positions": torch.as_tensor(raw_positions, dtype=torch.float32),
