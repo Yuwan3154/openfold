@@ -69,6 +69,31 @@ def load_ws5(ckpt_path, device="cuda:0", recycle=3):
     return m.to(device).eval()
 
 
+def build_cfg_templated(recycle=3):
+    """Same as build_cfg() but with templates ON -- for the AF2-initial-guess-style
+    target-conditioned scoring (score_binder_target), matching what WS5 was actually
+    trained under (--single_seq_keep_templates keeps templates enabled)."""
+    cfg = model_config("finetuning_ptm", train=False, low_prec=False)
+    cfg.globals.chunk_size = None
+    for g in ["use_deepspeed_evo_attention", "use_lma", "use_flash"]:
+        setattr(cfg.globals, g, False)
+    cfg.data.common.max_recycling_iters = recycle
+    cfg.model.template.enabled = True
+    cfg.data.common.use_templates = True
+    cfg.data.common.use_template_torsion_angles = True
+    return cfg
+
+
+def load_ws5_templated(ckpt_path, device="cuda:0", recycle=3):
+    """Templates ON this time, so the checkpoint's template_embedder.* weights are actually
+    used -- strict=True (no expected mismatch, unlike load_ws5's no-template path)."""
+    m = AlphaFold(build_cfg_templated(recycle))
+    prune_blocks(m.evoformer)
+    sd = torch.load(ckpt_path, map_location="cpu", weights_only=False)["state_dict"]
+    m.load_state_dict({k[6:]: v for k, v in sd.items() if k.startswith("model.")}, strict=True)
+    return m.to(device).eval()
+
+
 def seq_to_logits(seq, device, scale=SCALE):
     aat = torch.tensor([rc.restype_order.get(a, rc.restype_num) for a in seq])
     oh = F.one_hot(aat.clamp(max=19), 20).float()
@@ -96,4 +121,44 @@ def score_sequence(model, seq, device="cuda:0", recycle=3):
         "plddt_per_res": plddt.detach().cpu().numpy(),
         "pae_mean": pae.mean().item(),
         "ca_coords": ca.detach().cpu().numpy(),
+    }
+
+
+CHAIN_GAP = 200  # residue-index offset between chains -- the AF2-multimer/AF2-initial-guess
+                 # "chain break" convention (Bennett et al. 2023); far outside AF2's relpos
+                 # clipping window (+/-32) so the model can't infer chain adjacency from index.
+
+
+@torch.no_grad()
+def score_binder_target(model, binder_seq, target_seq, template_feats, device="cuda:0", recycle=3):
+    """query = [binder_seq, target_seq] concatenated; target_seq's real structure is templated
+    (via template_feats, built by template_feat_builder.build_template_features with
+    target_offset=len(binder_seq)); binder_seq is untemplated (gap-filled). Returns CA coords
+    and pLDDT split back into binder/target segments."""
+    full_seq = binder_seq + target_seq
+    logits = seq_to_logits(full_seq, device)
+    ri = torch.cat([
+        torch.arange(len(binder_seq), device=device),
+        torch.arange(len(target_seq), device=device) + len(binder_seq) + CHAIN_GAP,
+    ])
+    batch = make_feature_batch(logits, ri, recycle_dim=recycle + 1)
+
+    def add_cycle(x):
+        return x.unsqueeze(-1).expand(*x.shape, recycle + 1)
+
+    batch.update({k: add_cycle(v) for k, v in template_feats.items()})
+
+    out = model(batch)
+    dgl = out["distogram_logits"]; dgl = dgl[0] if dgl.dim() == 4 else dgl
+    tml = out["tm_logits"]; tml = tml[0] if tml.dim() == 4 else tml
+    lddt = out["lddt_logits"]; lddt = lddt[0] if lddt.dim() == 3 else lddt
+    fap = out["final_atom_positions"]; fap = fap[0] if fap.dim() == 4 else fap
+    ca = fap[:, rc.atom_order["CA"], :]
+    plddt = bcl.get_plddt(lddt)
+    nb = len(binder_seq)
+    return {
+        "binder_ca": ca[:nb].detach().cpu().numpy(),
+        "target_ca": ca[nb:].detach().cpu().numpy(),
+        "binder_plddt_mean": plddt[:nb].mean().item(),
+        "target_plddt_mean": plddt[nb:].mean().item(),
     }
