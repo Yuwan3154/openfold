@@ -460,8 +460,10 @@ def main(args):
         # Disable MSA-specific losses for single sequence training
         rank_zero_info("Disabling masked_msa loss for single sequence mode")
         config.loss.masked_msa.weight = 0.0
-        # Reduce some computational requirements
-        config.data.train.crop_size = min(config.data.train.crop_size, 256)
+        # Reduce some computational requirements (override-able: pruned/single-seq models use much
+        # less VRAM than full AF2, so longer crops may now fit -- default preserves prior behavior).
+        _max_crop = int(os.environ.get("SINGLE_SEQ_MAX_CROP", "256"))
+        config.data.train.crop_size = min(config.data.train.crop_size, _max_crop)
 
     # Use AdaptiveOpenFoldWrapper if adaptive_config_path is provided
     adaptive_config_path = getattr(args, 'adaptive_config_path', None)
