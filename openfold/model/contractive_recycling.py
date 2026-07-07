@@ -26,16 +26,22 @@ class ContractivePairUpdate(nn.Module):
     """z_{t+1}_input = Abar * z_t + Bbar * LayerNorm(u_t), eq. (2) of ESMFold2 Appendix A.2.5.
 
     Abar = exp(-delta * a), Bbar = delta * b -- delta, a, b are learnable, per-channel (shape
-    [c_z]) scalars. a is passed through softplus (>0), delta through softplus (>0), so
-    -delta*a < 0 always => Abar in (0,1) elementwise by construction (contractive), regardless of
-    training dynamics -- this is the property that keeps the recurrent state's magnitude bounded
-    across arbitrarily many loop iterations.
+    [c_z]) scalars. delta = softplus(log_delta), a = exp(log_a) -- this asymmetric split (not
+    softplus for both, not exp for both) matches the official Mamba/S6 reference implementation
+    (state-spaces/mamba, mamba_simple.py: `dt = F.softplus(...)`, `A = -torch.exp(self.A_log)`),
+    the exact lineage Parcae (arXiv:2604.12946, Sec 4.1) cites for this discretization scheme
+    (refs [17,29] = Dao & Gu 2024, Gu & Dao 2023). ESMFold2/Parcae's own papers write both as
+    plain "exp" in their compact notation, but neither paper's code is public; Mamba's IS public
+    and is the literature both papers explicitly build on, so its code is the disambiguating
+    source here. -delta*a < 0 always => Abar in (0,1) elementwise by construction (contractive),
+    regardless of training dynamics -- this is the property that keeps the recurrent state's
+    magnitude bounded across arbitrarily many loop iterations.
     """
 
     def __init__(self, c_z: int):
         super().__init__()
         self.c_z = c_z
-        # log-parametrized so the raw learnable params are unconstrained; softplus enforces >0.
+        # log-parametrized so the raw learnable params are unconstrained.
         self.log_delta = nn.Parameter(torch.zeros(c_z))
         self.log_a = nn.Parameter(torch.zeros(c_z))
         self.b = nn.Parameter(torch.ones(c_z))
@@ -43,7 +49,7 @@ class ContractivePairUpdate(nn.Module):
 
     def discretized_params(self):
         delta = F.softplus(self.log_delta)
-        a = F.softplus(self.log_a)
+        a = torch.exp(self.log_a)
         a_bar = torch.exp(-delta * a)
         b_bar = delta * self.b
         return a_bar, b_bar
