@@ -336,17 +336,20 @@ class OpenFoldWrapper(pl.LightningModule):
 
         # pTM calibration: gather (ptm_score, actual_tm) pairs from every DDP rank (correlation
         # needs the whole validation population, not a per-rank-shard estimate) and log a single
-        # Spearman correlation for the epoch.
+        # Spearman correlation for the epoch. Empty when the tm head is disabled (e.g. non-ptm
+        # config presets never populate outputs["ptm_score"]) -- skip logging in that case rather
+        # than crashing on zip(*[]).
         pairs = self._val_ptm_calib_pairs
         if self._is_distributed:
             gathered = [None] * dist.get_world_size()
             dist.all_gather_object(gathered, pairs)
             pairs = [p for rank_pairs in gathered for p in rank_pairs]
-        ptm_vals, real_tm_vals = zip(*pairs)
-        calibration = spearman_corr(
-            torch.tensor(ptm_vals), torch.tensor(real_tm_vals)
-        )
-        self.log("val/ptm_calibration_spearman", calibration, logger=True, rank_zero_only=True)
+        if pairs:
+            ptm_vals, real_tm_vals = zip(*pairs)
+            calibration = spearman_corr(
+                torch.tensor(ptm_vals), torch.tensor(real_tm_vals)
+            )
+            self.log("val/ptm_calibration_spearman", calibration, logger=True, rank_zero_only=True)
 
     def _compute_validation_metrics(self,
                                     batch,
@@ -412,12 +415,16 @@ class OpenFoldWrapper(pl.LightningModule):
             # whole validation epoch (and all DDP ranks, gathered in on_validation_epoch_end)
             # because a per-batch-item correlation is meaningless -- correlation needs the full
             # population, unlike the other metrics here which are plain epoch means.
-            real_tm = actual_tm_score(
-                superimposed_pred, gt_coords_masked_ca, all_atom_mask_ca
-            )
-            self._val_ptm_calib_pairs.extend(
-                zip(outputs["ptm_score"].reshape(-1).tolist(), real_tm.reshape(-1).tolist())
-            )
+            # outputs["ptm_score"] only exists when the tm head is enabled (config presets like
+            # initial_training/model_1-5/finetuning leave it off by default) -- guard rather than
+            # KeyError on those presets.
+            if "ptm_score" in outputs:
+                real_tm = actual_tm_score(
+                    superimposed_pred, gt_coords_masked_ca, all_atom_mask_ca
+                )
+                self._val_ptm_calib_pairs.extend(
+                    zip(outputs["ptm_score"].reshape(-1).tolist(), real_tm.reshape(-1).tolist())
+                )
 
         return metrics
 
