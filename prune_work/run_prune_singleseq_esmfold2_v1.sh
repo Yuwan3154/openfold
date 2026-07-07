@@ -13,7 +13,7 @@
 # template-assisted performance.
 cd /home/jupyter-chenxi/openfold-esmfold2-recycling
 . ~/miniconda3/etc/profile.d/conda.sh && conda deactivate && conda activate cue_openfold_gated
-export PYTHONPATH=/home/jupyter-chenxi/openfold-esmfold2-recycling
+export PYTHONPATH=/home/jupyter-chenxi/openfold-esmfold2-recycling/openfold  # MANDATORY (else block_replacement_scripts.enhanced_data_utils import fails silently -> chain_list_path ignored, eval_dataset = ALL alignment_dir entries instead of the intended val list -- root-caused via direct OpenFoldDataModule construction + diff against WS5's own working launcher convention)
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
 export SINGLE_SEQ_MAX_CROP=256
 ulimit -n 65536
