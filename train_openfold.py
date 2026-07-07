@@ -291,6 +291,14 @@ class OpenFoldWrapper(pl.LightningModule):
                 clone_param, self.model.state_dict())
             self.model.load_state_dict(self.ema.state_dict()["params"])
 
+            # ESMFold2-tricks run: validate on TRUE single-sequence prediction (no templates),
+            # even when templates are kept ON for training (--single_seq_keep_templates) -- makes
+            # val/lddt_ca (checkpoint selection) reflect genuine single-sequence capability
+            # rather than template-assisted performance. Restored in on_validation_epoch_end.
+            if getattr(self, "validate_without_templates", False):
+                self._orig_template_enabled = self.model.config.template.enabled
+                self.model.config.template.enabled = False
+
         ground_truth = batch.pop('gt_features', None)
 
         # Run the model
@@ -315,6 +323,9 @@ class OpenFoldWrapper(pl.LightningModule):
         # Restore the model weights to normal
         self.model.load_state_dict(self.cached_weights)
         self.cached_weights = None
+        if hasattr(self, "_orig_template_enabled"):
+            self.model.config.template.enabled = self._orig_template_enabled
+            del self._orig_template_enabled
 
     def _compute_validation_metrics(self,
                                     batch,
@@ -602,6 +613,7 @@ def main(args):
     # Apply requested LR-warmup length to the final wrapper (after any single-seq reconstruction).
     if hasattr(model_module, "warmup_no_steps"):
         model_module.warmup_no_steps = getattr(args, "warmup_no_steps", 1000)
+    model_module.validate_without_templates = getattr(args, "validate_without_templates", False)
 
     # Direction 2: keep only a SUBSET of the 48 Evoformer blocks (shallower full-block model),
     # warm-started from the matching AF2 block weights (full 48 loaded above, then sliced).
@@ -1089,6 +1101,14 @@ if __name__ == "__main__":
         help="ESMFold2-inspired: sample the first cycle's recurrent pair state from "
              "trunc_norm(0, 2/(5*c_z)) instead of zeros, giving a seed-varying source of "
              "structural diversity that doesn't depend on MSA masking. Default off."
+    )
+    parser.add_argument(
+        "--validate_without_templates", action="store_true", default=False,
+        help="Disable template usage (model.config.template.enabled) during validation only, "
+             "restoring it after -- makes val/lddt_ca (checkpoint selection) reflect TRUE "
+             "single-sequence prediction capability instead of template-assisted performance, "
+             "even when templates are kept ON for training (e.g. --single_seq_keep_templates). "
+             "Default off (validation matches training's template setting, as before)."
     )
     parser.add_argument(
         "--evoformer_keep_block_indices", type=str, default=None,

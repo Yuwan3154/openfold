@@ -8,6 +8,9 @@
 # OpenFold's OWN existing "uniform_recycling" mechanism (config.py's "train" stage default,
 # ALREADY true, no new code needed) combined with max_recycling_iters=3 (finetuning_ptm's
 # existing default) -- NOT something this launcher needs to configure further.
+# --validate_without_templates: TRAINING keeps templates ON, but VALIDATION (checkpoint
+# selection via val/lddt_ca) runs WITHOUT templates -- true single-sequence prediction, not
+# template-assisted performance.
 cd /home/jupyter-chenxi/openfold-esmfold2-recycling
 . ~/miniconda3/etc/profile.d/conda.sh && conda deactivate && conda activate cue_openfold_gated
 export PYTHONPATH=/home/jupyter-chenxi/openfold-esmfold2-recycling
@@ -46,7 +49,7 @@ python train_openfold.py "$MM" "$ALN" "$MM" "$OUT" 2018-04-30 \
   --config_preset finetuning_ptm \
   --kalign_binary_path "$KAL" --obsolete_pdbs_file_path "$OBS" --template_release_dates_cache_path "$CACHE" \
   --prune_evoformer --enable_single_seq_mode --single_seq_keep_templates --freeze_non_evoformer \
-  --contractive_recycling --gaussian_pair_init \
+  --contractive_recycling --gaussian_pair_init --validate_without_templates \
   "${RESUME[@]}" \
   --train_chain_list_path "$TRAIN" \
   --val_data_dir "$MM" --val_alignment_dir "$ALN" --val_chain_list_path "$VAL" \
