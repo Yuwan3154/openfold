@@ -160,8 +160,12 @@ def _replace_obsolete_references(obsolete_mapping) -> Mapping[str, str]:
 
     def _new_target(k):
         v = obsolete_mapping[k]
-        if v in obsolete_keys:
-            return _new_target(v)
+        seen = set()  # guard against self-ref/cycles in PDB obsolete.dat (e.g. 8ujj->8ujj)
+        while v in obsolete_keys:
+            if v in seen:
+                break
+            seen.add(v)
+            v = obsolete_mapping[v]
         return v
     
     for k in obsolete_keys:
