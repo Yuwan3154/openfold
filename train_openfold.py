@@ -608,15 +608,19 @@ def main(args):
         model_module.ema = ExponentialMovingAverage(model=model_module.model, decay=config.ema.decay)
         rank_zero_info("freeze_all_except_heads: heads-only trainable %d / %d" % (_ntr, _nall))
 
-    # Prune the Evoformer AFTER warm-start weight load; fine-tune Evoformer-only.
+    # Prune the Evoformer AFTER warm-start weight load; fine-tune Evoformer-only (unless a
+    # different freeze mode was already explicitly requested above -- e.g. --freeze_all_except_heads
+    # for a confidence-head-only fine-tune of a pruned model, which prune_evoformer must not clobber).
     if getattr(args, "prune_evoformer", False):
-        rank_zero_info("Pruning 48 EvoformerBlocks (drop column + triangle attention); Evoformer-only fine-tune.")
+        rank_zero_info("Pruning 48 EvoformerBlocks (drop column + triangle attention).")
         prune_blocks(model_module.model.evoformer)
-        freeze_all_except_evoformer(model_module.model)
-        model_module.ema = ExponentialMovingAverage(model=model_module.model, decay=config.ema.decay)
-        n_tr = sum(prm.numel() for prm in model_module.model.parameters() if prm.requires_grad)
-        n_all = sum(prm.numel() for prm in model_module.model.parameters())
-        rank_zero_info("Pruned: trainable (Evoformer-only) params %d / %d" % (n_tr, n_all))
+        if not (getattr(args, "freeze_non_evoformer", False) or getattr(args, "freeze_all_except_heads", False)):
+            rank_zero_info("prune_evoformer: no other freeze mode requested -- defaulting to Evoformer-only fine-tune.")
+            freeze_all_except_evoformer(model_module.model)
+            model_module.ema = ExponentialMovingAverage(model=model_module.model, decay=config.ema.decay)
+            n_tr = sum(prm.numel() for prm in model_module.model.parameters() if prm.requires_grad)
+            n_all = sum(prm.numel() for prm in model_module.model.parameters())
+            rank_zero_info("Pruned: trainable (Evoformer-only) params %d / %d" % (n_tr, n_all))
 
     # Direction-2 hybrid: build a frozen FULL-48-block teacher for online representation distillation.
     if getattr(args, "distill_teacher_jax_params", None) and getattr(args, "distill_weight", 0.0) > 0:
