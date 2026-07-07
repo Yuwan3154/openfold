@@ -707,6 +707,19 @@ def main(args):
     data_module.prepare_data()
     data_module.setup()
 
+    if getattr(args, "pda_val_manifest", None):
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "prune_work"))
+        from pda_dataset import PDASingleSeqDataset
+        data_module.eval_dataset = PDASingleSeqDataset(
+            manifest_path=args.pda_val_manifest,
+            cif_cache_dir=args.pda_cif_cache_dir,
+            config=config.data,
+            mode="eval",
+        )
+        rank_zero_info(
+            f"pda_val_manifest: replacing standard eval_dataset with PDA-based single-sequence "
+            f"validation ({len(data_module.eval_dataset)} de novo design entries)")
+
     callbacks = []
     
     # Checkpointing: BEST by validation loss (early-stopping target to mitigate single-seq
@@ -1109,6 +1122,20 @@ if __name__ == "__main__":
              "single-sequence prediction capability instead of template-assisted performance, "
              "even when templates are kept ON for training (e.g. --single_seq_keep_templates). "
              "Default off (validation matches training's template setting, as before)."
+    )
+    parser.add_argument(
+        "--pda_val_manifest", type=str, default=None,
+        help="Path to a JSON manifest (list of {pdb, chain_id, seq}) of PDA (Protein Design "
+             "Archive) de novo design entries -- when set, REPLACES the standard validation "
+             "dataset with PDASingleSeqDataset (true single-sequence, no-template prediction "
+             "on real de novo designs, not natural-protein chains). --val_data_dir/"
+             "--val_alignment_dir/--val_chain_list_path are still required (unused output "
+             "discarded) since OpenFoldDataModule.setup() needs them to construct eval_dataset "
+             "in the first place, before this override replaces it."
+    )
+    parser.add_argument(
+        "--pda_cif_cache_dir", type=str, default=None,
+        help="Directory of cached PDA mmCIF files ({pdb}.cif), required with --pda_val_manifest."
     )
     parser.add_argument(
         "--evoformer_keep_block_indices", type=str, default=None,
