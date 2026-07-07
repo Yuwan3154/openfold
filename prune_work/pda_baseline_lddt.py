@@ -31,6 +31,8 @@ WS5_CKPT = os.environ.get(
     "/home/jupyter-chenxi/runs/prune_singleseq_v1/lightning_logs/version_4/checkpoints/best-063-016336.ckpt")
 STOCK_JAX_PARAMS = "/home/jupyter-chenxi/params/params_model_1_ptm.npz"
 OUT_CSV = os.environ.get("OUT_CSV", "/home/jupyter-chenxi/prune_work/eval_out/pda_baseline_lddt.csv")
+SHARD_IDX = int(os.environ.get("SHARD_IDX", "0"))
+NUM_SHARDS = int(os.environ.get("NUM_SHARDS", "1"))
 
 
 def build_cfg():
@@ -96,11 +98,21 @@ def run_eval(model, ds, name):
     return rows
 
 
+def shard(manifest):
+    """NUM_SHARDS>1: only process every NUM_SHARDS-th entry starting at SHARD_IDX -- lets
+    independent parallel processes (one per free GPU) split the eval set, each writing its own
+    shard CSV; a separate merge step (pda_baseline_merge.py) combines them afterward."""
+    if NUM_SHARDS <= 1:
+        return manifest
+    return manifest[SHARD_IDX::NUM_SHARDS]
+
+
 def main():
     cfg_ws5 = build_cfg()
     ds = PDASingleSeqDataset(manifest_path=MANIFEST, cif_cache_dir=CIF_CACHE_DIR,
                               config=cfg_ws5.data, mode="eval")
-    print(f"PDA clustered eval set: {len(ds)} entries", flush=True)
+    ds.manifest = shard(ds.manifest)
+    print(f"PDA clustered eval set: {len(ds)} entries (shard {SHARD_IDX}/{NUM_SHARDS})", flush=True)
 
     ws5 = load_ws5(cfg_ws5, WS5_CKPT)
     rows_ws5 = run_eval(ws5, ds, "WS5")
@@ -110,6 +122,7 @@ def main():
     cfg_stock = build_cfg_stock()
     ds_stock = PDASingleSeqDataset(manifest_path=MANIFEST, cif_cache_dir=CIF_CACHE_DIR,
                                     config=cfg_stock.data, mode="eval")
+    ds_stock.manifest = shard(ds_stock.manifest)
     stock = load_stock(cfg_stock)
     rows_stock = run_eval(stock, ds_stock, "stock_AF2")
 
@@ -122,8 +135,9 @@ def main():
                               "lddt_ca_ws5": lddt_ws5[k], "lddt_ca_stock": lddt_stock[k]})
 
     import csv
-    os.makedirs(os.path.dirname(OUT_CSV), exist_ok=True)
-    with open(OUT_CSV, "w", newline="") as f:
+    out_csv = OUT_CSV if NUM_SHARDS <= 1 else OUT_CSV.replace(".csv", f".shard{SHARD_IDX}.csv")
+    os.makedirs(os.path.dirname(out_csv), exist_ok=True)
+    with open(out_csv, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["pdb", "chain_id", "lddt_ca_ws5", "lddt_ca_stock"])
         w.writeheader()
         w.writerows(combined)
@@ -131,9 +145,9 @@ def main():
     mean_ws5 = sum(r["lddt_ca_ws5"] for r in combined) / len(combined)
     mean_stock = sum(r["lddt_ca_stock"] for r in combined) / len(combined)
     print(f"\nn={len(combined)}")
-    print(f"WS5 (pre-ESMFold2-tricks) mean val/lddt_ca on clustered PDA set:   {mean_ws5:.4f}")
-    print(f"stock AF2 mean val/lddt_ca on clustered PDA set: {mean_stock:.4f}")
-    print(f"wrote per-entry results -> {OUT_CSV}")
+    print(f"WS5 (pre-ESMFold2-tricks) mean val/lddt_ca on this shard:   {mean_ws5:.4f}")
+    print(f"stock AF2 mean val/lddt_ca on this shard: {mean_stock:.4f}")
+    print(f"wrote per-entry results -> {out_csv}")
 
 
 if __name__ == "__main__":
