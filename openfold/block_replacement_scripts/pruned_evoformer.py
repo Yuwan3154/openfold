@@ -28,6 +28,14 @@ def freeze_all_except_evoformer(model):
         prm.requires_grad_(False)
     for prm in model.evoformer.parameters():
         prm.requires_grad_(True)
+    # The ESMFold2-inspired contractive pair update (openfold/model/contractive_recycling.py)
+    # lives in model.recycling_embedder, NOT model.evoformer -- without this, its learnable
+    # Delta/A/B parameters would be silently frozen (dead weights) whenever use_contractive=True
+    # is combined with an evoformer-only freeze scheme.
+    contractive = getattr(model.recycling_embedder, "contractive_pair_update", None)
+    if contractive is not None:
+        for prm in contractive.parameters():
+            prm.requires_grad_(True)
     return model
 
 

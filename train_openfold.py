@@ -116,6 +116,30 @@ class OpenFoldWrapper(pl.LightningModule):
     def forward(self, batch):
         return self.model(batch)
 
+    def on_before_optimizer_step(self, optimizer):
+        # Opt-in gradient diagnostic (DEBUG_GRAD_CHECK=1): reports whether the evoformer, the
+        # ESMFold2-inspired contractive pair-update module (if enabled), and any frozen
+        # parameters have the gradient state they SHOULD have -- added specifically to verify
+        # the contractive module's learnable Delta/A/B parameters actually receive gradients
+        # (they live outside model.evoformer, so a freeze scheme scoped to "evoformer only"
+        # would otherwise silently leave them frozen/dead).
+        if os.environ.get("DEBUG_GRAD_CHECK") != "1":
+            return
+        groups = {"evoformer": list(self.model.evoformer.parameters())}
+        contractive = getattr(self.model.recycling_embedder, "contractive_pair_update", None)
+        if contractive is not None:
+            groups["contractive_pair_update"] = list(contractive.parameters())
+        groups["structure_module (expected frozen)"] = list(self.model.structure_module.parameters())
+        for name, params in groups.items():
+            grads = [p.grad for p in params if p.grad is not None]
+            if not grads:
+                rank_zero_info(f"[grad-check] {name}: 0/{len(params)} params have a gradient")
+                continue
+            finite = all(torch.isfinite(g).all() for g in grads)
+            total_norm = sum(g.norm().item() ** 2 for g in grads) ** 0.5
+            rank_zero_info(f"[grad-check] {name}: {len(grads)}/{len(params)} params have a "
+                           f"gradient, finite={finite}, total_norm={total_norm:.3e}")
+
     def _log(self, loss_breakdown, batch, outputs, train=True):
         phase = "train" if train else "val"
         
