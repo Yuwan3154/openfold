@@ -356,6 +356,10 @@ class OpenFoldWrapper(pl.LightningModule):
 
         metrics["lddt_ca"] = lddt_ca_score
 
+        # Already computed every forward pass by AuxiliaryHeads (compute_tm on tm_logits,
+        # config.model.heads.tm.enabled=True by default) -- just reading an existing output key.
+        metrics["ptm_score"] = outputs["ptm_score"]
+
         drmsd_ca_score = drmsd(
             pred_coords_masked_ca,
             gt_coords_masked_ca,
@@ -376,6 +380,9 @@ class OpenFoldWrapper(pl.LightningModule):
             )
 
             metrics["alignment_rmsd"] = alignment_rmsd
+            # Pass/fail recall at the standard self-consistency threshold -- Lightning's existing
+            # epoch-mean aggregation over this 0/1 indicator gives the pass RATE directly.
+            metrics["recall_2A"] = (alignment_rmsd < 2.0).float()
             metrics["gdt_ts"] = gdt_ts_score
             metrics["gdt_ha"] = gdt_ha_score
 
