@@ -29,6 +29,12 @@ from openfold.model.model import AlphaFold
 from openfold.np import residue_constants as rc
 
 SEQ = "MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQAPILSRVGDGTQDNLSGAEKAVQVKVKALPDAQFEVVHSLAKWKR"[:20]
+DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+# NOTE: OpenFold's inplace-attention path (triggered under torch.no_grad(), see
+# `inplace_safe = not (self.training or torch.is_grad_enabled())` in model.py) unconditionally
+# calls a CUDA-only kernel (attn_core_inplace_cuda) -- this is pre-existing OpenFold behavior,
+# not something this patch changes, so this test needs a real GPU if one is available, and CANNOT
+# run under torch.no_grad() on CPU-only.
 
 
 def build_model(use_contractive, use_gaussian_pair_init, seed=0):
@@ -44,14 +50,14 @@ def build_model(use_contractive, use_gaussian_pair_init, seed=0):
     cfg.model.recycling_embedder.use_gaussian_pair_init = use_gaussian_pair_init
     m = AlphaFold(cfg)
     m.eval()
-    return m
+    return m.to(DEVICE)
 
 
 def seq_to_logits(seq):
     aat = torch.tensor([rc.restype_order.get(a, rc.restype_num) for a in seq])
     oh = torch.nn.functional.one_hot(aat.clamp(max=19), 20).float()
     oh[aat >= 20] = 0.0
-    return 3.0 * oh
+    return (3.0 * oh).to(DEVICE)
 
 
 @torch.no_grad()
@@ -59,7 +65,7 @@ def run_forward(model, seq, recycle, seed=None):
     if seed is not None:
         torch.manual_seed(seed)
     logits = seq_to_logits(seq)
-    ri = torch.arange(len(seq))
+    ri = torch.arange(len(seq), device=DEVICE)
     batch = make_feature_batch(logits, ri, recycle_dim=recycle + 1)
     out = model(batch)
     fap = out["final_atom_positions"]
