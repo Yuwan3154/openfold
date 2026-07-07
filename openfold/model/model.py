@@ -272,10 +272,22 @@ class AlphaFold(nn.Module):
             )
 
             # [*, N, N, C_z]
-            z_prev = z.new_zeros(
-                (*batch_dims, n, n, self.config.input_embedder.c_z),
-                requires_grad=False,
-            )
+            if getattr(self.config.recycling_embedder, "use_gaussian_pair_init", False):
+                # ESMFold2-inspired (Appendix A.2.5): independent, seed-varying initial
+                # recurrent pair state instead of a deterministic all-zero start -- the source
+                # of structural sampling diversity that doesn't depend on MSA masking.
+                from openfold.model.contractive_recycling import sample_gaussian_pair_init
+                z_prev = sample_gaussian_pair_init(
+                    (*batch_dims, n, n, self.config.input_embedder.c_z),
+                    d_pair=self.config.input_embedder.c_z,
+                    device=z.device,
+                    dtype=z.dtype,
+                )
+            else:
+                z_prev = z.new_zeros(
+                    (*batch_dims, n, n, self.config.input_embedder.c_z),
+                    requires_grad=False,
+                )
 
             # [*, N, 3]
             x_prev = z.new_zeros(
@@ -311,7 +323,16 @@ class AlphaFold(nn.Module):
         m[..., 0, :, :] += m_1_prev_emb
 
         # [*, N, N, C_z]
-        z = add(z, z_prev_emb, inplace=inplace_safe)
+        if getattr(self.config.recycling_embedder, "use_contractive", False):
+            # ESMFold2-inspired (Appendix A.2.5, arXiv:2604.12946): z_prev_emb here is the
+            # distogram-derived signal ALONE (RecyclingEmbedder.forward's use_contractive
+            # branch), not yet combined with z_prev. Combine raw z_prev with (z + that signal)
+            # via the contractive recurrence instead of a plain additive residual -- this is
+            # what keeps the recurrent state numerically bounded across many recycle iterations.
+            u_t = add(z, z_prev_emb, inplace=inplace_safe)
+            z = self.recycling_embedder.contractive_pair_update(z_prev, u_t)
+        else:
+            z = add(z, z_prev_emb, inplace=inplace_safe)
 
         # Deletions like these become significant for inference with large N,
         # where they free unused tensors and remove references to others such
@@ -664,6 +685,26 @@ class AlphaFold(nn.Module):
             raise NotImplementedError(
                 "forward_inference/iteration_inference only support monomer "
                 "single-sequence mode (AF2Rank)."
+            )
+        if getattr(self.config.recycling_embedder, "use_contractive", False):
+            # This compiled, AF2Rank-specific fast path has its own separate `z = z + z_prev_emb`
+            # combination step (below) that was never updated for the contractive recurrence --
+            # doing so silently here would combine z_prev_emb (which means something DIFFERENT
+            # when use_contractive=True -- see RecyclingEmbedder.forward) incorrectly. Not yet
+            # supported; use the regular forward()/iteration() path instead.
+            raise NotImplementedError(
+                "use_contractive is not yet supported on the iteration_inference/AF2Rank fast "
+                "path -- use the regular forward()/iteration() path instead."
+            )
+        if getattr(self.config.recycling_embedder, "use_gaussian_pair_init", False):
+            # z_prev is pre-allocated as zeros by the caller (forward_inference) before this
+            # method ever runs -- use_gaussian_pair_init's sampling logic lives in iteration()'s
+            # `None in [...]` branch only, so it would be silently ignored here. Guard instead
+            # of letting the flag silently do nothing on this path.
+            raise NotImplementedError(
+                "use_gaussian_pair_init is not yet supported on the iteration_inference/AF2Rank "
+                "fast path (z_prev is pre-zeroed by the caller) -- use the regular "
+                "forward()/iteration() path instead."
             )
 
         # Convert input float32 feats to the model's parameter dtype.  This

@@ -418,6 +418,8 @@ class RecyclingEmbedder(nn.Module):
         max_bin: float,
         no_bins: int,
         inf: float = 1e8,
+        use_contractive: bool = False,
+        use_gaussian_pair_init: bool = False,
         **kwargs,
     ):
         """
@@ -432,6 +434,18 @@ class RecyclingEmbedder(nn.Module):
                 Largest distogram bin (Angstroms)
             no_bins:
                 Number of distogram bins
+            use_contractive:
+                ESMFold2-inspired (Appendix A.2.5, arXiv:2604.12946) opt-in: replace the plain
+                additive z-recycling combination with a contractive linear-SSM-style recurrence
+                (see openfold/model/contractive_recycling.py), which stays numerically bounded
+                across arbitrarily many recycle iterations (the plain additive update does not).
+                Default False -- no behavior change unless explicitly enabled.
+            use_gaussian_pair_init:
+                ESMFold2-inspired opt-in: sample the FIRST cycle's recurrent pair state from
+                trunc_norm(0, 2/(5*c_z)) instead of zeros, giving a seed-varying source of
+                structural diversity that doesn't depend on MSA masking. Handled in model.py
+                (this flag is read there, not used directly in this module); kept here too so
+                the config block that owns both flags stays together.
         """
         super(RecyclingEmbedder, self).__init__()
 
@@ -441,10 +455,16 @@ class RecyclingEmbedder(nn.Module):
         self.max_bin = max_bin
         self.no_bins = no_bins
         self.inf = inf
+        self.use_contractive = use_contractive
+        self.use_gaussian_pair_init = use_gaussian_pair_init
 
         self.linear = Linear(self.no_bins, self.c_z)
         self.layer_norm_m = LayerNorm(self.c_m)
         self.layer_norm_z = LayerNorm(self.c_z)
+
+        if self.use_contractive:
+            from openfold.model.contractive_recycling import ContractivePairUpdate
+            self.contractive_pair_update = ContractivePairUpdate(self.c_z)
 
     def forward(
         self,
@@ -458,14 +478,19 @@ class RecyclingEmbedder(nn.Module):
             m:
                 First row of the MSA embedding. [*, N_res, C_m]
             z:
-                [*, N_res, N_res, C_z] pair embedding
+                [*, N_res, N_res, C_z] pair embedding (previous cycle's raw output)
             x:
                 [*, N_res, 3] predicted C_beta coordinates
         Returns:
             m:
-                [*, N_res, C_m] MSA embedding update
+                [*, N_res, C_m] MSA embedding update (always: to be ADDED to the fresh cycle's m)
             z:
-                [*, N_res, N_res, C_z] pair embedding update
+                if use_contractive=False (default, unchanged behavior): [*, N_res, N_res, C_z]
+                pair embedding update, to be ADDED to the fresh cycle's z.
+                if use_contractive=True: the distogram-derived signal ALONE (z itself is left
+                untouched/un-normalized) -- the caller (model.py) combines it with the fresh
+                cycle's z via self.contractive_pair_update(z_prev_raw=z, u_t=z_fresh+this_signal),
+                per ESMFold2 Appendix A.2.5 (see openfold/model/contractive_recycling.py).
         """
         # [*, N, C_m]
         m_update = self.layer_norm_m(m)
@@ -473,11 +498,12 @@ class RecyclingEmbedder(nn.Module):
             m.copy_(m_update)
             m_update = m
 
-        # [*, N, N, C_z]
-        z_update = self.layer_norm_z(z)
-        if(inplace_safe):
-            z.copy_(z_update)
-            z_update = z
+        if not self.use_contractive:
+            # [*, N, N, C_z]
+            z_update = self.layer_norm_z(z)
+            if(inplace_safe):
+                z.copy_(z_update)
+                z_update = z
 
         # This squared method might become problematic in FP16 mode.
         bins = torch.linspace(
@@ -501,6 +527,10 @@ class RecyclingEmbedder(nn.Module):
 
         # [*, N, N, C_z]
         d = self.linear(d)
+
+        if self.use_contractive:
+            return m_update, d
+
         z_update = add(z_update, d, inplace_safe)
 
         return m_update, z_update

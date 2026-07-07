@@ -558,6 +558,11 @@ config = mlc.ConfigDict(
                 "max_bin": 20.75,
                 "no_bins": 15,
                 "inf": 1e8,
+                # ESMFold2-inspired opt-ins (Appendix A.2.5, arXiv:2604.12946) -- default OFF,
+                # zero behavior change unless explicitly enabled. See
+                # openfold/model/contractive_recycling.py.
+                "use_contractive": False,
+                "use_gaussian_pair_init": False,
             },
             "template": {
                 "distogram": {

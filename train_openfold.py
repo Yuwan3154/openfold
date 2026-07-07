@@ -465,6 +465,17 @@ def main(args):
         _max_crop = int(os.environ.get("SINGLE_SEQ_MAX_CROP", "256"))
         config.data.train.crop_size = min(config.data.train.crop_size, _max_crop)
 
+    # ESMFold2-inspired recycling opt-ins (Appendix A.2.5, arXiv:2604.12946) -- must be set
+    # before the model is constructed, since RecyclingEmbedder.__init__ reads these at build time.
+    if getattr(args, "contractive_recycling", False):
+        rank_zero_info("contractive_recycling: replacing plain-additive z-recycling with the "
+                       "ESMFold2-inspired contractive recurrence")
+        config.model.recycling_embedder.use_contractive = True
+    if getattr(args, "gaussian_pair_init", False):
+        rank_zero_info("gaussian_pair_init: sampling the first cycle's pair state from "
+                       "trunc_norm(0, 2/(5*c_z)) instead of zeros")
+        config.model.recycling_embedder.use_gaussian_pair_init = True
+
     # Use AdaptiveOpenFoldWrapper if adaptive_config_path is provided
     adaptive_config_path = getattr(args, 'adaptive_config_path', None)
     
@@ -1041,6 +1052,19 @@ if __name__ == "__main__":
     parser.add_argument(
         "--prune_evoformer", action="store_true", default=False,
         help="Prune all 48 EvoformerBlocks (drop column + triangle attention); fine-tune Evoformer-only."
+    )
+    parser.add_argument(
+        "--contractive_recycling", action="store_true", default=False,
+        help="ESMFold2-inspired (Appendix A.2.5, arXiv:2604.12946): replace the plain additive "
+             "z-recycling combination with a contractive linear-SSM-style recurrence, which stays "
+             "numerically bounded across arbitrarily many recycle iterations (unlike the plain "
+             "additive update). Default off -- no behavior change unless set."
+    )
+    parser.add_argument(
+        "--gaussian_pair_init", action="store_true", default=False,
+        help="ESMFold2-inspired: sample the first cycle's recurrent pair state from "
+             "trunc_norm(0, 2/(5*c_z)) instead of zeros, giving a seed-varying source of "
+             "structural diversity that doesn't depend on MSA masking. Default off."
     )
     parser.add_argument(
         "--evoformer_keep_block_indices", type=str, default=None,

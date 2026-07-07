@@ -12,8 +12,8 @@ import os
 
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from contractive_recycling import ContractivePairUpdate, sample_gaussian_pair_init
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "openfold"))
+from openfold.model.contractive_recycling import ContractivePairUpdate, sample_gaussian_pair_init
 
 torch.manual_seed(0)
 
