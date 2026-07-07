@@ -617,10 +617,14 @@ def main(args):
         if not (getattr(args, "freeze_non_evoformer", False) or getattr(args, "freeze_all_except_heads", False)):
             rank_zero_info("prune_evoformer: no other freeze mode requested -- defaulting to Evoformer-only fine-tune.")
             freeze_all_except_evoformer(model_module.model)
-            model_module.ema = ExponentialMovingAverage(model=model_module.model, decay=config.ema.decay)
-            n_tr = sum(prm.numel() for prm in model_module.model.parameters() if prm.requires_grad)
-            n_all = sum(prm.numel() for prm in model_module.model.parameters())
-            rank_zero_info("Pruned: trainable (Evoformer-only) params %d / %d" % (n_tr, n_all))
+        # EMA must be (re)built AFTER pruning regardless of freeze mode: prune_blocks() structurally
+        # changes the model (deletes msa_att_col, replaces tri_att_start/end with no-ops), so an EMA
+        # built beforehand (e.g. by the freeze_all_except_heads branch above) retains stale keys for
+        # the removed modules, which then fails to load at validation time.
+        model_module.ema = ExponentialMovingAverage(model=model_module.model, decay=config.ema.decay)
+        n_tr = sum(prm.numel() for prm in model_module.model.parameters() if prm.requires_grad)
+        n_all = sum(prm.numel() for prm in model_module.model.parameters())
+        rank_zero_info("Post-prune trainable params %d / %d" % (n_tr, n_all))
 
     # Direction-2 hybrid: build a frozen FULL-48-block teacher for online representation distillation.
     if getattr(args, "distill_teacher_jax_params", None) and getattr(args, "distill_weight", 0.0) > 0:
