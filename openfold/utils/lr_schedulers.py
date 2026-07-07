@@ -47,8 +47,7 @@ class AlphaFoldLRScheduler(torch.optim.lr_scheduler._LRScheduler):
 
         super(AlphaFoldLRScheduler, self).__init__(
             optimizer,
-            last_epoch=last_epoch, 
-            verbose=verbose,
+            last_epoch=last_epoch,
         )
 
     def state_dict(self):
