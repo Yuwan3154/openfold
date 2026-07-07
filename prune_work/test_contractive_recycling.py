@@ -26,8 +26,12 @@ def test_abar_in_unit_interval():
             m.log_delta.normal_(0, 3)
             m.log_a.normal_(0, 3)
         a_bar, b_bar = m.discretized_params()
-        assert (a_bar > 0).all() and (a_bar < 1).all(), f"Abar out of (0,1): min={a_bar.min()} max={a_bar.max()}"
-    print("PASS: Abar in (0,1) elementwise across 20 random parameter draws")
+        # a=exp(log_a) (Mamba convention) has a much wider dynamic range than the old
+        # softplus(log_a); under this N(0,3) stress draw, -delta*a can be extreme enough that
+        # exp(-delta*a) underflows to exactly 0.0 in float32 -- still mathematically in [0,1),
+        # never <0 or >=1 (delta>=0, a>0 guarantee -delta*a<=0 always, so exp(...) can't exceed 1).
+        assert (a_bar >= 0).all() and (a_bar < 1).all(), f"Abar out of [0,1): min={a_bar.min()} max={a_bar.max()}"
+    print("PASS: Abar in [0,1) elementwise across 20 random parameter draws")
 
 
 def test_bounded_vs_unbounded():
