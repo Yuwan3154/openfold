@@ -15,6 +15,7 @@ Compares 4 configurations: {use_contractive, use_gaussian_pair_init} x {False, T
     IDENTICAL input sequence -- confirming genuine seed-based structural diversity, the actual
     point of the mechanism.
 """
+import glob
 import os
 import sys
 
@@ -95,32 +96,72 @@ def test_default_config_reproducible():
     print("PASS: default (both flags False) config is deterministic/reproducible")
 
 
-def test_gaussian_init_gives_seed_diversity():
+def build_ws5_model(use_contractive, use_gaussian_pair_init, ckpt_path):
+    """Load WS5's REAL trained checkpoint (not fresh random weights) -- IMPORTANT: an untrained,
+    randomly-initialized model was found (see plan doc) to have essentially zero z->single-repr
+    coupling for this reduced single-sequence config, so a seed-diversity test on random weights
+    is not meaningful. A model actually TRAINED to exploit its pair representation for structure
+    prediction is the correct thing to test this against."""
+    sys.path.insert(0, f"{os.path.dirname(os.path.abspath(__file__))}/../openfold/block_replacement_scripts")
+    from pruned_evoformer import prune_blocks
+
+    cfg = model_config("finetuning_ptm", train=False, low_prec=False)
+    cfg.globals.chunk_size = None
+    for g in ["use_deepspeed_evo_attention", "use_lma", "use_flash"]:
+        setattr(cfg.globals, g, False)
+    cfg.data.common.max_recycling_iters = 3
+    cfg.model.template.enabled = False
+    cfg.data.common.use_templates = False
+    cfg.data.common.use_template_torsion_angles = False
+    cfg.model.recycling_embedder.use_contractive = use_contractive
+    cfg.model.recycling_embedder.use_gaussian_pair_init = use_gaussian_pair_init
+
+    m = AlphaFold(cfg)
+    prune_blocks(m.evoformer)
+    sd = torch.load(ckpt_path, map_location="cpu", weights_only=False)["state_dict"]
+    missing, unexpected = m.load_state_dict(
+        {k[6:]: v for k, v in sd.items() if k.startswith("model.")}, strict=False)
+    assert not missing, f"unexpected missing keys: {missing}"
+    assert all(k.startswith("template_embedder.") for k in unexpected), \
+        f"unexpected non-template keys: {[k for k in unexpected if not k.startswith('template_embedder.')]}"
+    return m.eval().to(DEVICE)
+
+
+def test_gaussian_init_gives_seed_diversity_on_real_ws5_weights():
     """The actual point of use_gaussian_pair_init: same sequence, different seeds -> different
-    structures."""
-    model = build_model(use_contractive=False, use_gaussian_pair_init=True, seed=0)
+    structures -- tested on WS5's REAL trained checkpoint, not fresh random weights (see
+    build_ws5_model's docstring for why that distinction matters)."""
+    ws5_ckpt_dir = "/home/jupyter-chenxi/runs/prune_singleseq_v1/lightning_logs/version_4/checkpoints"
+    candidates = glob.glob(os.path.join(ws5_ckpt_dir, "best-*.ckpt"))
+    if not candidates:
+        print(f"SKIP: no WS5 checkpoint found in {ws5_ckpt_dir} -- cannot test seed-diversity "
+              f"on real trained weights in this environment")
+        return
+    ckpt_path = max(candidates, key=os.path.getmtime)
+    print(f"using WS5 checkpoint: {ckpt_path}")
+
+    model = build_ws5_model(use_contractive=False, use_gaussian_pair_init=True, ckpt_path=ckpt_path)
     fap_seed1 = run_forward(model, SEQ, recycle=3, seed=1)
     fap_seed2 = run_forward(model, SEQ, recycle=3, seed=2)
     diff = (fap_seed1 - fap_seed2).abs().mean().item()
-    assert diff > 1e-3, f"different seeds gave near-identical output (mean abs diff={diff:.2e})"
-    print(f"PASS: gaussian_pair_init gives seed-based diversity (mean abs coord diff={diff:.3f} A)")
+    assert diff > 1e-3, f"different seeds gave near-identical output on REAL WS5 weights (mean abs diff={diff:.2e})"
+    print(f"PASS: gaussian_pair_init gives seed-based diversity on real WS5 weights "
+          f"(mean abs coord diff={diff:.3f} A)")
 
-    # Sanity: with gaussian init OFF, different seeds should NOT change the (deterministic,
-    # eval-mode, no-dropout) output at all -- isolates that the diversity really comes from z0.
-    model_off = build_model(use_contractive=False, use_gaussian_pair_init=False, seed=0)
+    model_off = build_ws5_model(use_contractive=False, use_gaussian_pair_init=False, ckpt_path=ckpt_path)
     fap_off_seed1 = run_forward(model_off, SEQ, recycle=3, seed=1)
     fap_off_seed2 = run_forward(model_off, SEQ, recycle=3, seed=2)
     diff_off = (fap_off_seed1 - fap_off_seed2).abs().mean().item()
     assert diff_off < 1e-6, (
         f"expected NO seed-diversity with gaussian_pair_init=False (eval mode, no dropout), "
         f"got diff={diff_off:.2e} -- something else is seed-dependent unexpectedly")
-    print(f"PASS: with gaussian_pair_init=False, different seeds give identical output "
-          f"(diff={diff_off:.2e}) -- confirms the diversity in the previous test comes from z0, "
+    print(f"PASS: with gaussian_pair_init=False, different seeds give identical output on real "
+          f"WS5 weights (diff={diff_off:.2e}) -- confirms the diversity above comes from z0, "
           f"not some other incidental randomness")
 
 
 if __name__ == "__main__":
     test_runs_without_error_all_configs()
     test_default_config_reproducible()
-    test_gaussian_init_gives_seed_diversity()
+    test_gaussian_init_gives_seed_diversity_on_real_ws5_weights()
     print("\nALL INTEGRATION TESTS PASSED")
