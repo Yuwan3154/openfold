@@ -14,6 +14,7 @@ from pytorch_lightning.plugins.environments import MPIEnvironment
 from pytorch_lightning import seed_everything
 from pytorch_lightning.utilities.rank_zero import rank_zero_info
 import torch
+import torch.distributed as dist
 import torch.multiprocessing as _tmp
 _tmp.set_sharing_strategy("file_system")
 import wandb
@@ -37,6 +38,8 @@ from openfold.utils.validation_metrics import (
     drmsd,
     gdt_ts,
     gdt_ha,
+    actual_tm_score,
+    spearman_corr,
 )
 from openfold.utils.import_weights import (
     import_jax_weights_,
@@ -85,6 +88,7 @@ class OpenFoldWrapper(pl.LightningModule):
         self.cached_weights = None
         self.last_lr_step = -1
         self._is_distributed = None  # Cache for distributed detection
+        self._val_ptm_calib_pairs = []  # (ptm_score, actual_tm) pairs, this rank, this val epoch
         self.save_hyperparameters()
     
     def _apply_block_replacement(self):
@@ -280,6 +284,9 @@ class OpenFoldWrapper(pl.LightningModule):
     def on_before_zero_grad(self, *args, **kwargs):
         self.ema.update(self.model)
 
+    def on_validation_epoch_start(self):
+        self._val_ptm_calib_pairs = []
+
     def validation_step(self, batch, batch_idx):
         # At the start of validation, load the EMA weights
         if (self.cached_weights is None):
@@ -327,6 +334,20 @@ class OpenFoldWrapper(pl.LightningModule):
             self.model.config.template.enabled = self._orig_template_enabled
             del self._orig_template_enabled
 
+        # pTM calibration: gather (ptm_score, actual_tm) pairs from every DDP rank (correlation
+        # needs the whole validation population, not a per-rank-shard estimate) and log a single
+        # Spearman correlation for the epoch.
+        pairs = self._val_ptm_calib_pairs
+        if self._is_distributed:
+            gathered = [None] * dist.get_world_size()
+            dist.all_gather_object(gathered, pairs)
+            pairs = [p for rank_pairs in gathered for p in rank_pairs]
+        ptm_vals, real_tm_vals = zip(*pairs)
+        calibration = spearman_corr(
+            torch.tensor(ptm_vals), torch.tensor(real_tm_vals)
+        )
+        self.log("val/ptm_calibration_spearman", calibration, logger=True, rank_zero_only=True)
+
     def _compute_validation_metrics(self,
                                     batch,
                                     outputs,
@@ -356,10 +377,6 @@ class OpenFoldWrapper(pl.LightningModule):
 
         metrics["lddt_ca"] = lddt_ca_score
 
-        # Already computed every forward pass by AuxiliaryHeads (compute_tm on tm_logits,
-        # config.model.heads.tm.enabled=True by default) -- just reading an existing output key.
-        metrics["ptm_score"] = outputs["ptm_score"]
-
         drmsd_ca_score = drmsd(
             pred_coords_masked_ca,
             gt_coords_masked_ca,
@@ -385,6 +402,22 @@ class OpenFoldWrapper(pl.LightningModule):
             metrics["recall_2A"] = (alignment_rmsd < 2.0).float()
             metrics["gdt_ts"] = gdt_ts_score
             metrics["gdt_ha"] = gdt_ha_score
+
+            # pTM confidence calibration: the raw mean of pTM isn't informative on its own (we
+            # already know from the standalone PDA baseline that both models' pTM sits low and
+            # uniform regardless of actual quality) -- what matters is whether pTM actually
+            # TRACKS real quality. actual_tm_score is the ground-truth analog of pTM (same d0
+            # length-normalization as compute_tm, applied to real post-superposition distances),
+            # so (ptm_score, actual_tm) pairs are directly comparable. Accumulated across the
+            # whole validation epoch (and all DDP ranks, gathered in on_validation_epoch_end)
+            # because a per-batch-item correlation is meaningless -- correlation needs the full
+            # population, unlike the other metrics here which are plain epoch means.
+            real_tm = actual_tm_score(
+                superimposed_pred, gt_coords_masked_ca, all_atom_mask_ca
+            )
+            self._val_ptm_calib_pairs.extend(
+                zip(outputs["ptm_score"].reshape(-1).tolist(), real_tm.reshape(-1).tolist())
+            )
 
         return metrics
 

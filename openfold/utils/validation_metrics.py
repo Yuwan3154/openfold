@@ -67,3 +67,29 @@ def gdt_ts(p1, p2, mask):
 def gdt_ha(p1, p2, mask):
     return gdt(p1, p2, mask, [0.5, 1., 2., 4.])
 
+
+def actual_tm_score(superimposed_pred, native, mask):
+    """Real (ground-truth) TM-score between a Kabsch-superimposed predicted structure and the
+    native structure -- same d0 length-normalization as AlphaFold's predicted TM-score
+    (openfold.utils.loss.compute_tm), applied to actual post-superposition CA distances instead
+    of a predicted distance-bin distribution. Lets predicted pTM be checked for calibration
+    against a directly comparable, same-scale ground-truth quantity."""
+    n = torch.sum(mask, dim=-1)
+    clipped_n = torch.clamp(n, min=19)
+    d0 = 1.24 * (clipped_n - 15) ** (1. / 3.) - 1.8
+    distances = torch.sqrt(torch.sum((superimposed_pred - native) ** 2, dim=-1))
+    per_residue_term = 1. / (1. + (distances / d0[..., None]) ** 2)
+    return torch.sum(per_residue_term * mask, dim=-1) / n
+
+
+def spearman_corr(x, y):
+    """Spearman rank correlation between two equal-length 1-D tensors -- same calibration
+    convention this project already uses elsewhere (e.g. per-target Spearman(composite,
+    tm_ref_template) in the AF2Rank calibration work)."""
+    x_rank = torch.argsort(torch.argsort(x)).float()
+    y_rank = torch.argsort(torch.argsort(y)).float()
+    x_rank = x_rank - x_rank.mean()
+    y_rank = y_rank - y_rank.mean()
+    denom = torch.sqrt((x_rank ** 2).sum() * (y_rank ** 2).sum())
+    return (x_rank * y_rank).sum() / denom if denom > 0 else x_rank.new_zeros(())
+
