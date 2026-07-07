@@ -757,15 +757,32 @@ def main(args):
     if getattr(args, "pda_val_manifest", None):
         sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "prune_work"))
         from pda_dataset import PDASingleSeqDataset
-        data_module.eval_dataset = PDASingleSeqDataset(
-            manifest_path=args.pda_val_manifest,
-            cif_cache_dir=args.pda_cif_cache_dir,
-            config=config.data,
-            mode="eval",
-        )
-        rank_zero_info(
-            f"pda_val_manifest: replacing standard eval_dataset with PDA-based single-sequence "
-            f"validation ({len(data_module.eval_dataset)} de novo design entries)")
+
+        def _set_pda_eval_dataset():
+            data_module.eval_dataset = PDASingleSeqDataset(
+                manifest_path=args.pda_val_manifest,
+                cif_cache_dir=args.pda_cif_cache_dir,
+                config=config.data,
+                mode="eval",
+            )
+            rank_zero_info(
+                f"pda_val_manifest: replacing standard eval_dataset with PDA-based single-sequence "
+                f"validation ({len(data_module.eval_dataset)} de novo design entries)")
+
+        # trainer.fit(datamodule=data_module)/trainer.validate(...) call data_module.setup()
+        # AGAIN internally (pytorch_lightning/trainer/call.py's _call_setup_hook), and
+        # OpenFoldDataModule.setup() unconditionally rebuilds self.eval_dataset from
+        # val_data_dir/val_chain_list_path with no idempotency guard -- silently clobbering this
+        # override back to the natural-protein WS5 val set right before training starts. Patch
+        # setup() itself to reapply the PDA override after every call, so it survives Lightning's
+        # own re-invocation regardless of how many times setup() runs.
+        _orig_setup = data_module.setup
+        def _setup_then_reapply_pda(stage=None):
+            _orig_setup(stage)
+            _set_pda_eval_dataset()
+        data_module.setup = _setup_then_reapply_pda
+
+        _set_pda_eval_dataset()
 
     callbacks = []
     
