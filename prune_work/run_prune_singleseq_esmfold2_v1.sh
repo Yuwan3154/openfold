@@ -36,6 +36,7 @@ OUT=${OUT_DIR:-/home/jupyter-chenxi/runs/prune_singleseq_esmfold2_v2_pda_eval}
 MAXEP=${MAX_EPOCHS:-100}
 SAVE_TOP_K=${SAVE_TOP_K:-5}
 EPL=${TRAIN_EPOCH_LEN:-1000}
+GRAD_ACCUM=${GRAD_ACCUM:-1}
 # WS5's own latest checkpoint -- the INIT source for this run's weights (NOT stock full AF2).
 WS5_CKPT_DIR=/home/jupyter-chenxi/runs/prune_singleseq_v1/lightning_logs/version_4/checkpoints
 WS5_INIT_CKPT=${WS5_INIT_CKPT:-$(ls -t "$WS5_CKPT_DIR"/best-*.ckpt 2>/dev/null | head -1)}
@@ -65,5 +66,6 @@ python train_openfold.py "$MM" "$ALN" "$MM" "$OUT" 2018-04-30 \
   --val_data_dir "$MM" --val_alignment_dir "$ALN" --val_chain_list_path "$VAL" \
   --precision bf16 --learning_rate 1e-4 --warmup_no_steps 3000 \
   --train_epoch_len "$EPL" --max_epochs "$MAXEP" --num_sanity_val_steps 0 \
+  --grad_accum_steps "$GRAD_ACCUM" \
   --checkpoint_every_n_steps 20 --checkpoint_monitor val/lddt_ca --checkpoint_save_top_k "$SAVE_TOP_K" \
   --log_lr --log_every_n_steps 20 --seed 42 --distributed_backend nccl

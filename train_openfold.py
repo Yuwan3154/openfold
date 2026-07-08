@@ -899,6 +899,7 @@ def main(args):
         'strategy': strategy,
         'callbacks': callbacks,
         'logger': loggers,
+        'accumulate_grad_batches': args.grad_accum_steps,
         'gradient_clip_val': 0.1,
         'gradient_clip_algorithm': 'norm',
     })
