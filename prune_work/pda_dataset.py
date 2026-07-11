@@ -25,12 +25,22 @@ class PDASingleSeqDataset(torch.utils.data.Dataset):
     SAME config.data object OpenFoldDataModule/OpenFoldSingleDataset use. mode: "eval" (matches
     OpenFoldSingleDataset's mode argument -- controls cropping/recycling-count sampling)."""
 
-    def __init__(self, manifest_path, cif_cache_dir, config, mode="eval"):
+    def __init__(self, manifest_path, cif_cache_dir, config, mode="eval", train_overlap_ids_path=None):
         with open(manifest_path) as f:
             self.manifest = json.load(f)
         self.cif_cache_dir = cif_cache_dir
         self.config = config
         self.mode = mode
+        # Entries whose pdb_chain is verbatim present in the model's own training set (see
+        # ESMFOLD2_RECYCLE_SCALING.md PDA investigation) -- kept IN the validation population as a
+        # deliberate "has the model learned its own training data" marker, not filtered out. Empty
+        # set (default) means every item reports as held-out, i.e. no behavior change when unset.
+        self.train_overlap_ids = set()
+        if train_overlap_ids_path is not None:
+            with open(train_overlap_ids_path) as f:
+                self.train_overlap_ids = {
+                    f"{e['pdb']}_{e['chain_id']}" for e in json.load(f)
+                }
         # template_featurizer=None -> make_template_features always takes the empty-template
         # branch (data_pipeline.py: `if template_featurizer is None or (len(hits_cat)==0 ...)`),
         # so no template mmcif dir / release-dates cache is needed for this template-free path.
@@ -61,4 +71,6 @@ class PDASingleSeqDataset(torch.utils.data.Dataset):
         feats = self.feature_pipeline.process_features(data, self.mode)
         feats["batch_idx"] = torch.tensor(
             [idx for _ in range(feats["aatype"].shape[-1])], dtype=torch.int64)
+        is_overlap = int(f"{pdbid}_{chain_id}" in self.train_overlap_ids)
+        feats["is_train_overlap"] = torch.full_like(feats["batch_idx"], is_overlap)
         return feats

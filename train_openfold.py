@@ -188,9 +188,26 @@ class OpenFoldWrapper(pl.LightningModule):
                 f"{phase}/{k}",
                 torch.mean(v),
                 prog_bar = (k == 'loss'),
-                on_step=False, on_epoch=True, logger=True, 
+                on_step=False, on_epoch=True, logger=True,
                 sync_dist=sync_epoch_metrics,  # Sync for epoch-level in distributed
             )
+
+        # Additionally split validation metrics by "is this PDA entry verbatim present in the
+        # model's own training set" (see ESMFOLD2_RECYCLE_SCALING.md PDA investigation) -- these
+        # entries stay IN the validation population (not filtered out), this just reports them
+        # separately as a diagnostic marker for whether the model has actually learned its own
+        # training data. Only active when PDASingleSeqDataset was built with
+        # --pda_train_overlap_ids (batch then carries "is_train_overlap"); the full-population
+        # val/{k} above is logged unconditionally either way.
+        if (not train) and "is_train_overlap" in batch:
+            suffix = "train_overlap" if bool(batch["is_train_overlap"].flatten()[0]) else "held_out"
+            for k, v in other_metrics.items():
+                self.log(
+                    f"{phase}/{k}_{suffix}",
+                    torch.mean(v),
+                    on_step=False, on_epoch=True, logger=True,
+                    sync_dist=sync_epoch_metrics,
+                )
 
     def training_step(self, batch, batch_idx):
         if (self.ema.device != batch["aatype"].device):
@@ -764,6 +781,7 @@ def main(args):
                 cif_cache_dir=args.pda_cif_cache_dir,
                 config=config.data,
                 mode="eval",
+                train_overlap_ids_path=getattr(args, "pda_train_overlap_ids", None),
             )
             rank_zero_info(
                 f"pda_val_manifest: replacing standard eval_dataset with PDA-based single-sequence "
@@ -1201,6 +1219,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--pda_cif_cache_dir", type=str, default=None,
         help="Directory of cached PDA mmCIF files ({pdb}.cif), required with --pda_val_manifest."
+    )
+    parser.add_argument(
+        "--pda_train_overlap_ids", type=str, default=None,
+        help="Path to a JSON list of {pdb, chain_id} PDA entries whose pdb_chain is verbatim "
+             "present in the training set (e.g. classic pre-cutoff designs). These stay IN the "
+             "validation population as-is; when this is set, val metrics are ADDITIONALLY logged "
+             "split into val/{metric}_train_overlap and val/{metric}_held_out, alongside the "
+             "existing full-population val/{metric} (unchanged). Default off (no split logging)."
     )
     parser.add_argument(
         "--evoformer_keep_block_indices", type=str, default=None,
