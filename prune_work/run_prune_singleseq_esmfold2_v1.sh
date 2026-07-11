@@ -32,6 +32,7 @@ TRAIN=${TRAIN_LIST:-$L/slim_struct_train.list}
 VAL=${VAL_LIST:-$L/ws5_val_strict_clean.list}
 PDA_MANIFEST=${PDA_VAL_MANIFEST:-/home/jupyter-chenxi/prune_work/eval_out/pda_cluster_representatives.json}
 PDA_CIF_DIR=${PDA_CIF_CACHE_DIR:-/home/jupyter-chenxi/prune_work/eval_out/pda_mmcif_cache}
+PDA_TRAIN_OVERLAP=${PDA_TRAIN_OVERLAP_IDS:-/home/jupyter-chenxi/prune_work/eval_out/pda_train_overlap_ids.json}
 OUT=${OUT_DIR:-/home/jupyter-chenxi/runs/prune_singleseq_esmfold2_v2_pda_eval}
 MAXEP=${MAX_EPOCHS:-100}
 SAVE_TOP_K=${SAVE_TOP_K:-5}
@@ -61,6 +62,7 @@ python train_openfold.py "$MM" "$ALN" "$MM" "$OUT" 2018-04-30 \
   --prune_evoformer --enable_single_seq_mode --single_seq_keep_templates --freeze_non_evoformer \
   --contractive_recycling --gaussian_pair_init --validate_without_templates \
   --pda_val_manifest "$PDA_MANIFEST" --pda_cif_cache_dir "$PDA_CIF_DIR" \
+  --pda_train_overlap_ids "$PDA_TRAIN_OVERLAP" \
   "${RESUME[@]}" \
   --train_chain_list_path "$TRAIN" \
   --val_data_dir "$MM" --val_alignment_dir "$ALN" --val_chain_list_path "$VAL" \
