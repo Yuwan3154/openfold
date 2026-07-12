@@ -603,16 +603,24 @@ def main(args):
             else:
                 sd = torch.load(args.resume_from_ckpt, weights_only=False)
             # Process the state dict
-            # Use strict=False if we're doing block replacement or single sequence mode (model structure changed)
+            # Use strict=False if we're doing block replacement, single sequence mode, or Evoformer
+            # pruning (model structure changed). prune_evoformer deletes msa_att_col and replaces
+            # tri_att_start/end with param-free no-ops (see pruned_evoformer.py) AFTER this load, so
+            # a freshly-constructed (not-yet-pruned) model always has more keys than an
+            # already-pruned checkpoint -- this holds regardless of enable_single_seq_mode, which
+            # every prior launcher happened to always combine with prune_evoformer, masking the gap.
             strict_loading = not (
                 (hasattr(args, 'replace_block_index') and args.replace_block_index is not None) or
-                (hasattr(args, 'enable_single_seq_mode') and args.enable_single_seq_mode)
+                (hasattr(args, 'enable_single_seq_mode') and args.enable_single_seq_mode) or
+                (hasattr(args, 'prune_evoformer') and args.prune_evoformer)
             )
             if not strict_loading:
                 if hasattr(args, 'replace_block_index') and args.replace_block_index is not None:
                     rank_zero_info(f"Using strict=False for weight loading due to block replacement at index {args.replace_block_index}")
                 elif hasattr(args, 'enable_single_seq_mode') and args.enable_single_seq_mode:
                     rank_zero_info(f"Using strict=False for weight loading due to single sequence mode (templates disabled)")
+                elif hasattr(args, 'prune_evoformer') and args.prune_evoformer:
+                    rank_zero_info(f"Using strict=False for weight loading due to prune_evoformer (column/triangle attention removed after load)")
             if 'module' in sd:
                 sd = {k[len('module.'):]: v for k, v in sd['module'].items()}
                 import_openfold_weights_(model=model_module, state_dict=sd, strict=strict_loading)

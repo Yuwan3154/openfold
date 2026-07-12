@@ -1,0 +1,4 @@
+{
+  "data.train.crop_size": 256,
+  "loss.masked_msa.weight": 0.0
+}
