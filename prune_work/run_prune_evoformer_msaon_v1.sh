@@ -1,7 +1,7 @@
 #!/bin/bash
-# Single-variable ablation vs run_prune_singleseq_esmfold2_v1.sh (the live v4 run): everything
-# identical (prune_evoformer, freeze_non_evoformer, contractive_recycling, gaussian_pair_init,
-# validate_without_templates, PDA eval set, WS5 weights-only init) EXCEPT real MSA is left ON
+# Single-variable ablation vs run_prune_singleseq_esmfold2_v1.sh (v4, stopped 2026-07-12 to launch
+# this run): everything identical (prune_evoformer, freeze_non_evoformer, contractive_recycling,
+# gaussian_pair_init, validate_without_templates, PDA eval set) EXCEPT real MSA is left ON
 # (finetuning_ptm's own max_msa_clusters=512/max_extra_msa=5120, not clamped to 1) -- tests
 # whether OuterProductMean can still extract a genuine covariation/contact signal into the pair
 # track without column attention (dropped by --prune_evoformer), approximating classical
@@ -33,25 +33,26 @@ MAXEP=${MAX_EPOCHS:-100}
 SAVE_TOP_K=${SAVE_TOP_K:-5}
 EPL=${TRAIN_EPOCH_LEN:-3000}
 GRAD_ACCUM=${GRAD_ACCUM:-4}
-# WS5's own latest checkpoint -- the INIT source for this run's weights (NOT stock AF2 jax), same
-# source v4 was weights-only-initialized from.
-WS5_CKPT_DIR=/home/jupyter-chenxi/runs/prune_singleseq_v1/lightning_logs/version_4/checkpoints
-WS5_INIT_CKPT=${WS5_INIT_CKPT:-$(ls -t "$WS5_CKPT_DIR"/best-*.ckpt 2>/dev/null | head -1)}
+# v4's own best checkpoint (by val/lddt_ca) -- the INIT source for this run's weights, per user
+# directive (2026-07-12): continue from v4's already-trained state rather than WS5's, so this run
+# tests "turn MSA on from here" rather than "retrain from scratch with MSA on".
+V4_CKPT_DIR=/home/jupyter-chenxi/runs/prune_singleseq_esmfold2_v4_pda_eval/lightning_logs/version_7/checkpoints
+INIT_CKPT=${INIT_CKPT:-$(ls -t "$V4_CKPT_DIR"/best-*.ckpt 2>/dev/null | head -1)}
 [ -f "$TRAIN" ] || { echo "ERROR: train list not found: $TRAIN"; exit 1; }
 [ -f "$VAL" ]   || { echo "ERROR: val list not found: $VAL"; exit 1; }
 [ -f "$PDA_MANIFEST" ] || { echo "ERROR: PDA val manifest not found: $PDA_MANIFEST"; exit 1; }
 [ -d "$PDA_CIF_DIR" ]  || { echo "ERROR: PDA cif cache dir not found: $PDA_CIF_DIR"; exit 1; }
 [ -f "$MSAON_CONFIG_JSON" ] || { echo "ERROR: MSA-on config overrides json not found: $MSAON_CONFIG_JSON"; exit 1; }
-[ -n "$WS5_INIT_CKPT" ] || { echo "ERROR: no WS5 init checkpoint found in $WS5_CKPT_DIR"; exit 1; }
+[ -n "$INIT_CKPT" ] || { echo "ERROR: no init checkpoint found in $V4_CKPT_DIR"; exit 1; }
 # Auto-resume: if THIS run already has its own checkpoint, resume full state from it; else
-# weights-only init from WS5's latest checkpoint (first launch).
+# weights-only init from v4's best checkpoint (first launch).
 CK=$(ls -t "$OUT"/lightning_logs/version_*/checkpoints/last.ckpt 2>/dev/null | head -1)
 if [ -n "$CK" ]; then
   RESUME=(--resume_from_ckpt "$CK")
   echo "RESUME (full state) from this run's own checkpoint: $CK"
 else
-  RESUME=(--resume_from_ckpt "$WS5_INIT_CKPT" --resume_model_weights_only true)
-  echo "INIT (weights-only) from WS5's latest checkpoint: $WS5_INIT_CKPT"
+  RESUME=(--resume_from_ckpt "$INIT_CKPT" --resume_model_weights_only true)
+  echo "INIT (weights-only) from v4's best checkpoint: $INIT_CKPT"
 fi
 python train_openfold.py "$MM" "$ALN" "$MM" "$OUT" 2018-04-30 \
   --config_preset finetuning_ptm \
