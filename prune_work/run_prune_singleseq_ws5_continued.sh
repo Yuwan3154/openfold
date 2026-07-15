@@ -14,7 +14,16 @@
 cd /home/jupyter-chenxi/openfold-esmfold2-recycling
 . ~/miniconda3/etc/profile.d/conda.sh && conda deactivate && conda activate cue_openfold_gated
 export PYTHONPATH=/home/jupyter-chenxi/openfold-esmfold2-recycling/openfold  # MANDATORY, see run_prune_singleseq_esmfold2_v1.sh
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}
+# 2-GPU (0,1) DDP hangs on this box: GPU0<->GPU1 is PHB (PCIe P2P over the CPU host bridge), whose
+# bulk-transfer DMA deadlocks -- NCCL reports Init COMPLETE then the first collective spins forever
+# at 100% util / flat memory (confirmed 2026-07-14 via NCCL_DEBUG trace + /proc forensics). Disabling
+# direct P2P routes collectives through host-staged SHM instead: correctness-neutral (transport only,
+# reduction/accumulation unchanged), negligible perf cost (PHB P2P already went through the root
+# complex anyway). Scoped to <=2 GPUs so a 4-GPU launch keeps direct P2P (its ring avoids the broken
+# direct-0<->1 link and works). Do NOT use NCCL_P2P_LEVEL=PHB/SYS -- those keep P2P on the failing link.
+NGPU=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | grep -c .)
+[ "$NGPU" -le 2 ] && export NCCL_P2P_DISABLE=1
 ulimit -n 65536
 MM=/home/jupyter-chenxi/data/pdb_mmcif/mmcif_files
 ALN=/home/jupyter-chenxi/data/openproteinset_aln
