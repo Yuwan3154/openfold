@@ -15,7 +15,12 @@ import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, "/home/jupyter-chenxi/openfold/openfold/block_replacement_scripts")
+# MUST point at THIS repo's own worktree, not /home/jupyter-chenxi/openfold/ (a different, unrelated
+# worktree) -- pda_baseline_full.py has this same wrong path but it's latent/harmless there since
+# that script runs with model.template.enabled=False, never exercising embed_templates(); THIS
+# script uses templates.enabled=True and hit a real reshape bug in the OTHER worktree's template.py
+# (caught 2026-07-15 via a full traceback, not assumed).
+sys.path.insert(0, "/home/jupyter-chenxi/openfold-esmfold2-recycling/openfold/block_replacement_scripts")
 from pda_a4c_lib import build_slots_from_components, build_multichain_features, build_cfg, get_native_design_coords
 from pruned_evoformer import prune_blocks
 from eval_pda_self_consistency import kabsch_rmsd
