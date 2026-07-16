@@ -9,6 +9,7 @@ import json
 import os
 import sys
 import time
+import traceback
 
 import numpy as np
 import torch
@@ -120,6 +121,7 @@ def main():
             row = run_one(model, cfg, entry)
         except Exception as e:
             print(f"[{ARM}] {entry['pdb']}_{entry['chain_id']}: FAILED {type(e).__name__}: {e}", flush=True)
+            traceback.print_exc()
             rows.append(dict(pdb=entry["pdb"], chain_id=entry["chain_id"], total_len=entry["total_len"],
                              n_slots=None, design_len=None, rmsd=float("nan"), success_2A=False))
             continue
