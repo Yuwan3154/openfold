@@ -55,6 +55,18 @@ def build_multichain_features(slots, kalign_binary_path, ri_gap=RI_GAP):
 
     msa_feats = data_pipeline.make_dummy_msa_feats(input_sequence)
 
+    # Ground-truth base fields the standard feature_pipeline schema always expects present
+    # (common_cfg.feat), even in pure-inference eval mode -- downstream transforms derive
+    # atom14_gt_*/rigidgroups_gt_*/chi_angles_* etc. from these. Zero-filled here: we score against
+    # ground truth fetched SEPARATELY (get_native_design_coords), so these never feed the network
+    # (GT coords are loss-only fields, not model inputs) and zero/masked is safe for every slot.
+    gt_feats = {
+        "all_atom_positions": np.zeros((num_res, rc.atom_type_num, 3), dtype=np.float32),
+        "all_atom_mask": np.zeros((num_res, rc.atom_type_num), dtype=np.float32),
+        "resolution": np.array([0.], dtype=np.float32),
+        "is_distillation": np.array(0., dtype=np.float32),
+    }
+
     has_any_template = any(s.get("template") is not None for s in slots)
     if not has_any_template:
         template_feats = templates.empty_template_feats(num_res)
@@ -87,7 +99,7 @@ def build_multichain_features(slots, kalign_binary_path, ri_gap=RI_GAP):
             "template_sum_probs": np.array([[1.0]], dtype=np.float32),
         }
 
-    return {**seq_feats, **msa_feats, **template_feats}
+    return {**seq_feats, **msa_feats, **gt_feats, **template_feats}
 
 
 def build_cfg(model_config_fn):
