@@ -29,6 +29,14 @@ from openfold.config import model_config
 from openfold.data import feature_pipeline
 from openfold.model.model import AlphaFold
 from openfold.np import residue_constants as rc
+
+import openfold as _of_diag
+from openfold.model import template as _of_template_diag
+print(f"DIAG __file__={__file__}", flush=True)
+print(f"DIAG sys.path[:4]={sys.path[:4]}", flush=True)
+print(f"DIAG openfold.__file__={_of_diag.__file__}", flush=True)
+print(f"DIAG openfold.model.model.__file__={AlphaFold.__module__}", flush=True)
+print(f"DIAG openfold.model.template.__file__={_of_template_diag.__file__}", flush=True)
 from openfold.utils.tensor_utils import tensor_tree_map
 
 ARM = os.environ["ARM"]  # "arm1", "arm2", or "arm3"
