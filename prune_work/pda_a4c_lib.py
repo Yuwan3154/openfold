@@ -82,37 +82,41 @@ def build_multichain_features(slots, kalign_binary_path, ri_gap=RI_GAP):
         "is_distillation": np.array(0., dtype=np.float32),
     }
 
-    has_any_template = any(s.get("template") is not None for s in slots)
-    if not has_any_template:
-        template_feats = templates.empty_template_feats(num_res)
-    else:
-        n_aatype = len(rc.restypes_with_x_and_gap)
-        template_aatype = np.zeros((1, num_res, n_aatype), dtype=np.float32)
-        template_aatype[..., rc.HHBLITS_AA_TO_ID['-']] = 1
-        template_all_atom_positions = np.zeros((1, num_res, rc.atom_type_num, 3), dtype=np.float32)
-        template_all_atom_mask = np.zeros((1, num_res, rc.atom_type_num), dtype=np.float32)
+    # ALWAYS build exactly 1 template row (never n_templates=0): with cfg.data.eval.fixed_size=False
+    # (chosen so the design chain, slot 0, is never cropped), the standard make_fixed_size transform
+    # that normally pads the template dim to >=1 slot never runs -- a genuinely 0-sized template
+    # tensor hits a real PyTorch ambiguous-reshape edge case inside TemplatePointwiseAttention's
+    # chunked path (`reshape(-1, 0, ...)`, caught 2026-07-15 via full traceback). A single FULLY
+    # MASKED template (all-gap aatype, zero positions/mask) is semantically identical to "no
+    # template info" -- it contributes nothing to the pair/single embeddings either way -- so this
+    # is not a behavior change, just avoiding the empty-tensor shape.
+    n_aatype = len(rc.restypes_with_x_and_gap)
+    template_aatype = np.zeros((1, num_res, n_aatype), dtype=np.float32)
+    template_aatype[..., rc.HHBLITS_AA_TO_ID['-']] = 1
+    template_all_atom_positions = np.zeros((1, num_res, rc.atom_type_num, 3), dtype=np.float32)
+    template_all_atom_mask = np.zeros((1, num_res, rc.atom_type_num), dtype=np.float32)
 
-        cur = 0
-        for s in slots:
-            L = len(s["seq"])
-            if s.get("template") is not None:
-                block = _template_block_for_slot(s["seq"], s["template"], kalign_binary_path)
-                template_aatype[:, cur:cur + L] = block["template_aatype"]
-                template_all_atom_positions[:, cur:cur + L] = block["template_all_atom_positions"]
-                template_all_atom_mask[:, cur:cur + L] = block["template_all_atom_mask"]
-            cur += L
+    cur = 0
+    for s in slots:
+        L = len(s["seq"])
+        if s.get("template") is not None:
+            block = _template_block_for_slot(s["seq"], s["template"], kalign_binary_path)
+            template_aatype[:, cur:cur + L] = block["template_aatype"]
+            template_all_atom_positions[:, cur:cur + L] = block["template_all_atom_positions"]
+            template_all_atom_mask[:, cur:cur + L] = block["template_all_atom_mask"]
+        cur += L
 
-        template_feats = {
-            "template_aatype": template_aatype,
-            "template_all_atom_positions": template_all_atom_positions,
-            "template_all_atom_mask": template_all_atom_mask,
-            "template_pseudo_beta_mask": np.zeros((1, num_res), dtype=np.float32),
-            "template_pseudo_beta": np.zeros((1, num_res, 3), dtype=np.float32),
-            "template_dgram_probs": np.zeros((1, num_res, num_res, 39), dtype=np.float32),
-            "template_domain_names": np.array([b"a4c"], dtype=object),
-            "template_sequence": np.array([input_sequence.encode()], dtype=object),
-            "template_sum_probs": np.array([[1.0]], dtype=np.float32),
-        }
+    template_feats = {
+        "template_aatype": template_aatype,
+        "template_all_atom_positions": template_all_atom_positions,
+        "template_all_atom_mask": template_all_atom_mask,
+        "template_pseudo_beta_mask": np.zeros((1, num_res), dtype=np.float32),
+        "template_pseudo_beta": np.zeros((1, num_res, 3), dtype=np.float32),
+        "template_dgram_probs": np.zeros((1, num_res, num_res, 39), dtype=np.float32),
+        "template_domain_names": np.array([b"a4c"], dtype=object),
+        "template_sequence": np.array([input_sequence.encode()], dtype=object),
+        "template_sum_probs": np.array([[1.0]], dtype=np.float32),
+    }
 
     return {**seq_feats, **msa_feats, **gt_feats, **template_feats}
 
