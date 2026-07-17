@@ -16,27 +16,21 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # MUST point at THIS repo's own worktree, not /home/jupyter-chenxi/openfold/ (a different, unrelated
-# worktree) -- pda_baseline_full.py has this same wrong path but it's latent/harmless there since
-# that script runs with model.template.enabled=False, never exercising embed_templates(); THIS
-# script uses templates.enabled=True and hit a real reshape bug in the OTHER worktree's template.py
-# (caught 2026-07-15 via a full traceback, not assumed).
+# worktree). Root-caused 2026-07-15 (full traceback -> single_seq_infer.py, pulled in transitively
+# via eval_pda_self_consistency.py, hardcodes sys.path.insert(0, "/home/jupyter-chenxi/openfold/
+# openfold/block_replacement_scripts") as an import side effect, poisoning `openfold` resolution for
+# everything imported afterward) -- fixed by reimplementing kabsch_rmsd directly in pda_a4c_lib.py
+# instead of importing it through that poisoned chain; do NOT import eval_pda_self_consistency or
+# single_seq_infer from this script.
 sys.path.insert(0, "/home/jupyter-chenxi/openfold-esmfold2-recycling/openfold/block_replacement_scripts")
-from pda_a4c_lib import build_slots_from_components, build_multichain_features, build_cfg, get_native_design_coords
+from pda_a4c_lib import (build_slots_from_components, build_multichain_features, build_cfg,
+                          get_native_design_coords, kabsch_rmsd)
 from pruned_evoformer import prune_blocks
-from eval_pda_self_consistency import kabsch_rmsd
 
 from openfold.config import model_config
 from openfold.data import feature_pipeline
 from openfold.model.model import AlphaFold
 from openfold.np import residue_constants as rc
-
-import openfold as _of_diag
-from openfold.model import template as _of_template_diag
-print(f"DIAG __file__={__file__}", flush=True)
-print(f"DIAG sys.path[:4]={sys.path[:4]}", flush=True)
-print(f"DIAG openfold.__file__={_of_diag.__file__}", flush=True)
-print(f"DIAG openfold.model.model.__file__={AlphaFold.__module__}", flush=True)
-print(f"DIAG openfold.model.template.__file__={_of_template_diag.__file__}", flush=True)
 from openfold.utils.tensor_utils import tensor_tree_map
 
 ARM = os.environ["ARM"]  # "arm1", "arm2", or "arm3"

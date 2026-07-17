@@ -10,6 +10,21 @@ import numpy as np
 import torch
 
 from openfold.data import data_pipeline, mmcif_parsing, templates
+
+
+def kabsch_rmsd(a, b):
+    """Verbatim from prune_work/eval_pda_self_consistency.py -- reimplemented (not imported) since
+    that module transitively imports single_seq_infer.py, which hardcodes
+    sys.path.insert(0, "/home/jupyter-chenxi/openfold/openfold/block_replacement_scripts") -- a
+    DIFFERENT, unrelated worktree -- as a side effect of import, silently poisoning `openfold`
+    resolution for everything imported afterward (caught 2026-07-15 via a real reshape crash inside
+    embed_templates whose traceback pointed at that other worktree's template.py)."""
+    a = a - a.mean(0)
+    b = b - b.mean(0)
+    u, s, vt = np.linalg.svd(a.T @ b)
+    d = np.sign(np.linalg.det(vt.T @ u.T))
+    a_aligned = a @ (vt.T @ np.diag([1, 1, d]) @ u.T).T
+    return float(np.sqrt(((a_aligned - b) ** 2).sum(-1).mean()))
 from openfold.np import residue_constants as rc
 
 RI_GAP = 200
