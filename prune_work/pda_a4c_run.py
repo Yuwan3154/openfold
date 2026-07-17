@@ -51,7 +51,9 @@ WS5_CKPT = os.environ.get(
     "WS5_CKPT",
     "/home/jupyter-chenxi/runs/prune_singleseq_v1/lightning_logs/version_4/checkpoints/best-063-016336.ckpt")
 KAL = "/home/jupyter-chenxi/miniconda3/envs/cue_openfold_gated/bin/kalign"
-MANIFEST = f"/home/jupyter-chenxi/prune_work/eval_out/a4c_{ARM}_{'hetero_binder' if ARM=='arm1' else ('nanocage' if ARM=='arm2' else 'homo')}.json"
+MANIFEST = os.environ.get(
+    "MANIFEST",
+    f"/home/jupyter-chenxi/prune_work/eval_out/a4c_{ARM}_{'hetero_binder' if ARM=='arm1' else ('nanocage' if ARM=='arm2' else 'homo')}.json")
 OUT_CSV = os.environ.get("OUT_CSV", f"/home/jupyter-chenxi/prune_work/eval_out/a4c_{ARM}_results.csv")
 LIMIT = int(os.environ.get("LIMIT", "0"))  # 0 = no limit, else stop after N entries (for the smoke test)
 CA_IDX = rc.atom_order["CA"]
