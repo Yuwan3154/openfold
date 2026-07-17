@@ -101,6 +101,13 @@ def run_one(model, cfg, entry):
     design_len = len(slots[0]["seq"])
     raw_feats = build_multichain_features(slots, KAL)
 
+    # crop_size set PER-ENTRY (this entry's own real length + margin), not the whole arm's max --
+    # fixed_size=True is still needed (avoids the empty-tensor edge cases), but padding every small
+    # entry up to the arm's largest entry OOMs (O(L^2) pair rep; caught 2026-07-15 on GPU2, 27GiB+
+    # for a single padded-to-1161 batch). Per-entry sizing keeps each forward pass close to its own
+    # natural memory footprint.
+    cfg.data.eval.crop_size = sum(len(s["seq"]) for s in slots) + 16
+
     fp = feature_pipeline.FeaturePipeline(cfg.data)
     feats = fp.process_features(raw_feats, mode="eval")
     batch = {k: v.unsqueeze(0).to(DEVICE) for k, v in feats.items()}
@@ -125,13 +132,12 @@ def run_one(model, cfg, entry):
 
 def main():
     full_manifest = json.load(open(MANIFEST))
-    # crop_size sized from this arm's OWN actual max concatenated length (never invented) so
-    # fixed_size=True padding never truncates any entry, incl. under LIMIT-restricted smoke tests.
-    crop_size = max(e["total_len"] for e in full_manifest) + 16
     manifest = full_manifest[:LIMIT] if LIMIT else full_manifest
-    print(f"ARM={ARM} n_entries={len(manifest)} device={DEVICE} crop_size={crop_size}", flush=True)
+    print(f"ARM={ARM} n_entries={len(manifest)} device={DEVICE}", flush=True)
 
-    cfg = build_cfg(model_config, crop_size)
+    # crop_size is overwritten PER-ENTRY inside run_one() (see its own comment); this initial value
+    # is just a placeholder so build_cfg has something valid before the first entry runs.
+    cfg = build_cfg(model_config, manifest[0]["total_len"] + 16)
     model = load_ws5(cfg, WS5_CKPT)
 
     rows = []
