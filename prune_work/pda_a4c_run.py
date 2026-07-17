@@ -35,26 +35,30 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, "/home/jupyter-chenxi/openfold-esmfold2-recycling")
 sys.path.insert(0, "/home/jupyter-chenxi/openfold-esmfold2-recycling/openfold/block_replacement_scripts")
 from pda_a4c_lib import (build_slots_from_components, build_multichain_features, build_cfg,
-                          get_native_design_coords, kabsch_rmsd)
+                          build_cfg_stock, get_native_design_coords, kabsch_rmsd)
 from pruned_evoformer import prune_blocks
 
 from openfold.config import model_config
 from openfold.data import feature_pipeline
 from openfold.model.model import AlphaFold
 from openfold.np import residue_constants as rc
+from openfold.utils.import_weights import import_jax_weights_
 from openfold.utils.tensor_utils import tensor_tree_map
 
 ARM = os.environ["ARM"]  # "arm1", "arm2", or "arm3"
+MODEL = os.environ.get("MODEL", "ws5")  # "ws5" (pruned, single-seq-finetuned) or "stock" (stock AF2 jax)
 DEVICE = os.environ.get("DEVICE", "cuda:0")
 CIF_DIR = "/home/jupyter-chenxi/prune_work/eval_out/pda_mmcif_cache"
 WS5_CKPT = os.environ.get(
     "WS5_CKPT",
     "/home/jupyter-chenxi/runs/prune_singleseq_v1/lightning_logs/version_4/checkpoints/best-063-016336.ckpt")
+STOCK_JAX_PARAMS = os.environ.get(
+    "STOCK_JAX_PARAMS", "/home/jupyter-chenxi/params/params_model_1_ptm.npz")
 KAL = "/home/jupyter-chenxi/miniconda3/envs/cue_openfold_gated/bin/kalign"
 MANIFEST = os.environ.get(
     "MANIFEST",
     f"/home/jupyter-chenxi/prune_work/eval_out/a4c_{ARM}_{'hetero_binder' if ARM=='arm1' else ('nanocage' if ARM=='arm2' else 'homo')}.json")
-OUT_CSV = os.environ.get("OUT_CSV", f"/home/jupyter-chenxi/prune_work/eval_out/a4c_{ARM}_results.csv")
+OUT_CSV = os.environ.get("OUT_CSV", f"/home/jupyter-chenxi/prune_work/eval_out/a4c_{ARM}_{MODEL}_results.csv")
 LIMIT = int(os.environ.get("LIMIT", "0"))  # 0 = no limit, else stop after N entries (for the smoke test)
 CA_IDX = rc.atom_order["CA"]
 
@@ -68,6 +72,13 @@ def load_ws5(cfg, ckpt_path):
     assert not missing, f"unexpected missing keys: {missing}"
     assert all(k.startswith("template_embedder.") for k in unexpected), \
         f"unexpected non-template keys: {[k for k in unexpected if not k.startswith('template_embedder.')]}"
+    return m.to(DEVICE).eval()
+
+
+def load_stock(cfg):
+    """Unpruned architecture, stock AF2 jax weights -- mirrors pda_baseline_full.py's load_stock()."""
+    m = AlphaFold(cfg)
+    import_jax_weights_(m, STOCK_JAX_PARAMS, version="model_1_ptm")
     return m.to(DEVICE).eval()
 
 
@@ -135,12 +146,18 @@ def run_one(model, cfg, entry):
 def main():
     full_manifest = json.load(open(MANIFEST))
     manifest = full_manifest[:LIMIT] if LIMIT else full_manifest
-    print(f"ARM={ARM} n_entries={len(manifest)} device={DEVICE}", flush=True)
+    print(f"ARM={ARM} MODEL={MODEL} n_entries={len(manifest)} device={DEVICE}", flush=True)
 
     # crop_size is overwritten PER-ENTRY inside run_one() (see its own comment); this initial value
     # is just a placeholder so build_cfg has something valid before the first entry runs.
-    cfg = build_cfg(model_config, manifest[0]["total_len"] + 16)
-    model = load_ws5(cfg, WS5_CKPT)
+    if MODEL == "ws5":
+        cfg = build_cfg(model_config, manifest[0]["total_len"] + 16)
+        model = load_ws5(cfg, WS5_CKPT)
+    elif MODEL == "stock":
+        cfg = build_cfg_stock(model_config, manifest[0]["total_len"] + 16)
+        model = load_stock(cfg)
+    else:
+        raise ValueError(f"unknown MODEL={MODEL!r}, expected 'ws5' or 'stock'")
 
     rows = []
     for i, entry in enumerate(manifest):

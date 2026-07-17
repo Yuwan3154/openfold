@@ -145,6 +145,24 @@ def build_cfg(model_config_fn, crop_size):
     return cfg
 
 
+def build_cfg_stock(model_config_fn, crop_size):
+    """Stock AF2, mirroring pda_baseline_full.py's build_cfg_stock() exactly (model_1_ptm preset,
+    jax weights, templates explicitly OFF, single-seq clamp) -- only crop_size is parameterized
+    per-entry here instead of the fixed 256 that script uses for isolated single-chain folding."""
+    cfg = model_config_fn("model_1_ptm", train=False, low_prec=False)
+    cfg.globals.chunk_size = None
+    for g in ["use_deepspeed_evo_attention", "use_lma", "use_flash"]:
+        setattr(cfg.globals, g, False)
+    cfg.data.common.max_recycling_iters = 3
+    cfg.data.common.max_extra_msa = 1
+    cfg.data.common.max_msa_clusters = 1
+    cfg.data.eval.crop_size = crop_size
+    cfg.model.template.enabled = False
+    cfg.data.common.use_templates = False
+    cfg.data.common.use_template_torsion_angles = False
+    return cfg
+
+
 def get_native_design_coords(cif_cache_dir, pdb, chain_id):
     """Ground-truth CA coordinates + per-residue validity mask for the design chain, aligned 1:1 by
     index to chain_to_seqres[chain_id] (same ordering used to build slot 0's input sequence) --
