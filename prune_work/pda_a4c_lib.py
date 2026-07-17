@@ -121,9 +121,19 @@ def build_multichain_features(slots, kalign_binary_path, ri_gap=RI_GAP):
     return {**seq_feats, **msa_feats, **gt_feats, **template_feats}
 
 
-def build_cfg(model_config_fn):
+def build_cfg(model_config_fn, crop_size):
     """finetuning_ptm already has model.template.enabled=True / data.common.use_templates=True by
-    default -- only single-seq MSA clamp + no-cropping need explicit override."""
+    default -- only single-seq MSA clamp needs explicit override.
+
+    fixed_size=True (the DEFAULT, same as pda_baseline_full.py and the whole v4/v5/WS5-continued
+    PDA harness) is used deliberately, NOT fixed_size=False: with fixed_size=False, several arrays
+    (template, extra_msa) can legitimately end up genuinely 0-sized for a single-template/single-seq
+    batch, which hits a real PyTorch "reshape(-1, 0, ...) is ambiguous" edge case inside chunked
+    attention paths that the standard fixed_size=True padding (make_fixed_size) always avoids by
+    guaranteeing a non-zero minimum size. Caller MUST pass crop_size >= this run's own max
+    concatenated length (from the actual per-arm manifest survey, never invented) so no entry -- in
+    particular the design chain, always slot 0 -- gets truncated; random_crop_to_size is a no-op
+    when the real length already fits within crop_size."""
     cfg = model_config_fn("finetuning_ptm", train=False, low_prec=False)
     cfg.globals.chunk_size = None
     for g in ["use_deepspeed_evo_attention", "use_lma", "use_flash"]:
@@ -131,7 +141,7 @@ def build_cfg(model_config_fn):
     cfg.data.common.max_recycling_iters = 3
     cfg.data.common.max_extra_msa = 1
     cfg.data.common.max_msa_clusters = 1
-    cfg.data.eval.fixed_size = False  # never crop -- design chain (slot 0) must never be truncated
+    cfg.data.eval.crop_size = crop_size
     return cfg
 
 

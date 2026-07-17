@@ -124,12 +124,14 @@ def run_one(model, cfg, entry):
 
 
 def main():
-    manifest = json.load(open(MANIFEST))
-    if LIMIT:
-        manifest = manifest[:LIMIT]
-    print(f"ARM={ARM} n_entries={len(manifest)} device={DEVICE}", flush=True)
+    full_manifest = json.load(open(MANIFEST))
+    # crop_size sized from this arm's OWN actual max concatenated length (never invented) so
+    # fixed_size=True padding never truncates any entry, incl. under LIMIT-restricted smoke tests.
+    crop_size = max(e["total_len"] for e in full_manifest) + 16
+    manifest = full_manifest[:LIMIT] if LIMIT else full_manifest
+    print(f"ARM={ARM} n_entries={len(manifest)} device={DEVICE} crop_size={crop_size}", flush=True)
 
-    cfg = build_cfg(model_config)
+    cfg = build_cfg(model_config, crop_size)
     model = load_ws5(cfg, WS5_CKPT)
 
     rows = []
