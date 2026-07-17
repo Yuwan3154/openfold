@@ -15,13 +15,24 @@ import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-# MUST point at THIS repo's own worktree, not /home/jupyter-chenxi/openfold/ (a different, unrelated
-# worktree). Root-caused 2026-07-15 (full traceback -> single_seq_infer.py, pulled in transitively
-# via eval_pda_self_consistency.py, hardcodes sys.path.insert(0, "/home/jupyter-chenxi/openfold/
-# openfold/block_replacement_scripts") as an import side effect, poisoning `openfold` resolution for
-# everything imported afterward) -- fixed by reimplementing kabsch_rmsd directly in pda_a4c_lib.py
-# instead of importing it through that poisoned chain; do NOT import eval_pda_self_consistency or
-# single_seq_infer from this script.
+# --- openfold import resolution, root-caused 2026-07-15 via a real reshape crash + a full traceback
+# chase (not assumed) -- two DISTINCT, both-real issues stacked:
+# (1) eval_pda_self_consistency.py transitively imports single_seq_infer.py, which hardcodes
+#     sys.path.insert(0, "/home/jupyter-chenxi/openfold/.../block_replacement_scripts") -- a
+#     DIFFERENT, unrelated worktree -- as an import side effect. Avoided by reimplementing
+#     kabsch_rmsd directly in pda_a4c_lib.py instead of importing it through that chain; do NOT
+#     import eval_pda_self_consistency or single_seq_infer from this script.
+# (2) `cue_openfold_gated`'s "openfold" package is pip-installed EDITABLE, hardcoded to
+#     /home/jupyter-chenxi/openfold/openfold (confirmed via site-packages'
+#     __editable___openfold_2_2_0_finder.py MAPPING dict) -- a sys.meta_path MetaPathFinder,
+#     checked independently of sys.path/PYTHONPATH. train_openfold.py (repo ROOT) never hits this:
+#     its own script-directory (auto-added sys.path[0]) IS the repo root, which already contains
+#     the real `openfold/` package dir, so PathFinder resolves it correctly before ever falling
+#     through to the editable-install finder. THIS script lives in prune_work/ (a subdirectory), so
+#     sys.path[0] alone never contains `openfold/` -- PathFinder fails, falls through to the
+#     poisoned editable finder, which "wins" as the only one that resolves anything. Fix: put the
+#     REPO ROOT itself (not the nested openfold/ subdir) on sys.path so PathFinder succeeds first.
+sys.path.insert(0, "/home/jupyter-chenxi/openfold-esmfold2-recycling")
 sys.path.insert(0, "/home/jupyter-chenxi/openfold-esmfold2-recycling/openfold/block_replacement_scripts")
 from pda_a4c_lib import (build_slots_from_components, build_multichain_features, build_cfg,
                           get_native_design_coords, kabsch_rmsd)
