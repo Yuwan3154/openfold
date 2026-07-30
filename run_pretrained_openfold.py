@@ -45,6 +45,7 @@ from openfold.config import model_config
 from openfold.data import templates, feature_pipeline, data_pipeline
 from openfold.data.tools import hhsearch, hmmsearch
 from openfold.np import protein
+from openfold.np import residue_constants as rc
 from openfold.utils.script_utils import (load_models_from_command_line, parse_fasta, run_model,
                                          prep_output, relax_protein)
 from openfold.utils.tensor_utils import tensor_tree_map
@@ -124,6 +125,40 @@ def precompute_alignments(tags, seqs, alignment_dir, args):
 
 def round_up_seqlen(seqlen):
     return int(math.ceil(seqlen / TRACING_INTERVAL)) * TRACING_INTERVAL
+
+
+def mask_template_sidechains_add_cb(feature_dict):
+    """AF2Rank's mask_sidechains_add_cb, applied to template features instead of a PDB file.
+
+    Keeps N/CA/C/O/CB and projects a virtual CB onto glycines (same ideal-geometry construction
+    as AF2Rank), so the template's sidechain geometry cannot leak residue identity. Operating on
+    atom37 rather than the mmCIF keeps the template's correspondence and coordinates untouched --
+    only which atoms AlphaFold is allowed to see changes.
+    """
+    keep = [rc.atom_order[a] for a in ("N", "CA", "C", "O", "CB")]
+    pos = feature_dict["template_all_atom_positions"]
+    mask = feature_dict["template_all_atom_mask"]
+    n, ca, c, cb = (rc.atom_order[a] for a in ("N", "CA", "C", "CB"))
+
+    have_bb = (mask[..., n] > 0) & (mask[..., ca] > 0) & (mask[..., c] > 0)
+    need_cb = have_bb & (mask[..., cb] == 0)
+    if np.any(need_cb):
+        norm = lambda x: x / (np.sqrt(np.square(x).sum(-1, keepdims=True)) + 1e-8)
+        bc = norm(pos[..., n, :] - pos[..., ca, :])
+        nn = norm(np.cross(pos[..., n, :] - pos[..., c, :], bc))
+        m = np.stack([bc, np.cross(nn, bc), nn], axis=-2)
+        d = np.array([1.522 * np.cos(1.927),
+                      1.522 * np.sin(1.927) * np.cos(-2.143),
+                      -1.522 * np.sin(1.927) * np.sin(-2.143)])
+        virtual = pos[..., ca, :] + np.einsum("i,...ij->...j", d, m)
+        pos[..., cb, :] = np.where(need_cb[..., None], virtual, pos[..., cb, :])
+        mask[..., cb] = np.where(need_cb, 1.0, mask[..., cb])
+
+    keep_mask = np.zeros(mask.shape[-1], dtype=mask.dtype)
+    keep_mask[keep] = 1.0
+    feature_dict["template_all_atom_mask"] = mask * keep_mask
+    feature_dict["template_all_atom_positions"] = pos * feature_dict[
+        "template_all_atom_mask"][..., None]
 
 
 def generate_feature_dict(
@@ -321,6 +356,11 @@ def main(args):
                         feature_dict, rounded_seqlen,
                     )
 
+                # Before featurization, mirroring AF2Rank stripping the template PDB itself, so
+                # the derived features (torsions, pseudo-beta) see the stripped template too.
+                if getattr(args, "mask_template_sidechains", False):
+                    mask_template_sidechains_add_cb(feature_dict)
+
                 feature_dicts[tag] = feature_dict
             processed_feature_dict = feature_processor.process_features(
                 feature_dict, mode='predict', is_multimer=is_multimer
@@ -330,6 +370,12 @@ def main(args):
                 k: torch.as_tensor(v, device=args.model_device)
                 for k, v in processed_feature_dict.items()
             }
+
+            # After featurization and immediately before the forward pass, which is where AF2Rank
+            # masks it -- doing it earlier would change the aatype-dependent transforms above.
+            if getattr(args, "mask_template_aatype", False):
+                pf = processed_feature_dict["template_aatype"]
+                processed_feature_dict["template_aatype"] = torch.full_like(pf, rc.restype_num)
 
             if args.trace_model:
                 if rounded_seqlen > cur_tracing_interval:
@@ -478,6 +524,16 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--skip_relaxation", action="store_true", default=False,
+    )
+    parser.add_argument(
+        "--mask_template_sidechains", action="store_true", default=False,
+        help="""AF2Rank convention: restrict template atoms to N/CA/C/O/CB, projecting a virtual
+                CB onto glycines, so template sidechain geometry cannot leak residue identity."""
+    )
+    parser.add_argument(
+        "--mask_template_aatype", action="store_true", default=False,
+        help="""AF2Rank convention: set template_aatype to UNK immediately before the forward
+                pass, so the template contributes structure but not sequence."""
     )
     parser.add_argument(
         "--multimer_ri_gap", type=int, default=200,
