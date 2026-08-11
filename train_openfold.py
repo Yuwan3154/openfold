@@ -1,4 +1,5 @@
 import argparse
+import csv
 import logging
 import os
 import sys
@@ -89,6 +90,11 @@ class OpenFoldWrapper(pl.LightningModule):
         self.last_lr_step = -1
         self._is_distributed = None  # Cache for distributed detection
         self._val_ptm_calib_pairs = []  # (ptm_score, actual_tm) pairs, this rank, this val epoch
+        # Per-entry validation records for T1's "which targets did we get better at" tracking
+        # (see ESMFOLD2_RECYCLE_SCALING.md T1). Epoch-mean scalars in TensorBoard cannot answer
+        # that question -- this keeps the identity of each entry alongside its own metrics.
+        self._val_per_entry_records = []
+        self._per_entry_csv_path = None
         self.save_hyperparameters()
     
     def _apply_block_replacement(self):
@@ -303,6 +309,7 @@ class OpenFoldWrapper(pl.LightningModule):
 
     def on_validation_epoch_start(self):
         self._val_ptm_calib_pairs = []
+        self._val_per_entry_records = []
 
     def validation_step(self, batch, batch_idx):
         # At the start of validation, load the EMA weights
@@ -367,6 +374,34 @@ class OpenFoldWrapper(pl.LightningModule):
                 torch.tensor(ptm_vals), torch.tensor(real_tm_vals)
             )
             self.log("val/ptm_calibration_spearman", calibration, logger=True, rank_zero_only=True)
+
+        # T1 per-entry tracking: gather every rank's records (each rank only sees its own DDP
+        # shard, so a per-rank file would silently hold a fraction of the val set) and append one
+        # row per entry per epoch to a CSV next to the checkpoints. Appending rather than
+        # overwriting keeps the full history, so "got better at" is answerable over time, and
+        # survives the auto-versioning that puts each resume in a fresh lightning_logs dir.
+        records = self._val_per_entry_records
+        if self._is_distributed:
+            gathered_recs = [None] * dist.get_world_size()
+            dist.all_gather_object(gathered_recs, records)
+            records = [r for rank_recs in gathered_recs for r in rank_recs]
+        if records and self.trainer.is_global_zero:
+            if self._per_entry_csv_path is None:
+                log_dir = getattr(self.trainer, "log_dir", None) or "."
+                self._per_entry_csv_path = os.path.join(log_dir, "per_entry_val_history.csv")
+            write_header = not os.path.exists(self._per_entry_csv_path)
+            with open(self._per_entry_csv_path, "a", newline="") as fh:
+                writer = csv.writer(fh)
+                if write_header:
+                    writer.writerow(
+                        ["epoch", "global_step", "batch_idx", "lddt_ca",
+                         "alignment_rmsd", "recall_2A", "gdt_ts"]
+                    )
+                for idx, lddt, rmsd, recall, gdt in sorted(records):
+                    writer.writerow(
+                        [self.current_epoch, self.global_step, int(idx),
+                         f"{lddt:.6f}", f"{rmsd:.6f}", f"{recall:.6f}", f"{gdt:.6f}"]
+                    )
 
     def _compute_validation_metrics(self,
                                     batch,
@@ -441,6 +476,32 @@ class OpenFoldWrapper(pl.LightningModule):
                 )
                 self._val_ptm_calib_pairs.extend(
                     zip(outputs["ptm_score"].reshape(-1).tolist(), real_tm.reshape(-1).tolist())
+                )
+
+            # T1 per-entry tracking: keep each entry's IDENTITY next to its own metrics, so we can
+            # answer "which specific targets did this run get better at" rather than only seeing
+            # epoch means. "batch_idx" is the manifest index injected by PDASingleSeqDataset, so it
+            # maps back to (pdb, chain_id) via the same manifest JSON -- no extra compute. Guarded:
+            # only the PDA dataset provides it, so non-PDA validation paths are unaffected.
+            if "batch_idx" in batch:
+                idxs = batch["batch_idx"].reshape(-1).tolist()
+                lddt_vals = metrics["lddt_ca"].reshape(-1).tolist()
+                rmsd_vals = metrics["alignment_rmsd"].reshape(-1).tolist()
+                recall_vals = metrics["recall_2A"].reshape(-1).tolist()
+                gdt_vals = metrics["gdt_ts"].reshape(-1).tolist()
+                # zip() truncates to the shortest, which would silently drop entries if any metric
+                # were unexpectedly scalar rather than per-sample -- assert instead of losing rows.
+                assert (
+                    len(lddt_vals) == len(idxs)
+                    and len(rmsd_vals) == len(idxs)
+                    and len(recall_vals) == len(idxs)
+                    and len(gdt_vals) == len(idxs)
+                ), (
+                    f"per-entry metric length mismatch: idx={len(idxs)} lddt={len(lddt_vals)} "
+                    f"rmsd={len(rmsd_vals)} recall={len(recall_vals)} gdt={len(gdt_vals)}"
+                )
+                self._val_per_entry_records.extend(
+                    zip(idxs, lddt_vals, rmsd_vals, recall_vals, gdt_vals)
                 )
 
         return metrics
