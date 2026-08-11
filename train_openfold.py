@@ -94,6 +94,8 @@ class OpenFoldWrapper(pl.LightningModule):
         # (see ESMFOLD2_RECYCLE_SCALING.md T1). Epoch-mean scalars in TensorBoard cannot answer
         # that question -- this keeps the identity of each entry alongside its own metrics.
         self._val_per_entry_records = []
+        self._val_per_entry_epoch = 0
+        self._val_per_entry_step = 0
         self._per_entry_csv_path = None
         self.save_hyperparameters()
     
@@ -375,37 +377,59 @@ class OpenFoldWrapper(pl.LightningModule):
             )
             self.log("val/ptm_calibration_spearman", calibration, logger=True, rank_zero_only=True)
 
+        # Capture epoch/step HERE (still correct for "the epoch that just validated") since the
+        # actual gather+write is deferred to on_train_epoch_start, by which point Lightning's own
+        # epoch counter has already advanced to the NEXT epoch -- see _flush_per_entry_records.
+        self._val_per_entry_epoch = self.current_epoch
+        self._val_per_entry_step = self.global_step
+
+    def on_train_epoch_start(self):
+        # T1 per-entry tracking, deferred flush. A/B-tested 2026-08-11 (see
+        # ESMFOLD2_RECYCLE_SCALING.md T1): calling dist.all_gather_object for this from
+        # on_validation_epoch_end -- immediately before Lightning's own ModelCheckpoint
+        # _monitor_candidates DDP-metric-sync (a known-fragile, unresolved-upstream race,
+        # github.com/Lightning-AI/pytorch-lightning#19045) -- reliably deadlocked the run.
+        # Deferring the gather to here (on_train_epoch_start of the NEXT epoch, which Lightning
+        # only reaches after the previous epoch's checkpoint decision has fully completed, see
+        # fit_loop.py on_advance_end's callback/module-hook ordering) moves it out of that race
+        # window. on_fit_end below is the safety-net flush for the final epoch, which has no
+        # "next" on_train_epoch_start to defer to.
+        self._flush_per_entry_records()
+
+    def on_fit_end(self):
+        self._flush_per_entry_records()
+
+    def _flush_per_entry_records(self):
         # T1 per-entry tracking: gather every rank's records (each rank only sees its own DDP
         # shard, so a per-rank file would silently hold a fraction of the val set) and append one
         # row per entry per epoch to a CSV next to the checkpoints. Appending rather than
         # overwriting keeps the full history, so "got better at" is answerable over time, and
         # survives the auto-versioning that puts each resume in a fresh lightning_logs dir.
-        # 2026-08-11 diagnostic: SKIP_PER_ENTRY_TRACKING env toggle to A/B-test whether this block
-        # (new for T1, absent from WS5-continued's 100 crash-free epochs) is implicated in the
-        # ModelCheckpoint/DDP-metric-sync deadlock. Remove once the A/B result is in.
-        if not os.environ.get("SKIP_PER_ENTRY_TRACKING"):
-            records = self._val_per_entry_records
-            if self._is_distributed:
-                gathered_recs = [None] * dist.get_world_size()
-                dist.all_gather_object(gathered_recs, records)
-                records = [r for rank_recs in gathered_recs for r in rank_recs]
-            if records and self.trainer.is_global_zero:
-                if self._per_entry_csv_path is None:
-                    log_dir = getattr(self.trainer, "log_dir", None) or "."
-                    self._per_entry_csv_path = os.path.join(log_dir, "per_entry_val_history.csv")
-                write_header = not os.path.exists(self._per_entry_csv_path)
-                with open(self._per_entry_csv_path, "a", newline="") as fh:
-                    writer = csv.writer(fh)
-                    if write_header:
-                        writer.writerow(
-                            ["epoch", "global_step", "batch_idx", "lddt_ca",
-                             "alignment_rmsd", "recall_2A", "gdt_ts"]
-                        )
-                    for idx, lddt, rmsd, recall, gdt in sorted(records):
-                        writer.writerow(
-                            [self.current_epoch, self.global_step, int(idx),
-                             f"{lddt:.6f}", f"{rmsd:.6f}", f"{recall:.6f}", f"{gdt:.6f}"]
-                        )
+        if os.environ.get("SKIP_PER_ENTRY_TRACKING"):
+            return
+        records = self._val_per_entry_records
+        if self._is_distributed:
+            gathered_recs = [None] * dist.get_world_size()
+            dist.all_gather_object(gathered_recs, records)
+            records = [r for rank_recs in gathered_recs for r in rank_recs]
+        self._val_per_entry_records = []  # consumed; avoids re-flushing the same epoch twice
+        if records and self.trainer.is_global_zero:
+            if self._per_entry_csv_path is None:
+                log_dir = getattr(self.trainer, "log_dir", None) or "."
+                self._per_entry_csv_path = os.path.join(log_dir, "per_entry_val_history.csv")
+            write_header = not os.path.exists(self._per_entry_csv_path)
+            with open(self._per_entry_csv_path, "a", newline="") as fh:
+                writer = csv.writer(fh)
+                if write_header:
+                    writer.writerow(
+                        ["epoch", "global_step", "batch_idx", "lddt_ca",
+                         "alignment_rmsd", "recall_2A", "gdt_ts"]
+                    )
+                for idx, lddt, rmsd, recall, gdt in sorted(records):
+                    writer.writerow(
+                        [self._val_per_entry_epoch, self._val_per_entry_step, int(idx),
+                         f"{lddt:.6f}", f"{rmsd:.6f}", f"{recall:.6f}", f"{gdt:.6f}"]
+                    )
 
     def _compute_validation_metrics(self,
                                     batch,
