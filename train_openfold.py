@@ -380,28 +380,32 @@ class OpenFoldWrapper(pl.LightningModule):
         # row per entry per epoch to a CSV next to the checkpoints. Appending rather than
         # overwriting keeps the full history, so "got better at" is answerable over time, and
         # survives the auto-versioning that puts each resume in a fresh lightning_logs dir.
-        records = self._val_per_entry_records
-        if self._is_distributed:
-            gathered_recs = [None] * dist.get_world_size()
-            dist.all_gather_object(gathered_recs, records)
-            records = [r for rank_recs in gathered_recs for r in rank_recs]
-        if records and self.trainer.is_global_zero:
-            if self._per_entry_csv_path is None:
-                log_dir = getattr(self.trainer, "log_dir", None) or "."
-                self._per_entry_csv_path = os.path.join(log_dir, "per_entry_val_history.csv")
-            write_header = not os.path.exists(self._per_entry_csv_path)
-            with open(self._per_entry_csv_path, "a", newline="") as fh:
-                writer = csv.writer(fh)
-                if write_header:
-                    writer.writerow(
-                        ["epoch", "global_step", "batch_idx", "lddt_ca",
-                         "alignment_rmsd", "recall_2A", "gdt_ts"]
-                    )
-                for idx, lddt, rmsd, recall, gdt in sorted(records):
-                    writer.writerow(
-                        [self.current_epoch, self.global_step, int(idx),
-                         f"{lddt:.6f}", f"{rmsd:.6f}", f"{recall:.6f}", f"{gdt:.6f}"]
-                    )
+        # 2026-08-11 diagnostic: SKIP_PER_ENTRY_TRACKING env toggle to A/B-test whether this block
+        # (new for T1, absent from WS5-continued's 100 crash-free epochs) is implicated in the
+        # ModelCheckpoint/DDP-metric-sync deadlock. Remove once the A/B result is in.
+        if not os.environ.get("SKIP_PER_ENTRY_TRACKING"):
+            records = self._val_per_entry_records
+            if self._is_distributed:
+                gathered_recs = [None] * dist.get_world_size()
+                dist.all_gather_object(gathered_recs, records)
+                records = [r for rank_recs in gathered_recs for r in rank_recs]
+            if records and self.trainer.is_global_zero:
+                if self._per_entry_csv_path is None:
+                    log_dir = getattr(self.trainer, "log_dir", None) or "."
+                    self._per_entry_csv_path = os.path.join(log_dir, "per_entry_val_history.csv")
+                write_header = not os.path.exists(self._per_entry_csv_path)
+                with open(self._per_entry_csv_path, "a", newline="") as fh:
+                    writer = csv.writer(fh)
+                    if write_header:
+                        writer.writerow(
+                            ["epoch", "global_step", "batch_idx", "lddt_ca",
+                             "alignment_rmsd", "recall_2A", "gdt_ts"]
+                        )
+                    for idx, lddt, rmsd, recall, gdt in sorted(records):
+                        writer.writerow(
+                            [self.current_epoch, self.global_step, int(idx),
+                             f"{lddt:.6f}", f"{rmsd:.6f}", f"{recall:.6f}", f"{gdt:.6f}"]
+                        )
 
     def _compute_validation_metrics(self,
                                     batch,
