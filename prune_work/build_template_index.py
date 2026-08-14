@@ -40,12 +40,28 @@ REFERENCE_KWARGS, tm_score = _tms.REFERENCE_KWARGS, _tms.tm_score
 CA = 1
 
 
-def native_ca(pdb_path: Path) -> torch.Tensor:
-    xs = []
+def native_ca(pdb_path: Path, residue_index: np.ndarray):
+    """Native CA coordinates ALIGNED to `residue_index`, plus a presence mask.
+
+    ⛔ Not "CA lines in file order". A residue whose CA is unresolved in the deposited structure
+    contributes no CA line, so the k-th CA line is not the k-th residue -- pairing by file order
+    would shift the whole chain and silently score a misalignment. (Caught by the length assertion
+    on 3ra5_A: 97 CA lines for L=98.) Keyed on the residue number instead, which
+    `write_coords_to_pdb` wrote from this same `residue_index`.
+    """
+    by_resnum = {}
     for line in pdb_path.read_text().splitlines():
         if line.startswith("ATOM") and line[12:16].strip() == "CA":
-            xs.append((float(line[30:38]), float(line[38:46]), float(line[46:54])))
-    return torch.tensor(xs, dtype=torch.float32)
+            by_resnum[int(line[22:26])] = (
+                float(line[30:38]), float(line[38:46]), float(line[46:54]))
+    L = len(residue_index)
+    xyz = np.zeros((L, 3), np.float32)
+    present = np.zeros(L, bool)
+    for i, r in enumerate(residue_index.astype(int)):
+        if r in by_resnum:
+            xyz[i] = by_resnum[r]
+            present[i] = True
+    return torch.from_numpy(xyz), torch.from_numpy(present.astype(np.float32))
 
 
 def score_chain(npz_path: Path, pdb_path: Path, chunk: int, device: str):
@@ -58,12 +74,11 @@ def score_chain(npz_path: Path, pdb_path: Path, chunk: int, device: str):
     full = np.zeros((N, L, 37, 3), np.float32)
     full[:, atom_mask] = coords
     tmpl = torch.from_numpy(full[:, :, CA, :])                   # (N, L, 3)
-    has_ca = torch.from_numpy(atom_mask[:, CA].astype(np.float32))
+    tmpl_ca = torch.from_numpy(atom_mask[:, CA].astype(np.float32))
 
-    ref = native_ca(pdb_path)
-    # the template was generated from this very PDB, so a length mismatch means the pair is not what
-    # it claims to be -- fail loudly rather than silently scoring a misalignment
-    assert ref.shape[0] == L, f"{npz_path.name}: native has {ref.shape[0]} CA, npz has L={L}"
+    ref, ref_ca = native_ca(pdb_path, d["residue_index"])
+    assert int(ref_ca.sum()) >= 5, f"{npz_path.name}: only {int(ref_ca.sum())} native CA"
+    both = ref_ca * tmpl_ca                                      # scored where BOTH have a CA
 
     tms = []
     for s in range(0, N, chunk):                                 # chunked to bound B*S memory
@@ -71,7 +86,9 @@ def score_chain(npz_path: Path, pdb_path: Path, chunk: int, device: str):
         n = b.shape[0]
         tms.append(tm_score(
             b, ref[None].expand(n, L, 3).to(device),
-            mask=has_ca[None].expand(n, L).to(device),
+            mask=both[None].expand(n, L).to(device),
+            # normalized by the NATIVE's own coverage, so a template missing residues is penalized
+            norm_mask=ref_ca[None].expand(n, L).to(device),
             **REFERENCE_KWARGS,
         ).cpu())
     return torch.cat(tms).numpy().astype(np.float32), d["rewind_steps"].astype(np.int16), L
