@@ -8,14 +8,20 @@ Three layers:
      scores a whole batch at once and a leak across the batch dim would be invisible otherwise.
 
 The loop reference below is the implementation that was validated against `USalign -TMscore 5` on
-60 real structure pairs (max abs err 0.0018 at the FAST preset, 0/60 promotion decisions flipped at
-delta=0.05); keeping it here makes that validation transferable to the optimized version.
+real structure pairs; keeping it here makes that validation transferable to the optimized version.
+
+⛔ Correction (2026-08-14): an earlier writeup reported the FAST preset at max abs err 0.0018 with
+0/60 decisions flipped. Re-measured on 60 pairs that actually reach the low-TM end (0.223-0.999),
+FAST peaks at **0.0440** error while the REFERENCE schedule stays at 0.0008 -- the earlier sample
+simply never went below TM ~ 0.5. The T4 gate therefore uses REFERENCE, not FAST. Most tests here
+still run FAST because they only need a cheap, deterministic scorer, but
+test_reference_never_scores_below_fast pins the relationship between the two.
 """
 
 import numpy as np
 import torch
 
-from openfold.utils.tm_score import FAST_KWARGS, tm_score, tm_score_ca
+from openfold.utils.tm_score import FAST_KWARGS, REFERENCE_KWARGS, tm_score, tm_score_ca
 
 
 def _loop_tm(pred, ref, mask=None, norm_mask=None, n_iter=20, min_seed_len=4, max_seeds=None):
@@ -197,6 +203,28 @@ def test_atom37_wrapper_uses_ca_and_native_normalization():
     assert float(tm_score_ca(pred37, ref37, ref_mask, **FAST_KWARGS)) > 0.99
     partial = float(tm_score_ca(pred37, ref37, ref_mask, pred_mask37=tmpl_mask, **FAST_KWARGS))
     assert 0.45 < partial < 0.55
+
+
+def test_reference_never_scores_below_fast():
+    """TM is a max over everything explored and REFERENCE's seed set is a superset of FAST's, so
+    REFERENCE >= FAST identically. The gap is the accuracy FAST gives up -- it opens at LOW TM,
+    which is why the T4 gate uses REFERENCE (max err 0.0008 vs USalign, against FAST's 0.0440)."""
+    gaps = []
+    for s in range(6):
+        nat = _helix(110, s)[None]
+        for w in (0.0, 0.25, 0.5):
+            pred = (1 - w) * _walk(110, s)[None] + w * nat
+            hi = float(tm_score(pred, nat, **REFERENCE_KWARGS))
+            lo = float(tm_score(pred, nat, **FAST_KWARGS))
+            assert hi >= lo - 1e-6, (s, w, hi, lo)
+            gaps.append(hi - lo)
+    assert max(gaps) > 1e-3, "FAST matched REFERENCE everywhere -- fixtures never reach low TM"
+
+
+def test_gate_defaults_to_reference_schedule():
+    """Guards the T4 default against silently reverting to FAST."""
+    from openfold.utils import t4_self_distill as t4
+    assert t4.REFERENCE_KWARGS == REFERENCE_KWARGS
 
 
 def test_short_chain_below_min_seed_len():

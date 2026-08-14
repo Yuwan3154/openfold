@@ -28,8 +28,19 @@ from __future__ import annotations
 
 import torch
 
-# Validated preset: max abs err 0.0018 vs USalign over 60 real pairs, 0/60 promotion decisions
-# flipped at delta=0.05. See ESMFOLD2_RECYCLE_SCALING.md (T4 section) for the full table.
+# Seed schedules, measured against `USalign -TMscore 5` on 60 real pairs spanning TM 0.223-0.999
+# (A6000, 2026-08-14). ⛔ REFERENCE is the default for the T4 gate; FAST is NOT accurate enough:
+#
+#   schedule    seeds   max err   mean err   cost @L=384,B=1 (CPU)   % of an 8.3 s T1 step (2 calls)
+#   REFERENCE     247    0.0008    0.0001              30.9 ms                      0.75%
+#   FAST           26    0.0440    0.0012               5.3 ms                      0.13%
+#
+# ⛔ FAST's error is NOT uniform -- it is concentrated at LOW TM (worst case 0.1874 vs USalign's
+# 0.2314 on 2gmq_A), because min_seed_len=32 skips exactly the short seeds needed to find a small
+# alignable core. An earlier measurement reported FAST at max err 0.0018; that sample simply did
+# not reach down to TM ~ 0.2. Confirmed NOT a dtype effect and NOT a seed-batching effect: fp32,
+# fp64 and the per-seed loop all agree to the digit at each schedule.
+REFERENCE_KWARGS = {"n_iter": 20, "min_seed_len": 4}
 FAST_KWARGS = {"n_iter": 10, "min_seed_len": 32}
 
 

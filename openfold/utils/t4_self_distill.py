@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import torch
 
-from openfold.utils.tm_score import FAST_KWARGS, tm_score
+from openfold.utils.tm_score import REFERENCE_KWARGS, tm_score
 
 CA = 1  # atom37 index of the alpha carbon
 
@@ -49,7 +49,9 @@ def template_gate_metrics(
     Returns:
         dict of (B,) tensors: `tm_pred`, `tm_template`, `has_template`, `promote`.
     """
-    kw = FAST_KWARGS if tm_kwargs is None else tm_kwargs
+    # ⛔ REFERENCE, not FAST: FAST's error reaches 0.044 at low TM -- comparable to the delta the
+    # gate decides on. The extra cost is 0.75% of a step instead of 0.13%. See tm_score.py.
+    kw = REFERENCE_KWARGS if tm_kwargs is None else tm_kwargs
     with torch.no_grad():
         native = batch["all_atom_positions"]                       # (B,L,37,3)
         native_ca = batch["all_atom_mask"][..., CA] > 0             # (B,L)
