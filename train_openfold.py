@@ -1328,6 +1328,27 @@ if __name__ == "__main__":
              "Default off (validation matches training's template setting, as before)."
     )
     parser.add_argument(
+        "--t2_template_index", type=str, default=None,
+        help="T2: path to index_all.npz from prune_work/build_template_index.py (per-chain TM and "
+             "rewind for every generated Protpardelle template). Needs --t2_n_synthetic > 0 to "
+             "take effect."
+    )
+    parser.add_argument(
+        "--t2_templates_root", type=str, default=None,
+        help="T2: root of the generated template shards (shardNNNN/<chain>.npz)."
+    )
+    parser.add_argument(
+        "--t2_max_tm", type=float, default=0.9,
+        help="T2: keep only synthetic templates with TM(template, native) BELOW this. Default 0.9 "
+             "(user-set 2026-08-14: above it the task becomes trivial)."
+    )
+    parser.add_argument(
+        "--t2_n_synthetic", type=int, default=0,
+        help="T2: how many synthetic templates to concatenate onto each training example's natural "
+             "hits. The existing train-mode subsampler then draws uniformly over the combined "
+             "list, so this number sets the synthetic:natural mixing ratio. 0 = disabled (default)."
+    )
+    parser.add_argument(
         "--t4_self_distill", action="store_true", default=False,
         help="T4: each training step, score the prediction and the best template it was given "
              "against the native (TM, in-loop on the crop) and log t4/{tm_pred,tm_template,"

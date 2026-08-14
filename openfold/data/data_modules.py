@@ -7,8 +7,10 @@ import pickle
 from typing import Optional, Sequence, Any, Union
 
 import ml_collections as mlc
+import numpy as np
 import pytorch_lightning as pl
 import torch
+from pytorch_lightning.utilities.rank_zero import rank_zero_info
 from torch.utils.data import RandomSampler
 from openfold.np.residue_constants import restypes
 from openfold.data import (
@@ -17,6 +19,7 @@ from openfold.data import (
     mmcif_parsing,
     templates,
 )
+from openfold.data.synthetic_templates import merge_template_features
 from openfold.utils.tensor_utils import dict_multimap
 from openfold.utils.tensor_utils import (
     tensor_tree_map,
@@ -56,6 +59,8 @@ class OpenFoldSingleDataset(torch.utils.data.Dataset):
                  _structure_index: Optional[Any] = None,
                  chain_list_path: Optional[str] = None,
                  enable_recursive_search: bool = True,
+                 synthetic_template_pool: Optional[Any] = None,
+                 n_synthetic_templates: int = 0,
                  ):
         """
             Args:
@@ -102,6 +107,9 @@ class OpenFoldSingleDataset(torch.utils.data.Dataset):
         self.data_dir = data_dir
         self.chain_list_path = chain_list_path
         self.enable_recursive_search = enable_recursive_search
+        # T2: pool of Protpardelle synthetic templates mixed into this chain's template hits
+        self.synthetic_template_pool = synthetic_template_pool
+        self.n_synthetic_templates = n_synthetic_templates
 
         self.chain_data_cache = None
         if chain_data_cache_path is not None:
@@ -317,6 +325,18 @@ class OpenFoldSingleDataset(torch.utils.data.Dataset):
 
         if self._output_raw:
             return data
+
+        # T2: concatenate synthetic Protpardelle templates onto the natural hits BEFORE the feature
+        # pipeline, so train-mode `subsample_templates` draws uniformly over the combined list --
+        # which is the requested "mix with real templates, uniform over the mixture" policy with no
+        # change to the sampler. Seeded from the worker's torch RNG so it follows --seed.
+        if self.synthetic_template_pool is not None and self.n_synthetic_templates > 0:
+            synth = self.synthetic_template_pool.sample_features(
+                name, self.n_synthetic_templates,
+                np.random.default_rng(int(torch.randint(0, 2 ** 31 - 1, (1,)).item())),
+            )
+            if synth is not None:
+                data = merge_template_features(data, synth)
 
         feats = self.feature_pipeline.process_features(
             data, self.mode
@@ -924,6 +944,10 @@ class OpenFoldDataModule(pl.LightningDataModule):
                  train_chain_list_path: Optional[str] = None,
                  distillation_chain_list_path: Optional[str] = None,
                  val_chain_list_path: Optional[str] = None,
+                 t2_template_index: Optional[str] = None,
+                 t2_templates_root: Optional[str] = None,
+                 t2_max_tm: float = 0.9,
+                 t2_n_synthetic: int = 0,
                  enable_recursive_search: bool = True,
                  **kwargs
                  ):
@@ -996,6 +1020,21 @@ class OpenFoldDataModule(pl.LightningDataModule):
             with open(distillation_alignment_index_path, "r") as fp:
                 self.distillation_alignment_index = json.load(fp)
 
+        # T2: built once here (the index is a single npz) and shared by the dataloader workers
+        self.n_synthetic_templates = t2_n_synthetic
+        self.synthetic_template_pool = None
+        if t2_template_index is not None and t2_n_synthetic > 0:
+            from openfold.data.synthetic_templates import SyntheticTemplatePool
+            self.synthetic_template_pool = SyntheticTemplatePool(
+                t2_template_index, t2_templates_root, max_tm=t2_max_tm,
+            )
+            n_ok = sum(len(e) > 0 for e in self.synthetic_template_pool.eligible)
+            rank_zero_info(
+                f"T2 synthetic templates: {n_ok}/{len(self.synthetic_template_pool.eligible)} "
+                f"chains have >=1 template with TM < {t2_max_tm}; "
+                f"adding {t2_n_synthetic} per training example"
+            )
+
     def setup(self, stage=None):
         # Most of the arguments are the same for the three datasets 
         dataset_gen = partial(OpenFoldSingleDataset,
@@ -1019,6 +1058,10 @@ class OpenFoldDataModule(pl.LightningDataModule):
                 mode="train",
                 alignment_index=self.alignment_index,
                 chain_list_path=self.train_chain_list_path,
+                # T2: synthetic templates go to the TRAIN split only -- validation must stay a
+                # clean measurement of what the model can do on its own
+                synthetic_template_pool=self.synthetic_template_pool,
+                n_synthetic_templates=self.n_synthetic_templates,
             )
 
             distillation_dataset = None
