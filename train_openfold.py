@@ -34,6 +34,7 @@ from openfold.utils.loss import AlphaFoldLoss, lddt_ca
 from openfold.utils.lr_schedulers import AlphaFoldLRScheduler
 from openfold.utils.multi_chain_permutation import multi_chain_permutation_align
 from openfold.utils.superimposition import superimpose
+from openfold.utils.t4_self_distill import template_gate_metrics
 from openfold.utils.tensor_utils import tensor_tree_map
 from openfold.utils.validation_metrics import (
     drmsd,
@@ -300,6 +301,26 @@ class OpenFoldWrapper(pl.LightningModule):
             _cw = float(getattr(self, "cache_distill_weight", 1.0))
             loss = loss + _cw * _cl
             loss_breakdown["cache_distill"] = _cl.detach()
+
+        # T4 self-distillation gate: measure whether this prediction beat the template it was given.
+        # Measurement only for now -- promotion I/O needs the chain->template index that T2's
+        # template-consuming path will own. Costs ~0.03% of a step (openfold/utils/tm_score.py).
+        if getattr(self, "t4_self_distill", False):
+            m = template_gate_metrics(
+                outputs, batch,
+                delta=getattr(self, "t4_delta", 0.05),
+                min_tm=getattr(self, "t4_min_tm", 0.0),
+            )
+            n_t = m["has_template"].sum().clamp_min(1.0)
+            self.log("t4/tm_pred", m["tm_pred"].mean(), on_step=True, on_epoch=True, logger=True)
+            self.log("t4/tm_template", (m["tm_template"] * m["has_template"]).sum() / n_t,
+                     on_step=True, on_epoch=True, logger=True)
+            self.log("t4/margin", ((m["tm_pred"] - m["tm_template"]) * m["has_template"]).sum() / n_t,
+                     on_step=True, on_epoch=True, logger=True)
+            self.log("t4/promote_rate", m["promote"].sum() / n_t,
+                     on_step=True, on_epoch=True, logger=True)
+            self.log("t4/has_template", m["has_template"].mean(), on_step=True, on_epoch=True,
+                     logger=True)
 
         # Log it
         self._log(loss_breakdown, batch, outputs)
@@ -775,6 +796,9 @@ def main(args):
     if hasattr(model_module, "warmup_no_steps"):
         model_module.warmup_no_steps = getattr(args, "warmup_no_steps", 1000)
     model_module.validate_without_templates = getattr(args, "validate_without_templates", False)
+    model_module.t4_self_distill = getattr(args, "t4_self_distill", False)
+    model_module.t4_delta = getattr(args, "t4_delta", 0.05)
+    model_module.t4_min_tm = getattr(args, "t4_min_tm", 0.0)
 
     # Direction 2: keep only a SUBSET of the 48 Evoformer blocks (shallower full-block model),
     # warm-started from the matching AF2 block weights (full 48 loaded above, then sliced).
@@ -1302,6 +1326,23 @@ if __name__ == "__main__":
              "single-sequence prediction capability instead of template-assisted performance, "
              "even when templates are kept ON for training (e.g. --single_seq_keep_templates). "
              "Default off (validation matches training's template setting, as before)."
+    )
+    parser.add_argument(
+        "--t4_self_distill", action="store_true", default=False,
+        help="T4: each training step, score the prediction and the best template it was given "
+             "against the native (TM, in-loop on the crop) and log t4/{tm_pred,tm_template,"
+             "margin,promote_rate,has_template}. Measurement only -- nothing is written and the "
+             "loss is untouched, so this is safe to switch on mid-run. Default off."
+    )
+    parser.add_argument(
+        "--t4_delta", type=float, default=0.05,
+        help="T4 promotion margin: a prediction counts as beating its template when "
+             "TM(pred,native) > TM(template,native) + this. Default 0.05 (user-set 2026-08-13)."
+    )
+    parser.add_argument(
+        "--t4_min_tm", type=float, default=0.0,
+        help="T4: absolute floor on TM(pred,native) before a prediction may be promoted. "
+             "0.0 disables the floor (default) -- margin alone decides."
     )
     parser.add_argument(
         "--pda_val_manifest", type=str, default=None,
