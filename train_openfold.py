@@ -1346,7 +1346,11 @@ if __name__ == "__main__":
         "--t2_n_synthetic", type=int, default=0,
         help="T2: how many synthetic templates to concatenate onto each training example's natural "
              "hits. The existing train-mode subsampler then draws uniformly over the combined "
-             "list, so this number sets the synthetic:natural mixing ratio. 0 = disabled (default)."
+             "list, so this sets the mixing ratio: expected synthetic share is N/(4+N), because "
+             "98.2%% of training chains carry exactly 4 natural hits (measured n=400). "
+             "**Use 4** for the sanctioned 50/50 mixture. 0 = disabled (default), so existing "
+             "launchers are untouched. NOTE it also shifts the delivered COUNT -- "
+             "P(4 delivered) = (N+1)/(N+5), so zero-template steps fall from 20.6%% to 11%% at N=4."
     )
     parser.add_argument(
         "--t4_self_distill", action="store_true", default=False,
