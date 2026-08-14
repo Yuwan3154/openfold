@@ -20,12 +20,22 @@ CPU-only by default so it can run on xeon-p8 while the 8 V100s finish generating
 
 import argparse
 import csv
+import importlib.util
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from openfold.utils.tm_score import REFERENCE_KWARGS, tm_score
+# ⛔ Loaded by PATH, not as `from openfold.utils.tm_score import ...`. `openfold/__init__.py` does
+# `from . import resources`, and openfold/resources is UNTRACKED -- so a fresh clone or `git
+# worktree add` cannot import the package at all, which is exactly how this script has to run on
+# SuperCloud (where the templates live and where the only usable env is `protpardelle`).
+# tm_score.py is pure torch with no openfold imports, so a path load is sufficient and portable.
+_spec = importlib.util.spec_from_file_location(
+    "tm_score", Path(__file__).resolve().parents[1] / "openfold/utils/tm_score.py")
+_tms = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_tms)
+REFERENCE_KWARGS, tm_score = _tms.REFERENCE_KWARGS, _tms.tm_score
 
 CA = 1
 
@@ -78,6 +88,10 @@ def main():
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--consolidate", action="store_true",
                     help="merge every index_*.npz in --out into index_all.npz and exit")
+    ap.add_argument("--file-list", default=None,
+                    help="read the chain npz paths from this file instead of globbing")
+    ap.add_argument("--build-file-list", action="store_true",
+                    help="glob once, write --file-list, and exit")
     a = ap.parse_args()
 
     out = Path(a.out)
@@ -102,13 +116,26 @@ def main():
         print(f"chains with ZERO eligible template: {(elig == 0).sum()}")
         return
 
+    # ⛔ Glob ONCE, into a file the shards read. Two reasons, and the second is a correctness bug,
+    # not a performance nicety: (1) 48 processes each walking 1000 Lustre directories is 48x the
+    # metadata load; (2) if the generation run is still WRITING, two processes globbing at
+    # different moments see different file sets, so `files[shard::num_shards]` slices two different
+    # lists and chains are silently missed or scored twice.
+    if a.build_file_list:
+        assert a.file_list, "--build-file-list needs --file-list"
+        files = sorted(Path(a.templates_root).glob("shard*/*.npz"))
+        Path(a.file_list).write_text("\n".join(str(f) for f in files) + "\n")
+        print(f"wrote {a.file_list}  ({len(files)} chains)")
+        return
+
     pdb_of = {}
     with open(a.manifest) as fh:
         for r in csv.DictReader(fh):
             if r["status"] == "ok":
                 pdb_of[r["chain"]] = Path(r["pdb"])
 
-    files = sorted(Path(a.templates_root).glob("shard*/*.npz"))
+    assert a.file_list, "pass --file-list (build it once with --build-file-list)"
+    files = [Path(l) for l in Path(a.file_list).read_text().split() if l]
     mine = files[a.shard::a.num_shards]
     print(f"shard {a.shard}/{a.num_shards}: {len(mine)} of {len(files)} chains", flush=True)
 
