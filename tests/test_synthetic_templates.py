@@ -22,7 +22,8 @@ L, N_TMPL = 12, 6
 def pool(tmp_path):
     rng = np.random.default_rng(0)
     chains = ["1abc_A", "2xyz_B"]
-    tm = np.stack([np.linspace(0.2, 0.99, N_TMPL), np.full(N_TMPL, 0.95)]).astype(np.float32)
+    # chain 0 spans the band edges (0.10 .. 0.99); chain 1 is entirely too-easy
+    tm = np.stack([np.linspace(0.10, 0.99, N_TMPL), np.full(N_TMPL, 0.95)]).astype(np.float32)
     np.savez(
         tmp_path / "index_all.npz",
         chains=np.array(chains), tm=tm,
@@ -45,18 +46,22 @@ def pool(tmp_path):
             rewind_steps=np.arange(90, 90 + N_TMPL, dtype=np.int16),
             model="cc89", schedule="tiered", seconds=np.float32(1.0),
         )
-    return SyntheticTemplatePool(str(tmp_path / "index_all.npz"), str(root), max_tm=0.9), aatype
+    return SyntheticTemplatePool(str(tmp_path / "index_all.npz"), str(root),
+                                 min_tm=0.3, max_tm=0.9), aatype
 
 
-def test_tm_filter_excludes_trivial_templates(pool):
+def test_tm_filter_is_a_band_not_a_ceiling(pool):
+    """Eligibility is 0.3 < TM < 0.9 (user, 2026-08-14): outside it a template is too hard or
+    too easy. A ceiling-only filter would silently readmit the sub-0.3 tail."""
     p, _ = pool
     keep = p.eligible[p.row_of["1abc_A"]]
-    assert set(keep) == set(np.flatnonzero(p.tm[0] < 0.9))
-    assert p.tm[0][keep].max() < 0.9
+    assert set(keep) == set(np.flatnonzero((p.tm[0] > 0.3) & (p.tm[0] < 0.9)))
+    assert p.tm[0][keep].min() > 0.3 and p.tm[0][keep].max() < 0.9
+    assert (p.tm[0] <= 0.3).any(), "fixture must contain a too-hard template for this to bite"
 
 
 def test_chain_with_no_eligible_template_is_skipped(pool):
-    """2xyz_B's templates are all TM 0.95, i.e. all trivial -- it must yield nothing, not a crash."""
+    """2xyz_B's templates are all TM 0.95, i.e. all too easy -- it must yield nothing, not crash."""
     p, _ = pool
     assert "2xyz_B" not in p
     assert p.sample_features("2xyz_B", 2, np.random.default_rng(0)) is None

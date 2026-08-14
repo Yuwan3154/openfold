@@ -946,6 +946,7 @@ class OpenFoldDataModule(pl.LightningDataModule):
                  val_chain_list_path: Optional[str] = None,
                  t2_template_index: Optional[str] = None,
                  t2_templates_root: Optional[str] = None,
+                 t2_min_tm: float = 0.3,
                  t2_max_tm: float = 0.9,
                  t2_n_synthetic: int = 0,
                  enable_recursive_search: bool = True,
@@ -1026,12 +1027,15 @@ class OpenFoldDataModule(pl.LightningDataModule):
         if t2_template_index is not None and t2_n_synthetic > 0:
             from openfold.data.synthetic_templates import SyntheticTemplatePool
             self.synthetic_template_pool = SyntheticTemplatePool(
-                t2_template_index, t2_templates_root, max_tm=t2_max_tm,
+                t2_template_index, t2_templates_root, min_tm=t2_min_tm, max_tm=t2_max_tm,
             )
-            n_ok = sum(len(e) > 0 for e in self.synthetic_template_pool.eligible)
+            elig = self.synthetic_template_pool.eligible
+            n_ok = sum(len(e) > 0 for e in elig)
+            sizes = [len(e) for e in elig]
             rank_zero_info(
-                f"T2 synthetic templates: {n_ok}/{len(self.synthetic_template_pool.eligible)} "
-                f"chains have >=1 template with TM < {t2_max_tm}; "
+                f"T2 synthetic templates: {n_ok}/{len(elig)} chains have >=1 template with "
+                f"{t2_min_tm} < TM < {t2_max_tm} (per chain: median "
+                f"{int(np.median(sizes)) if sizes else 0}, min {min(sizes) if sizes else 0}); "
                 f"adding {t2_n_synthetic} per training example"
             )
 

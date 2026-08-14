@@ -5,9 +5,13 @@ Each training chain has one npz holding 64 synthetic templates of itself, genera
 T2-ALT). `build_template_index.py` scores every one of them against its native and writes the index
 this module reads.
 
-Sampling policy (user, 2026-08-14): keep only templates with **TM < `max_tm`** -- above that "the
-task becomes trivial" -- then **mix with the natural hhsearch templates and sample uniformly over
-the mixture**. The mixing is achieved by concatenating `n_sample` synthetic hits onto the natural
+Sampling policy (user, 2026-08-14): keep only templates inside the **TM band `min_tm` .. `max_tm`**
+(0.3-0.9) -- outside it a template is "too difficult or too easy" -- then **mix with the natural
+hhsearch templates and sample uniformly over the mixture**. ⭐ The band matters because the two
+sources cover different ranges: natural hhsearch hits pile up at TM 0.5-0.9 (88.8%, only 8.4% below
+0.5) while the synthetic ladder is near-uniform over 0.2-0.9, so the synthetic contribution is
+mostly the 0.3-0.5 region natural templates barely reach.
+The mixing is achieved by concatenating `n_sample` synthetic hits onto the natural
 ones and letting the existing train-mode subsampler
 (`random_crop_to_size(..., subsample_templates=True)`) draw uniformly from the combined list, which
 is exactly the requested behaviour and requires no change to the sampler itself.
@@ -34,16 +38,21 @@ CA = 1
 class SyntheticTemplatePool:
     """Index of generated templates, plus per-chain sampling of template features."""
 
-    def __init__(self, index_path: str, templates_root: str, max_tm: float = 0.9):
+    def __init__(self, index_path: str, templates_root: str,
+                 min_tm: float = 0.3, max_tm: float = 0.9):
         z = np.load(index_path, allow_pickle=False)
         self.tm = z["tm"]                                        # (n_chain, 64)
         self.rewind = z["rewind"]
         chains = [str(c) for c in z["chains"]]
         self.row_of = {c: i for i, c in enumerate(chains)}
         self.root = Path(templates_root)
-        self.max_tm = max_tm
-        # eligible[i] = template indices for chain i that pass the TM filter
-        self.eligible = [np.flatnonzero(self.tm[i] < max_tm) for i in range(len(chains))]
+        self.min_tm, self.max_tm = min_tm, max_tm
+        # eligible[i] = template indices for chain i inside the TM BAND. It is a band, not a
+        # ceiling (user, 2026-08-14): below min_tm the template is too hard to be a useful hint,
+        # above max_tm the task is trivial.
+        self.eligible = [
+            np.flatnonzero((self.tm[i] > min_tm) & (self.tm[i] < max_tm)) for i in range(len(chains))
+        ]
 
     def __contains__(self, chain: str) -> bool:
         return chain in self.row_of and len(self.eligible[self.row_of[chain]]) > 0

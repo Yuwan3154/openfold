@@ -1338,9 +1338,15 @@ if __name__ == "__main__":
         help="T2: root of the generated template shards (shardNNNN/<chain>.npz)."
     )
     parser.add_argument(
+        "--t2_min_tm", type=float, default=0.3,
+        help="T2: keep only synthetic templates with TM(template, native) ABOVE this. Default 0.3 "
+             "(user-set 2026-08-14: below it the template is too difficult to be a useful hint)."
+    )
+    parser.add_argument(
         "--t2_max_tm", type=float, default=0.9,
         help="T2: keep only synthetic templates with TM(template, native) BELOW this. Default 0.9 "
-             "(user-set 2026-08-14: above it the task becomes trivial)."
+             "(user-set 2026-08-14: above it the task becomes trivial). Together with --t2_min_tm "
+             "this is a BAND, not a ceiling."
     )
     parser.add_argument(
         "--t2_n_synthetic", type=int, default=0,
