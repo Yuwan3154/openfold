@@ -128,11 +128,18 @@ def main():
         print(f"wrote {a.file_list}  ({len(files)} chains)")
         return
 
+    # ⛔ The manifest records ABSOLUTE paths from the host that produced it (the A6000), so on any
+    # other host every `pdb` column is wrong. Same fallback the production driver uses: re-root the
+    # shard dir + filename under the manifest's own directory. This already bit the production
+    # launch once -- do not assume the recorded path resolves.
+    manifest_dir = Path(a.manifest).parent
     pdb_of = {}
     with open(a.manifest) as fh:
         for r in csv.DictReader(fh):
-            if r["status"] == "ok":
-                pdb_of[r["chain"]] = Path(r["pdb"])
+            if r["status"] != "ok":
+                continue
+            p = Path(r["pdb"])
+            pdb_of[r["chain"]] = p if p.is_file() else manifest_dir / p.parent.name / p.name
 
     assert a.file_list, "pass --file-list (build it once with --build-file-list)"
     files = [Path(l) for l in Path(a.file_list).read_text().split() if l]
