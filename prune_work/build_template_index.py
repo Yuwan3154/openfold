@@ -38,6 +38,9 @@ _spec.loader.exec_module(_tms)
 REFERENCE_KWARGS, tm_score = _tms.REFERENCE_KWARGS, _tms.tm_score
 
 CA = 1
+# unchanged from the assert this replaced -- kept identical so only the FATALITY changes, not which
+# chains are considered scoreable
+MIN_NATIVE_CA = 5
 
 
 def native_ca(pdb_path: Path, residue_index: np.ndarray):
@@ -77,7 +80,11 @@ def score_chain(npz_path: Path, pdb_path: Path, chunk: int, device: str):
     tmpl_ca = torch.from_numpy(atom_mask[:, CA].astype(np.float32))
 
     ref, ref_ca = native_ca(pdb_path, d["residue_index"])
-    assert int(ref_ca.sum()) >= 5, f"{npz_path.name}: only {int(ref_ca.sum())} native CA"
+    # ⛔ Degenerate natives EXIST in the training set (4boh_M resolves 4 CA) and TM is undefined
+    # there anyway -- d0 = 1.24*(L-15)^(1/3) - 1.8 is not real below L=15. Skip the chain and let
+    # the caller record it; an assert here aborted a whole 1723-chain shard on one bad input.
+    if int(ref_ca.sum()) < MIN_NATIVE_CA:
+        return None
     both = ref_ca * tmpl_ca                                      # scored where BOTH have a CA
 
     tms = []
@@ -115,15 +122,27 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
 
     if a.consolidate:
-        parts = sorted(out.glob("index_*.npz"))
-        assert parts, f"no index_*.npz under {out}"
+        # ⛔ NOT glob("index_*.npz") -- that matches index_all.npz too, so a second consolidate
+        # (e.g. after re-running one failed shard) would fold the previous merge back in and
+        # silently DOUBLE every chain.
+        parts = sorted(p for p in out.glob("index_[0-9]*.npz"))
+        assert parts, f"no index_NNNN.npz under {out}"
         acc = {k: [] for k in ("chains", "rewind", "tm", "length")}
+        skipped = []
         for p in parts:
             z = np.load(p, allow_pickle=False)
             for k in acc:
                 acc[k].append(z[k])
+            if "skipped" in z.files:
+                skipped.extend(str(c) for c in z["skipped"])
         merged = {k: np.concatenate(v) for k, v in acc.items()}
+        u, counts = np.unique(merged["chains"], return_counts=True)
+        assert len(u) == len(merged["chains"]), \
+            f"duplicate chains after merge: {u[counts > 1][:5].tolist()}"
         np.savez(out / "index_all.npz", **merged)
+        if skipped:
+            print(f"⚠️ {len(skipped)} chains SKIPPED as unscoreable "
+                  f"(<{MIN_NATIVE_CA} native CA): {' '.join(skipped)}")
         tm = merged["tm"]
         elig = (tm < 0.9).sum(axis=1)
         print(f"consolidated {len(parts)} shards -> {len(merged['chains'])} chains")
@@ -163,10 +182,14 @@ def main():
     mine = files[a.shard::a.num_shards]
     print(f"shard {a.shard}/{a.num_shards}: {len(mine)} of {len(files)} chains", flush=True)
 
-    chains, rewinds, tms, lengths = [], [], [], []
+    chains, rewinds, tms, lengths, skipped = [], [], [], [], []
     for i, f in enumerate(mine):
         chain = f.stem
-        tm, rw, L = score_chain(f, pdb_of[chain], a.chunk, a.device)
+        scored = score_chain(f, pdb_of[chain], a.chunk, a.device)
+        if scored is None:
+            skipped.append(chain)
+            continue
+        tm, rw, L = scored
         chains.append(chain)
         tms.append(tm)
         rewinds.append(rw)
@@ -178,8 +201,10 @@ def main():
         out / f"index_{a.shard:04d}.npz",
         chains=np.array(chains), rewind=np.stack(rewinds),
         tm=np.stack(tms), length=np.array(lengths, np.int32),
+        skipped=np.array(skipped),
     )
-    print(f"wrote {out / f'index_{a.shard:04d}.npz'}  ({len(chains)} chains)")
+    print(f"wrote {out / f'index_{a.shard:04d}.npz'}  ({len(chains)} chains, "
+          f"{len(skipped)} skipped: {' '.join(skipped) if skipped else '-'})")
 
 
 if __name__ == "__main__":

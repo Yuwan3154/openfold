@@ -102,3 +102,39 @@ print("⭐ skew = share of the EASIEST 0.1 sub-band / share of the HARDEST; 1.00
 print("\n⚠️ Interpolating each chain's OWN measured curve, so a candidate window is only as "
       "trustworthy as the ladder's coverage there; windows inside 90-375 are interpolation, "
       "nothing here extrapolates outside it.")
+
+# ---- would a LENGTH-DEPENDENT ladder beat any single window? -------------------------------------
+# The TM=0.9 crossing moves ~40 rewind units across length quartiles (longer chains hold higher TM
+# at the same rewind, because d0 = 1.24(L-15)^(1/3) - 1.8 grows with L), so one global window is
+# necessarily a compromise. Per-chain start = its own measured crossing, capped to the ladder range.
+print("\nlength-dependent ladders (start from each chain's own TM=0.9 crossing):")
+print(f"{'rule':>26} {'mean':>6} {'med':>4} {'p10':>4} {'=0':>6}   "
+      + " ".join(f"{x:.1f}-{x+0.1:.1f}" for x in np.arange(a.lo, a.hi - 1e-9, 0.1)) + f" {'skew':>5}")
+
+
+def score(starts, ends, label):
+    ys, pooled = [], []
+    for i in range(n):
+        r0 = min(max(starts[i], 90.0), 370.0)
+        rungs = np.linspace(r0, ends[i], a.n_rungs)
+        v = np.interp(rungs, *tm_at[i])
+        inb = v[(v > a.lo) & (v < a.hi)]
+        ys.append(len(inb))
+        pooled.append(inb)
+    ys = np.array(ys)
+    pooled = np.concatenate(pooled)
+    share = np.array([100 * ((pooled >= lo) & (pooled < hi)).mean()
+                      for lo, hi in zip(sub, sub[1:])])
+    print(f"{label:>26} {ys.mean():6.1f} {np.median(ys):4.0f} {np.percentile(ys,10):4.0f} "
+          f"{100*(ys == 0).mean():5.1f}%   " + " ".join(f"{s:6.1f}%" for s in share)
+          + f" {share[-1]/share[0] if share[0] else np.inf:5.2f}")
+
+
+c_hi_f = np.where(np.isnan(c_hi), 195.0, c_hi)      # chains that never cross 0.9 keep the global start
+score(c_hi_f, np.full(n, 375.0), "own 0.9 crossing -> 375")
+score(c_hi_f + 10, np.full(n, 375.0), "crossing+10 -> 375")
+# a coarse 4-bucket rule is deployable without a per-chain table
+qs_L = np.percentile(L, [25, 50, 75])
+bucket_start = np.array([179.0, 201.0, 212.0, 219.0])   # measured p50 crossing per length quartile
+idx = np.digitize(L, qs_L)
+score(bucket_start[idx], np.full(n, 375.0), "length-quartile p50 -> 375")
