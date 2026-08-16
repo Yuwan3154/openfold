@@ -43,6 +43,10 @@ class SyntheticTemplatePool:
         z = np.load(index_path, allow_pickle=False)
         self.tm = z["tm"]                                        # (n_chain, 64)
         self.rewind = z["rewind"]
+        # `slot` is present only for an index built by prune_templates_to_band.py, where each npz
+        # holds just the in-band templates: it maps an original rung to its row in the pruned file
+        # (-1 = dropped). Absent => the npz still has all 64 and the rung index IS the row.
+        self.slot = z["slot"] if "slot" in z.files else None
         chains = [str(c) for c in z["chains"]]
         self.row_of = {c: i for i, c in enumerate(chains)}
         self.root = Path(templates_root)
@@ -74,7 +78,12 @@ class SyntheticTemplatePool:
         d = np.load(self.npz_path(chain), allow_pickle=False)
         atom_mask = d["atom_mask"]                                # (L, 37) bool
         L = atom_mask.shape[0]
-        coords = d["coords"][pick]                                # (k, n_present, 3)
+        # ⛔ On a pruned tree the npz rows are a compacted subset, so the rung index picked out of
+        # `eligible` is NOT the row index -- translate it, or the coords silently belong to a
+        # different template than the TM that justified picking it.
+        rows = self.slot[row, pick] if self.slot is not None else pick
+        assert (rows >= 0).all(), f"{chain}: picked a rung missing from the pruned npz"
+        coords = d["coords"][rows]                                # (k, n_present, 3)
         k = coords.shape[0]
         pos = np.zeros((k, L, 37, 3), np.float32)
         pos[:, atom_mask] = coords

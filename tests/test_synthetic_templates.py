@@ -144,3 +144,55 @@ def test_merge_zero_extends_keys_the_synthetic_side_cannot_produce(pool):
     out = merge_template_features(nat, p.sample_features("1abc_A", 2, np.random.default_rng(6)))
     assert out["template_dgram_probs"].shape == (3, L, L, 39)
     assert (out["template_dgram_probs"][1:] == 0).all()
+
+
+def test_pruned_tree_translates_the_rung_to_its_compacted_row(tmp_path):
+    """⛔ On a band-pruned tree the npz holds only the in-band rungs, so rung index != row index.
+
+    Without the `slot` translation the pool would read whatever template happens to sit at the
+    rung's ORIGINAL position -- coordinates from one template paired with the TM of another, and
+    every downstream number silently wrong rather than crashing. Built here so the two orderings
+    disagree: the kept rungs are 1..4 out of 6, so rung k lives at row k-1.
+    """
+    rng = np.random.default_rng(0)
+    chain = "1abc_A"
+    tm = np.linspace(0.10, 0.99, N_TMPL).astype(np.float32)[None]
+    band = (tm[0] > 0.3) & (tm[0] < 0.9)
+    keep = np.flatnonzero(band)
+    assert keep[0] != 0, "fixture must drop at least the first rung or it tests nothing"
+    slot = np.full((1, N_TMPL), -1, np.int16)
+    slot[0, keep] = np.arange(len(keep), dtype=np.int16)
+    np.savez(
+        tmp_path / "index_all.npz",
+        chains=np.array([chain]), tm=tm,
+        rewind=np.arange(90, 90 + N_TMPL, dtype=np.int16)[None],
+        length=np.array([L], np.int32), slot=slot,
+    )
+    atom_mask = np.zeros((L, 37), bool)
+    atom_mask[:, :5] = True
+    n_present = int(atom_mask.sum())
+    # a distinct constant per KEPT template, so the coords identify which row was read
+    coords = np.stack([np.full((n_present, 3), float(j)) for j in range(len(keep))]).astype(np.float32)
+    d = tmp_path / "templates" / f"shard{zlib.crc32(chain.encode()) % 1000:04d}"
+    d.mkdir(parents=True)
+    np.savez(
+        d / f"{chain}.npz", coords=coords, atom_mask=atom_mask,
+        aatype=rng.integers(0, 20, L).astype(np.int8),
+        residue_index=np.arange(1, L + 1, dtype=np.int32),
+        rewind_steps=(90 + keep).astype(np.int16),
+    )
+    p = SyntheticTemplatePool(str(tmp_path / "index_all.npz"), str(tmp_path / "templates"),
+                              min_tm=0.3, max_tm=0.9)
+    f = p.sample_features(chain, len(keep), np.random.default_rng(0))
+    got = f["template_all_atom_positions"][:, 0, 1, 0]             # the constant, per template
+    # each sampled template's TM must be the one belonging to the row its coords came from
+    for tm_val, row in zip(f["_tm"], got):
+        assert tm[0][keep[int(row)]] == pytest.approx(tm_val), "coords paired with the wrong TM"
+
+
+def test_unpruned_index_still_reads_the_rung_directly(pool):
+    """The `slot` key is absent on the original 64-rung index -- that path must be untouched."""
+    p, _ = pool
+    assert p.slot is None
+    f = p.sample_features("1abc_A", 2, np.random.default_rng(0))
+    assert f["template_all_atom_positions"].shape[0] == 2
