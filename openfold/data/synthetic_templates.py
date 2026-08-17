@@ -47,6 +47,15 @@ class SyntheticTemplatePool:
         # holds just the in-band templates: it maps an original rung to its row in the pruned file
         # (-1 = dropped). Absent => the npz still has all 64 and the rung index IS the row.
         self.slot = z["slot"] if "slot" in z.files else None
+        if self.slot is not None:
+            # ⛔ A pruned tree physically contains only its own band, so asking for a WIDER band
+            # would select rungs whose npz rows were never written. Fail at construction with the
+            # actual numbers rather than on some later training step's assert.
+            pruned_lo, pruned_hi = float(z["min_tm"]), float(z["max_tm"])
+            assert min_tm >= pruned_lo and max_tm <= pruned_hi, (
+                f"index was pruned to TM {pruned_lo}-{pruned_hi} but the pool asks for "
+                f"{min_tm}-{max_tm}; re-prune from the full template tree for a wider band"
+            )
         chains = [str(c) for c in z["chains"]]
         self.row_of = {c: i for i, c in enumerate(chains)}
         self.root = Path(templates_root)

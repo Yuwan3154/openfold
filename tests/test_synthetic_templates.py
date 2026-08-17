@@ -196,3 +196,52 @@ def test_unpruned_index_still_reads_the_rung_directly(pool):
     assert p.slot is None
     f = p.sample_features("1abc_A", 2, np.random.default_rng(0))
     assert f["template_all_atom_positions"].shape[0] == 2
+
+
+def _pruned_index(tmp_path, lo, hi):
+    """A minimal pruned index/tree pair recording the band it was pruned to."""
+    tm = np.linspace(0.10, 0.99, N_TMPL).astype(np.float32)[None]
+    keep = np.flatnonzero((tm[0] > lo) & (tm[0] < hi))
+    slot = np.full((1, N_TMPL), -1, np.int16)
+    slot[0, keep] = np.arange(len(keep), dtype=np.int16)
+    np.savez(
+        tmp_path / "index_all.npz",
+        chains=np.array(["1abc_A"]), tm=tm,
+        rewind=np.arange(90, 90 + N_TMPL, dtype=np.int16)[None],
+        length=np.array([L], np.int32), slot=slot,
+        min_tm=np.float32(lo), max_tm=np.float32(hi),
+    )
+    atom_mask = np.zeros((L, 37), bool)
+    atom_mask[:, :5] = True
+    d = tmp_path / "templates" / f"shard{zlib.crc32(b'1abc_A') % 1000:04d}"
+    d.mkdir(parents=True)
+    np.savez(
+        d / "1abc_A.npz",
+        coords=np.zeros((len(keep), int(atom_mask.sum()), 3), np.float32),
+        atom_mask=atom_mask, aatype=np.zeros(L, np.int8),
+        residue_index=np.arange(1, L + 1, dtype=np.int32),
+        rewind_steps=(90 + keep).astype(np.int16),
+    )
+    return str(tmp_path / "index_all.npz"), str(tmp_path / "templates")
+
+
+def test_pruned_index_refuses_a_wider_band(tmp_path):
+    """⛔ A pruned tree physically lacks the out-of-band rungs, so a wider band at training time
+    would select rows that were never written. That must fail at construction with the numbers in
+    hand, not on some later step -- a run that dies 3 hours in is far worse than one that never
+    starts."""
+    idx, root = _pruned_index(tmp_path, 0.3, 0.9)
+    with pytest.raises(AssertionError, match="pruned to TM"):
+        SyntheticTemplatePool(idx, root, min_tm=0.2, max_tm=0.9)
+    with pytest.raises(AssertionError, match="pruned to TM"):
+        SyntheticTemplatePool(idx, root, min_tm=0.3, max_tm=0.95)
+
+
+def test_pruned_index_accepts_the_same_or_narrower_band(tmp_path):
+    idx, root = _pruned_index(tmp_path, 0.3, 0.9)
+    same = SyntheticTemplatePool(idx, root, min_tm=0.3, max_tm=0.9)
+    narrower = SyntheticTemplatePool(idx, root, min_tm=0.4, max_tm=0.8)
+    assert len(narrower.eligible[0]) < len(same.eligible[0])
+    # a narrower band still indexes real rows -- the translation must hold
+    f = narrower.sample_features("1abc_A", 2, np.random.default_rng(0))
+    assert f["template_all_atom_positions"].shape[0] == 2
