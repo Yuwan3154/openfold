@@ -1043,14 +1043,21 @@ class OpenFoldDataModule(pl.LightningDataModule):
                 t2_template_index, t2_templates_root, min_tm=t2_min_tm, max_tm=t2_max_tm,
                 qmap_path=t2_qmap,
             )
-            elig = self.synthetic_template_pool.eligible
-            n_ok = sum(len(e) > 0 for e in elig)
+            pool = self.synthetic_template_pool
+            elig = pool.eligible
             sizes = [len(e) for e in elig]
+            in_band = sum(n > 0 for n in sizes)
+            # ⛔ Report what the pool will ACTUALLY serve, not just the TM-band count. A chain also
+            # needs a query-index map entry, so `in_band` overstates usable coverage -- it read
+            # "82730/82733" while only 82282 chains were really available, which is exactly the kind
+            # of number that gets quoted later as if it were the real one.
+            usable = sum(1 for c in pool.row_of if c in pool)
             rank_zero_info(
-                f"T2 synthetic templates: {n_ok}/{len(elig)} chains have >=1 template with "
-                f"{t2_min_tm} < TM < {t2_max_tm} (per chain: median "
-                f"{int(np.median(sizes)) if sizes else 0}, min {min(sizes) if sizes else 0}); "
-                f"adding {t2_n_synthetic} per training example"
+                f"T2 synthetic templates: {usable}/{len(elig)} chains USABLE "
+                f"({in_band} in the {t2_min_tm}-{t2_max_tm} TM band, "
+                f"{in_band - usable} of those dropped for want of a query-index map); "
+                f"per chain median {int(np.median(sizes)) if sizes else 0}, "
+                f"min {min(sizes) if sizes else 0}; adding {t2_n_synthetic} per training example"
             )
 
     def setup(self, stage=None):
