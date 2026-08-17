@@ -65,6 +65,10 @@ T2_ROOT=${T2_TEMPLATES_ROOT:-/home/jupyter-chenxi/pp1c_work/templates_band}
 T2_MIN_TM=${T2_MIN_TM:-0.3}
 T2_MAX_TM=${T2_MAX_TM:-0.9}
 T2_N=${T2_N_SYNTHETIC:-4}
+# ⛔ REQUIRED. Without it the npz rows are placed by residue_index - 1, which desynchronises at
+# the first unresolved residue and is what killed launch #2 (1eis_A, 70/85 positions wrong).
+# data_modules.py asserts on its absence rather than silently falling back.
+T2_QMAP=${T2_QMAP:-/home/jupyter-chenxi/pp1c_work/qmap_all.npz}
 [ -f "$TRAIN" ] || { echo "ERROR: train list not found: $TRAIN"; exit 1; }
 [ -f "$VAL" ]   || { echo "ERROR: val list not found: $VAL"; exit 1; }
 [ -f "$PDA_MANIFEST" ] || { echo "ERROR: PDA val manifest not found: $PDA_MANIFEST"; exit 1; }
@@ -72,6 +76,7 @@ T2_N=${T2_N_SYNTHETIC:-4}
 [ -f "$JAX" ] || { echo "ERROR: stock AF2 jax params not found: $JAX"; exit 1; }
 [ -f "$T2_INDEX" ] || { echo "ERROR: T2 template index not found: $T2_INDEX"; exit 1; }
 [ -d "$T2_ROOT" ]  || { echo "ERROR: T2 templates root not found: $T2_ROOT"; exit 1; }
+[ -f "$T2_QMAP" ] || { echo "ERROR: T2 query-index map not found: $T2_QMAP"; exit 1; }
 # Auto-resume this run's own checkpoint (full state); else warm-start from stock AF2 jax params.
 CK=$(ls -t "$OUT"/lightning_logs/version_*/checkpoints/last.ckpt 2>/dev/null | head -1)
 if [ -n "$CK" ]; then
@@ -81,7 +86,7 @@ else
   RESUME=(--resume_from_jax_params "$JAX")
   echo "INIT (warm-start) from stock AF2 jax params: $JAX"
 fi
-echo "T2 synthetic templates: index=$T2_INDEX root=$T2_ROOT band=$T2_MIN_TM-$T2_MAX_TM n=$T2_N"
+echo "T2 synthetic templates: index=$T2_INDEX root=$T2_ROOT band=$T2_MIN_TM-$T2_MAX_TM n=$T2_N qmap=$T2_QMAP"
 python train_openfold.py "$MM" "$ALN" "$MM" "$OUT" 2018-04-30 \
   --config_preset finetuning_ptm \
   --kalign_binary_path "$KAL" --obsolete_pdbs_file_path "$OBS" --template_release_dates_cache_path "$CACHE" \
@@ -93,6 +98,7 @@ python train_openfold.py "$MM" "$ALN" "$MM" "$OUT" 2018-04-30 \
   --train_chain_list_path "$TRAIN" \
   --val_data_dir "$MM" --val_alignment_dir "$ALN" --val_chain_list_path "$VAL" \
   --t2_template_index "$T2_INDEX" --t2_templates_root "$T2_ROOT" \
+  --t2_qmap "$T2_QMAP" \
   --t2_min_tm "$T2_MIN_TM" --t2_max_tm "$T2_MAX_TM" --t2_n_synthetic "$T2_N" \
   --precision bf16 --learning_rate 1e-4 --warmup_no_steps 3000 \
   --train_epoch_len "$EPL" --max_epochs "$MAXEP" --num_sanity_val_steps 0 \
