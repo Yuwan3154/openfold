@@ -226,7 +226,9 @@ def _pruned_index(tmp_path, lo, hi):
         residue_index=np.arange(1, L + 1, dtype=np.int32),
         rewind_steps=(90 + keep).astype(np.int16),
     )
-    return str(tmp_path / "index_all.npz"), str(tmp_path / "templates")
+    # aatype is all zeros -> restypes[0] repeated, so this is the matching query sequence
+    return (str(tmp_path / "index_all.npz"), str(tmp_path / "templates"),
+            rc.restypes[0] * L)
 
 
 def test_pruned_index_refuses_a_wider_band(tmp_path):
