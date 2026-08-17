@@ -40,6 +40,14 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--index", required=True, help="index_band.npz (or index_all.npz)")
 ap.add_argument("--templates-root", required=True)
 ap.add_argument("--mmcif-dir", required=True)
+# ⭐ chain_data_cache_full.json is keyed "2fw8_A" -> {release_date, seq, resolution}, i.e. it already
+# holds the query sequence, so this replaces ~55k Biopython mmCIF parses (~2.3 s/chain) with one
+# 136 MB json read. VERIFIED before use: it covers 82733/82733 of the generated chains and its `seq`
+# is byte-identical to mmcif_parsing.parse(...).chain_to_seqres on a 40-chain sample (0 mismatches).
+# ⚠️ NOT chain_data_cache.json -- that one covers only 14.58% of these chains.
+ap.add_argument("--chain-cache", default=None,
+               help="chain_data_cache_full.json; when given, query sequences come from here and no "
+                    "mmCIF is parsed. Chains absent from it fall back to the mmCIF.")
 ap.add_argument("--out", required=True, help="output .npz for this shard")
 ap.add_argument("--shard", type=int, default=0)
 ap.add_argument("--num-shards", type=int, default=1)
@@ -102,9 +110,16 @@ def parsed_for(file_id: str):
             )
     return _cache["obj"]
 
+seq_cache = {}
+if a.chain_cache is not None:
+    import json
+    with open(a.chain_cache) as fh:
+        seq_cache = {k: v["seq"] for k, v in json.load(fh).items() if v.get("seq")}
+    print(f"query sequences from cache: {len(seq_cache)} entries", flush=True)
+
 names, maps, qlens, flags = [], [], [], []
 stat = dict(ok=0, ambiguous=0, not_subseq=0, no_mmcif=0, no_chain=0, no_npz=0,
-            from_ridx=0, from_align=0)
+            from_ridx=0, from_align=0, from_cache=0, from_mmcif=0)
 failures = []
 
 for n, i in enumerate(mine):
@@ -115,16 +130,21 @@ for n, i in enumerate(mine):
         stat["no_npz"] += 1
         continue
     file_id, chain_id = chain.rsplit("_", 1)
-    mo = parsed_for(file_id)
-    if mo is None and not (mmcif_dir / f"{file_id}.cif").is_file():
-        stat["no_mmcif"] += 1
-        failures.append((chain, "no mmcif"))
-        continue
-    if mo is None or chain_id not in mo.chain_to_seqres:
-        stat["no_chain"] += 1
-        failures.append((chain, "chain absent from mmcif"))
-        continue
-    query = mo.chain_to_seqres[chain_id]
+    query = seq_cache.get(chain)
+    if query is None:
+        mo = parsed_for(file_id)
+        if mo is None and not (mmcif_dir / f"{file_id}.cif").is_file():
+            stat["no_mmcif"] += 1
+            failures.append((chain, "no mmcif"))
+            continue
+        if mo is None or chain_id not in mo.chain_to_seqres:
+            stat["no_chain"] += 1
+            failures.append((chain, "chain absent from mmcif"))
+            continue
+        query = mo.chain_to_seqres[chain_id]
+        stat["from_mmcif"] += 1
+    else:
+        stat["from_cache"] += 1
 
     d = np.load(npz, allow_pickle=False)
     aat = d["aatype"].astype(int)
