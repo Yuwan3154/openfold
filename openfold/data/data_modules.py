@@ -331,9 +331,16 @@ class OpenFoldSingleDataset(torch.utils.data.Dataset):
         # which is the requested "mix with real templates, uniform over the mixture" policy with no
         # change to the sampler. Seeded from the worker's torch RNG so it follows --seed.
         if self.synthetic_template_pool is not None and self.n_synthetic_templates > 0:
+            # ⛔ The query sequence is REQUIRED, not a convenience: the npz is on the native
+            # structure's resolved-residue frame and has to be scattered onto the query's full
+            # frame. Without it the template arrays come out at the native length and the merge
+            # below fails on the NUM_RES axis (this is what killed the first T2 launch).
+            qseq = data["sequence"][0]
+            qseq = qseq.decode() if isinstance(qseq, bytes) else str(qseq)
             synth = self.synthetic_template_pool.sample_features(
                 name, self.n_synthetic_templates,
                 np.random.default_rng(int(torch.randint(0, 2 ** 31 - 1, (1,)).item())),
+                query_sequence=qseq,
             )
             if synth is not None:
                 data = merge_template_features(data, synth)

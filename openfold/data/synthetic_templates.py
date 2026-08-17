@@ -83,8 +83,21 @@ class SyntheticTemplatePool:
         # because builtin hash() is randomized per process (see the plan's production-bug notes)
         return self.root / f"shard{zlib.crc32(chain.encode()) % 1000:04d}" / f"{chain}.npz"
 
-    def sample_features(self, chain: str, n: int, rng: np.random.Generator) -> dict | None:
-        """`n` synthetic template hits for `chain`, in the raw pre-transform feature layout."""
+    def sample_features(self, chain: str, n: int, rng: np.random.Generator,
+                        query_sequence: str) -> dict | None:
+        """`n` synthetic template hits for `chain`, on the QUERY's residue frame.
+
+        ⛔⛔ The npz is on the NATIVE STRUCTURE's frame, not the query's: it holds only the residues
+        that were RESOLVED in the deposited structure, numbered by the native PDB (1-based, and not
+        necessarily contiguous). The query frame is the full sequence, 0..L-1. Those differ for the
+        large majority of chains -- measured 10 of 12 in a random sample, e.g. 3dls_A is a
+        335-residue query whose npz has 285 residues numbered 9-293. Building the arrays at the npz
+        length is what crashed the first T2 launch inside `merge_template_features`
+        ("size 104 vs 89").
+        So this scatters onto the query frame and masks everywhere else -- exactly what the natural
+        path does in `templates._extract_template_features`, which zero-initializes over the full
+        query, writes only mapped positions, and leaves "-" in the sequence elsewhere.
+        """
         if chain not in self:
             return None
         row = self.row_of[chain]
@@ -92,8 +105,7 @@ class SyntheticTemplatePool:
         pick = rng.choice(pool, size=min(n, len(pool)), replace=False)
 
         d = np.load(self.npz_path(chain), allow_pickle=False)
-        atom_mask = d["atom_mask"]                                # (L, 37) bool
-        L = atom_mask.shape[0]
+        atom_mask = d["atom_mask"]                                # (n_native, 37) bool
         # ⛔ On a pruned tree the npz rows are a compacted subset, so the rung index picked out of
         # `eligible` is NOT the row index -- translate it, or the coords silently belong to a
         # different template than the TM that justified picking it.
@@ -101,16 +113,44 @@ class SyntheticTemplatePool:
         assert (rows >= 0).all(), f"{chain}: picked a rung missing from the pruned npz"
         coords = d["coords"][rows]                                # (k, n_present, 3)
         k = coords.shape[0]
-        pos = np.zeros((k, L, 37, 3), np.float32)
-        pos[:, atom_mask] = coords
+        native = np.zeros((k,) + atom_mask.shape + (3,), np.float32)
+        native[:, atom_mask] = coords
 
-        seq = "".join(rc.restypes[a] if a < len(rc.restypes) else "X"
-                      for a in d["aatype"].astype(int))
+        qL = len(query_sequence)
+        aat = d["aatype"].astype(int)
+        # native PDB numbering is 1-based over the query's own sequence (write_coords_to_pdb wrote
+        # residue_index + 1), so the query's 0-based position is ridx - 1
+        q = d["residue_index"].astype(int) - 1
+        assert q.min() >= 0 and q.max() < qL, (
+            f"{chain}: npz residue_index {q.min()+1}-{q.max()+1} does not fit a query of length "
+            f"{qL} -- the numbering convention is not what this code assumes"
+        )
+        # ⭐ Sequence agreement is the real check on that mapping: an off-by-one would still be
+        # in-bounds and would silently place every residue's coordinates one slot over. Cheap
+        # vector compare, so it runs on every sample rather than only in tests.
+        letters = np.array([rc.restypes[a] if a < len(rc.restypes) else "X" for a in aat])
+        qchars = np.array(list(query_sequence))[q]
+        bad = (letters != qchars) & (letters != "X") & (qchars != "X")
+        assert not bad.any(), (
+            f"{chain}: npz aatype disagrees with the query sequence at {int(bad.sum())}/{len(q)} "
+            f"scattered positions (first at query index {int(q[bad][0])}: npz "
+            f"{letters[bad][0]} vs query {qchars[bad][0]}) -- residue mapping is wrong"
+        )
+
+        pos = np.zeros((k, qL, 37, 3), np.float32)
+        msk = np.zeros((k, qL, 37), np.float32)
+        pos[:, q] = native
+        msk[:, q] = atom_mask.astype(np.float32)
+
+        # "-" everywhere the template does not cover, matching the natural path's convention
+        seq_chars = ["-"] * qL
+        for j, p in enumerate(q):
+            seq_chars[p] = letters[j]
+        seq = "".join(seq_chars)
         onehot = rc.sequence_to_onehot(seq, rc.HHBLITS_AA_TO_ID).astype(np.float32)
         return {
             "template_all_atom_positions": pos,
-            "template_all_atom_mask": np.broadcast_to(
-                atom_mask.astype(np.float32), (k, L, 37)).copy(),
+            "template_all_atom_mask": msk,
             "template_aatype": np.broadcast_to(onehot, (k,) + onehot.shape).copy(),
             "template_sequence": np.array([seq.encode()] * k, dtype=object),
             "template_domain_names": np.array(
@@ -134,6 +174,18 @@ def merge_template_features(feats: dict, synth: dict) -> dict:
     if not keys:
         return feats
     k_new = synth["template_all_atom_positions"].shape[0]
+    # ⛔ Guard the NUM_RES axis explicitly. The first T2 launch died here on "size 104 vs 89"
+    # because the synthetic side was built on the native structure's resolved-residue frame while
+    # the natural side is on the query's. np.concatenate's own message names only the axis sizes,
+    # which is a long way from naming the cause -- so say it here.
+    old_pos = np.asarray(feats["template_all_atom_positions"])
+    if old_pos.shape[0] and old_pos.shape[1] != synth["template_all_atom_positions"].shape[1]:
+        raise ValueError(
+            f"template NUM_RES mismatch: natural hits have {old_pos.shape[1]} residues, synthetic "
+            f"have {synth['template_all_atom_positions'].shape[1]}. The synthetic features must be "
+            f"built on the QUERY frame (pass the query sequence to sample_features), not the "
+            f"native structure's resolved-residue frame."
+        )
     out = dict(feats)
     for key in keys:
         old = np.asarray(feats[key])
