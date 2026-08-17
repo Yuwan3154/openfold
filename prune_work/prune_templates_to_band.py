@@ -27,6 +27,10 @@ p.add_argument("--min-tm", type=float, default=0.3)
 p.add_argument("--max-tm", type=float, default=0.9)
 p.add_argument("--shard", type=int, default=0)
 p.add_argument("--num-shards", type=int, default=1)
+# ⛔ Without this every shard would np.savez the SAME --out-index path concurrently. Copying shards
+# now skip the index entirely and one final invocation writes it after they all finish.
+p.add_argument("--index-only", action="store_true",
+               help="write --out-index and exit; copy nothing")
 a = p.parse_args()
 
 z = np.load(a.index, allow_pickle=False)
@@ -40,6 +44,17 @@ src_root, dst_root = Path(a.src_root), Path(a.dst_root)
 slot = np.full(tm.shape, -1, np.int16)
 for i in range(len(chains)):
     slot[i, np.flatnonzero(band[i])] = np.arange(int(band[i].sum()), dtype=np.int16)
+
+if a.index_only:
+    np.savez(
+        a.out_index,
+        chains=np.array(chains), tm=tm, rewind=rewind, length=z["length"],
+        slot=slot, min_tm=np.float32(a.min_tm), max_tm=np.float32(a.max_tm),
+    )
+    kept = (slot >= 0).sum()
+    print(f"wrote {a.out_index}: {len(chains)} chains, {kept:,}/{slot.size:,} rungs retained "
+          f"({100*kept/slot.size:.1f}%), band {a.min_tm}-{a.max_tm}")
+    raise SystemExit(0)
 
 mine = list(range(a.shard, len(chains), a.num_shards))
 n_bytes_in = n_bytes_out = 0
@@ -72,10 +87,5 @@ for n, i in enumerate(mine):
         print(f"  {n+1}/{len(mine)}  "
               f"{n_bytes_in/2**30:.1f} -> {n_bytes_out/2**30:.1f} GiB", flush=True)
 
-np.savez(
-    a.out_index,
-    chains=np.array(chains), tm=tm, rewind=rewind, length=z["length"],
-    slot=slot, min_tm=np.float32(a.min_tm), max_tm=np.float32(a.max_tm),
-)
 print(f"shard {a.shard}: {n_bytes_in/2**30:.1f} -> {n_bytes_out/2**30:.1f} GiB "
       f"({100*n_bytes_out/max(n_bytes_in,1):.0f}%), {n_empty} chains had nothing in band")

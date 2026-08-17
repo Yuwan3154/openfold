@@ -41,7 +41,11 @@ mism = [i for i in range(len(orig.eligible))
 assert not mism, f"eligible sets differ for {len(mism)} chains, e.g. row {mism[0]}"
 print(f"✅ eligible sets identical across all {len(orig.eligible)} chains")
 
-eligible_chains = [c for c in orig.row_of if c in orig]
+# only chains whose pruned npz actually exists, so this works on a PILOT prune of a subset as well
+# as on the full tree -- the gate has to be runnable before committing to the full 103 GB pass
+eligible_chains = [c for c in orig.row_of if c in orig and pruned.npz_path(c).is_file()]
+assert eligible_chains, f"no pruned npz found under {a.dst_root}"
+print(f"{len(eligible_chains)} chains present in the pruned tree and in band")
 rng = np.random.default_rng(0)
 pick_chains = [eligible_chains[i] for i in
                rng.choice(len(eligible_chains), size=min(a.n_chains, len(eligible_chains)),

@@ -51,6 +51,10 @@ assert recomputed == per.tolist(), "pool.eligible disagrees with the index it wa
 print("  ✅ pool.eligible matches the index")
 
 # --- 3. exercise sample_features on real npz --------------------------------------------------
+# restrict to chains whose npz is actually on disk, so this also runs against a PILOT prune
+elig = [c for c in elig if pool.npz_path(c).is_file()]
+assert elig, f"no npz present under {a.templates_root}"
+print(f"  present on disk   : {len(elig)}")
 rng = np.random.default_rng(0)
 picks = rng.choice(len(elig), size=min(a.n_chains, len(elig)), replace=False)
 bad = 0
