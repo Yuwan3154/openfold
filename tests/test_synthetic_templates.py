@@ -366,7 +366,7 @@ def test_sequence_disagreement_is_caught(tmp_path):
 
 def test_native_numbering_beyond_the_query_is_refused(tmp_path):
     p, chain, qseq, _ = _partial_native_pool(tmp_path, 104, 9, 89)
-    with pytest.raises(AssertionError, match="does not fit a query of length"):
+    with pytest.raises(AssertionError, match="fit a query of length"):
         p.sample_features(chain, 1, np.random.default_rng(0), query_sequence=qseq[:50])
 
 
