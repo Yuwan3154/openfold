@@ -73,7 +73,9 @@ print(f"\ncompared {len(pick_chains)} chains / {n_tmpl} sampled templates: "
 z = np.load(a.pruned_index, allow_pickle=False)
 print(f"pruned index records its band as TM {float(z['min_tm'])}-{float(z['max_tm'])}"
       f" (requested {a.min_tm}-{a.max_tm})")
-assert float(z["min_tm"]) == a.min_tm and float(z["max_tm"]) == a.max_tm
+# float32 storage means exact float64 equality does not hold -- compare in the stored precision
+assert np.float32(z["min_tm"]) == np.float32(a.min_tm)
+assert np.float32(z["max_tm"]) == np.float32(a.max_tm)
 
 # every retained row must be reachable, and nothing beyond
 slot = z["slot"]

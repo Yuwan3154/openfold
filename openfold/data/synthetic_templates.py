@@ -51,10 +51,13 @@ class SyntheticTemplatePool:
             # ⛔ A pruned tree physically contains only its own band, so asking for a WIDER band
             # would select rungs whose npz rows were never written. Fail at construction with the
             # actual numbers rather than on some later training step's assert.
-            pruned_lo, pruned_hi = float(z["min_tm"]), float(z["max_tm"])
-            assert min_tm >= pruned_lo and max_tm <= pruned_hi, (
-                f"index was pruned to TM {pruned_lo}-{pruned_hi} but the pool asks for "
-                f"{min_tm}-{max_tm}; re-prune from the full template tree for a wider band"
+            # ⛔ compare in float32, not float64: np.float32(0.3) is 0.30000001192, which is
+            # GREATER than the python float 0.3, so a float64 comparison rejects an exactly
+            # matching band. Casting both sides to the stored precision makes equality exact.
+            pruned_lo, pruned_hi = np.float32(z["min_tm"]), np.float32(z["max_tm"])
+            assert np.float32(min_tm) >= pruned_lo and np.float32(max_tm) <= pruned_hi, (
+                f"index was pruned to TM {float(pruned_lo)}-{float(pruned_hi)} but the pool asks "
+                f"for {min_tm}-{max_tm}; re-prune from the full template tree for a wider band"
             )
         chains = [str(c) for c in z["chains"]]
         self.row_of = {c: i for i, c in enumerate(chains)}
