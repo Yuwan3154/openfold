@@ -18,11 +18,13 @@ is what AF2 does for real templates (`_build_query_to_hit_index_mapping`).
 TIE-BREAKS, stated explicitly because they are correctness choices and not formatting ones:
   * The npz sequence must be a SUBSEQUENCE of the query -- same protein, residues only ever dropped,
     never inserted or substituted. Anything else is reported as a failure rather than forced.
-  * Inside a run of identical residues the embedding is AMBIGUOUS ("which G of GGGG is absent"), and
-    the choice moves coordinates. We resolve it by preferring the LEFTMOST embedding, then verify
-    with `residue_index`: among equally valid embeddings, the one whose induced query positions are
-    most consistent with the npz's own numbering ORDER is kept. Ambiguous chains are counted and
-    reported so the residual risk is a number, not a hope.
+  * `residue_index - 1` WINS whenever it is sequence-valid. It was measured sequence-exact on
+    1500/1500 randomly sampled chains, whereas a deletion inside a run of identical residues makes
+    the alignment ambiguous for 17-48% of chains, where a leftmost pick is arbitrary. Preferring an
+    arbitrary embedding over consistent structural numbering would INTRODUCE errors in chains that
+    were already right. The alignment handles only what ridx-1 provably cannot explain.
+  * Where the alignment IS used and is ambiguous, the leftmost embedding is taken and the chain is
+    flagged, so the residual risk is a counted number rather than a hope.
 """
 
 import argparse
@@ -102,7 +104,7 @@ def parsed_for(file_id: str):
 
 names, maps, qlens, flags = [], [], [], []
 stat = dict(ok=0, ambiguous=0, not_subseq=0, no_mmcif=0, no_chain=0, no_npz=0,
-            old_ridx_would_be_ok=0)
+            from_ridx=0, from_align=0)
 failures = []
 
 for n, i in enumerate(mine):
@@ -127,28 +129,46 @@ for n, i in enumerate(mine):
     d = np.load(npz, allow_pickle=False)
     aat = d["aatype"].astype(int)
     npz_seq = "".join(rc.restypes[x] if x < len(rc.restypes) else "X" for x in aat)
-    m = subsequence_map(npz_seq, query)
-    if m is None:
-        stat["not_subseq"] += 1
-        failures.append((chain, "npz seq is not a subsequence of the query",
-                         f"npz {len(npz_seq)} vs query {len(query)}"))
-        continue
-    assert (np.diff(m) > 0).all() and 0 <= m.min() and m.max() < len(query)
 
-    # ambiguous iff the rightmost embedding differs from the leftmost one
-    rm = rightmost_map(npz_seq, query)
-    amb = rm is None or not np.array_equal(rm, m)
+    # ⭐⭐ PREFER `residue_index - 1` WHENEVER IT IS SEQUENCE-VALID, and fall back to the alignment
+    # only when it is not. Reason: `ridx - 1` was measured sequence-exact on 1500/1500 randomly
+    # sampled chains, while a deletion inside a run of identical residues makes the ALIGNMENT
+    # ambiguous for a large minority (17-48% across shards) -- and there my leftmost pick is
+    # arbitrary. `ridx - 1` carries independent structural information, so where it is consistent it
+    # is the better estimate; switching to an arbitrary embedding there would INTRODUCE errors in
+    # chains that were already placed correctly. The alignment exists for the cases `ridx - 1`
+    # provably cannot explain (1eis_A: contiguous numbering across a real gap, 15/85 agreement).
+    r = d["residue_index"].astype(int) - 1
+    ridx_ok = (
+        len(r) == len(npz_seq)
+        and r.min() >= 0 and r.max() < len(query)
+        and (np.diff(r) > 0).all()
+        and all(_match(sc, query[qi]) for sc, qi in zip(npz_seq, r))
+    )
+    if ridx_ok:
+        m, amb, src = r.astype(np.int32), False, "ridx"
+    else:
+        m = subsequence_map(npz_seq, query)
+        if m is None:
+            stat["not_subseq"] += 1
+            failures.append((chain, "ridx-1 invalid AND npz seq is not a subsequence of the query",
+                             f"npz {len(npz_seq)} vs query {len(query)}"))
+            continue
+        rm = rightmost_map(npz_seq, query)
+        amb = rm is None or not np.array_equal(rm, m)
+        src = "align"
+    assert (np.diff(m) > 0).all() and 0 <= m.min() and m.max() < len(query)
+    assert all(_match(sc, query[qi]) for sc, qi in zip(npz_seq, m)), chain
+
     stat["ambiguous"] += amb
     stat["ok"] += 1
-    # how often the OLD ridx-1 would have been right, so the blast radius is measured
-    r = d["residue_index"].astype(int) - 1
-    if r.min() >= 0 and r.max() < len(query) and np.array_equal(r, m):
-        stat["old_ridx_would_be_ok"] += 1
+    stat["from_ridx"] += (src == "ridx")
+    stat["from_align"] += (src == "align")
 
     names.append(chain)
     maps.append(m)
     qlens.append(len(query))
-    flags.append(1 if amb else 0)
+    flags.append((2 if src == "align" else 0) | (1 if amb else 0))
     if (n + 1) % a.progress_every == 0:
         print(f"  {n+1}/{len(mine)}  ok={stat['ok']} amb={stat['ambiguous']} "
               f"bad={stat['not_subseq']}", flush=True)
@@ -161,6 +181,7 @@ np.savez(
     qmap=np.concatenate(maps) if maps else np.zeros(0, np.int32),
     qmap_len=lens,
     query_len=np.array(qlens, np.int32),
+    # bit0 = ambiguous alignment, bit1 = placement came from the alignment not ridx-1
     ambiguous=np.array(flags, np.int8),
 )
 print(f"\nshard {a.shard}: wrote {len(names)} chains to {a.out}")
