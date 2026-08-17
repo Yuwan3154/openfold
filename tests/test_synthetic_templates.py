@@ -167,6 +167,7 @@ def test_pruned_tree_translates_the_rung_to_its_compacted_row(tmp_path):
         chains=np.array([chain]), tm=tm,
         rewind=np.arange(90, 90 + N_TMPL, dtype=np.int16)[None],
         length=np.array([L], np.int32), slot=slot,
+        min_tm=np.float32(0.3), max_tm=np.float32(0.9),
     )
     atom_mask = np.zeros((L, 37), bool)
     atom_mask[:, :5] = True

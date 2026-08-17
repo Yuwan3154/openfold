@@ -51,6 +51,10 @@ class SyntheticTemplatePool:
             # ⛔ A pruned tree physically contains only its own band, so asking for a WIDER band
             # would select rungs whose npz rows were never written. Fail at construction with the
             # actual numbers rather than on some later training step's assert.
+            assert "min_tm" in z.files and "max_tm" in z.files, (
+                "index carries `slot` (pruned) but does not record the band it was pruned to, so "
+                "the widening guard cannot run -- rebuild it with prune_templates_to_band.py"
+            )
             # ⛔ compare in float32, not float64: np.float32(0.3) is 0.30000001192, which is
             # GREATER than the python float 0.3, so a float64 comparison rejects an exactly
             # matching band. Casting both sides to the stored precision makes equality exact.
