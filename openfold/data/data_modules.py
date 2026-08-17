@@ -953,6 +953,7 @@ class OpenFoldDataModule(pl.LightningDataModule):
                  val_chain_list_path: Optional[str] = None,
                  t2_template_index: Optional[str] = None,
                  t2_templates_root: Optional[str] = None,
+                 t2_qmap: Optional[str] = None,
                  t2_min_tm: float = 0.3,
                  t2_max_tm: float = 0.9,
                  t2_n_synthetic: int = 0,
@@ -1033,8 +1034,14 @@ class OpenFoldDataModule(pl.LightningDataModule):
         self.synthetic_template_pool = None
         if t2_template_index is not None and t2_n_synthetic > 0:
             from openfold.data.synthetic_templates import SyntheticTemplatePool
+            assert t2_qmap is not None, (
+                "--t2_qmap is REQUIRED with --t2_n_synthetic > 0. Without it the npz rows are "
+                "placed by residue_index - 1, which desynchronises at the first unresolved residue "
+                "(see prune_work/build_query_index_map.py)."
+            )
             self.synthetic_template_pool = SyntheticTemplatePool(
                 t2_template_index, t2_templates_root, min_tm=t2_min_tm, max_tm=t2_max_tm,
+                qmap_path=t2_qmap,
             )
             elig = self.synthetic_template_pool.eligible
             n_ok = sum(len(e) > 0 for e in elig)

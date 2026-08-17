@@ -368,3 +368,81 @@ def test_native_numbering_beyond_the_query_is_refused(tmp_path):
     p, chain, qseq, _ = _partial_native_pool(tmp_path, 104, 9, 89)
     with pytest.raises(AssertionError, match="does not fit a query of length"):
         p.sample_features(chain, 1, np.random.default_rng(0), query_sequence=qseq[:50])
+
+
+# ---- the query-index map (build_query_index_map.py) --------------------------------------------
+
+def _qmap_npz(tmp_path, chain, qmap, query_len, ambiguous=0):
+    path = tmp_path / "qmap_all.npz"
+    np.savez(path, chains=np.array([chain]), qmap=np.asarray(qmap, np.int32),
+             qmap_len=np.array([len(qmap)], np.int32),
+             query_len=np.array([query_len], np.int32),
+             ambiguous=np.array([ambiguous], np.int8))
+    return str(path)
+
+
+def test_qmap_overrides_residue_index_and_places_rows_correctly(tmp_path):
+    """⛔ THE bug that broke two T2 launches: residue_index is protpardelle's structure parse, so
+    ridx-1 desynchronises at the first unresolved residue. The qmap is authoritative.
+
+    Fixture is the real 1eis_A shape: npz numbered CONTIGUOUSLY while actually skipping a query
+    position, so ridx-1 and the true map disagree and the difference is observable.
+    """
+    p, chain, qseq, resnums = _partial_native_pool(tmp_path, 104, 9, 89)
+    # the true map: shift every row one further along than ridx-1 would say, i.e. a genuine gap
+    true_q = (resnums - 1) + 1
+    assert true_q.max() < len(qseq)
+    # aatype must agree with the query at the TRUE positions, so rebuild the npz accordingly
+    d = np.load(p.npz_path(chain), allow_pickle=False)
+    new_aat = np.array([rc.restype_order[qseq[i]] for i in true_q], np.int8)
+    np.savez(p.npz_path(chain), coords=d["coords"], atom_mask=d["atom_mask"], aatype=new_aat,
+             residue_index=d["residue_index"], rewind_steps=d["rewind_steps"])
+
+    qm = _qmap_npz(tmp_path, chain, true_q, len(qseq))
+    pool = SyntheticTemplatePool(str(tmp_path / "index_all.npz"), str(tmp_path / "templates"),
+                                 min_tm=0.3, max_tm=0.9, qmap_path=qm)
+    f = pool.sample_features(chain, 1, np.random.default_rng(0), query_sequence=qseq)
+    seq = f["template_sequence"][0].decode()
+    covered = true_q
+    assert all(seq[i] == qseq[i] for i in covered)
+    # and the positions ridx-1 would have used, but the qmap did not, must be gaps
+    only_old = np.setdiff1d(resnums - 1, covered)
+    assert len(only_old) > 0, "fixture must make the two maps differ"
+    assert all(seq[i] == "-" for i in only_old), "used the stale ridx-1 placement"
+
+
+def test_chain_absent_from_a_supplied_qmap_is_unavailable(tmp_path):
+    """⛔ A missing map must mean 'no synthetic templates for this chain', NEVER a silent fallback
+    to the arithmetic that caused the original bug."""
+    p, chain, qseq, resnums = _partial_native_pool(tmp_path, 104, 9, 89)
+    qm = _qmap_npz(tmp_path, "someother_A", np.arange(5), 104)
+    pool = SyntheticTemplatePool(str(tmp_path / "index_all.npz"), str(tmp_path / "templates"),
+                                 min_tm=0.3, max_tm=0.9, qmap_path=qm)
+    assert chain not in pool
+    assert pool.sample_features(chain, 1, np.random.default_rng(0), query_sequence=qseq) is None
+
+
+def test_stale_qmap_query_length_is_refused(tmp_path):
+    p, chain, qseq, resnums = _partial_native_pool(tmp_path, 104, 9, 89)
+    qm = _qmap_npz(tmp_path, chain, resnums - 1, 999)          # wrong query_len on purpose
+    pool = SyntheticTemplatePool(str(tmp_path / "index_all.npz"), str(tmp_path / "templates"),
+                                 min_tm=0.3, max_tm=0.9, qmap_path=qm)
+    with pytest.raises(AssertionError, match="stale"):
+        pool.sample_features(chain, 1, np.random.default_rng(0), query_sequence=qseq)
+
+
+def test_qmap_row_count_must_match_the_npz(tmp_path):
+    p, chain, qseq, resnums = _partial_native_pool(tmp_path, 104, 9, 89)
+    qm = _qmap_npz(tmp_path, chain, (resnums - 1)[:-3], len(qseq))   # 3 rows short
+    pool = SyntheticTemplatePool(str(tmp_path / "index_all.npz"), str(tmp_path / "templates"),
+                                 min_tm=0.3, max_tm=0.9, qmap_path=qm)
+    with pytest.raises(AssertionError, match="qmap has"):
+        pool.sample_features(chain, 1, np.random.default_rng(0), query_sequence=qseq)
+
+
+def test_no_qmap_at_all_still_uses_residue_index(tmp_path):
+    """Legacy/no-map path stays intact so the existing tests and any pre-qmap index keep working."""
+    p, chain, qseq, resnums = _partial_native_pool(tmp_path, 104, 9, 89)
+    assert not p.qmap
+    f = p.sample_features(chain, 1, np.random.default_rng(0), query_sequence=qseq)
+    assert f["template_all_atom_positions"].shape[1] == len(qseq)

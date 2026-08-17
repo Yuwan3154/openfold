@@ -1338,6 +1338,15 @@ if __name__ == "__main__":
         help="T2: root of the generated template shards (shardNNNN/<chain>.npz)."
     )
     parser.add_argument(
+        "--t2_qmap", type=str, default=None,
+        help="T2: qmap_all.npz from prune_work/build_query_index_map.py, mapping each generated "
+             "template's npz rows to QUERY sequence positions. Required for correctness whenever "
+             "--t2_n_synthetic > 0: the npz's own residue_index comes from protpardelle's structure "
+             "parse and desynchronises at the first unresolved residue. Chains absent from this map "
+             "are treated as having no synthetic templates rather than being placed by the old "
+             "arithmetic.",
+    )
+    parser.add_argument(
         "--t2_min_tm", type=float, default=0.3,
         help="T2: keep only synthetic templates with TM(template, native) ABOVE this. Default 0.3 "
              "(user-set 2026-08-14: below it the template is too difficult to be a useful hint)."

@@ -39,7 +39,8 @@ class SyntheticTemplatePool:
     """Index of generated templates, plus per-chain sampling of template features."""
 
     def __init__(self, index_path: str, templates_root: str,
-                 min_tm: float = 0.3, max_tm: float = 0.9):
+                 min_tm: float = 0.3, max_tm: float = 0.9,
+                 qmap_path: str | None = None):
         z = np.load(index_path, allow_pickle=False)
         self.tm = z["tm"]                                        # (n_chain, 64)
         self.rewind = z["rewind"]
@@ -74,8 +75,30 @@ class SyntheticTemplatePool:
             np.flatnonzero((self.tm[i] > min_tm) & (self.tm[i] < max_tm)) for i in range(len(chains))
         ]
 
+        # ⛔⛔ The npz-row -> query-position map. This is NOT optional bookkeeping: the npz's own
+        # `residue_index` is protpardelle's structure parse (see build_query_index_map.py), and
+        # `residue_index - 1` desynchronises at the first unresolved residue. A chain with no entry
+        # here is treated as UNAVAILABLE rather than falling back to that arithmetic -- a silent
+        # fallback to a subtly wrong mapping is exactly what cost this project a debugging detour.
+        self.qmap: dict[str, np.ndarray] = {}
+        self.qmap_query_len: dict[str, int] = {}
+        self.qmap_ambiguous: dict[str, bool] = {}
+        if qmap_path is not None:
+            zq = np.load(qmap_path, allow_pickle=False)
+            flat, lens = zq["qmap"], zq["qmap_len"]
+            offs = np.concatenate([[0], np.cumsum(lens)])
+            amb = zq["ambiguous"] if "ambiguous" in zq.files else np.zeros(len(lens), np.int8)
+            for j, c in enumerate(zq["chains"]):
+                c = str(c)
+                self.qmap[c] = flat[offs[j]:offs[j + 1]]
+                self.qmap_query_len[c] = int(zq["query_len"][j])
+                self.qmap_ambiguous[c] = bool(amb[j])
+
     def __contains__(self, chain: str) -> bool:
-        return chain in self.row_of and len(self.eligible[self.row_of[chain]]) > 0
+        if chain not in self.row_of or len(self.eligible[self.row_of[chain]]) == 0:
+            return False
+        # no query map => cannot place this chain's templates correctly => it has none
+        return not self.qmap or chain in self.qmap
 
     def npz_path(self, chain: str) -> Path:
         import zlib
@@ -118,12 +141,20 @@ class SyntheticTemplatePool:
 
         qL = len(query_sequence)
         aat = d["aatype"].astype(int)
-        # native PDB numbering is 1-based over the query's own sequence (write_coords_to_pdb wrote
-        # residue_index + 1), so the query's 0-based position is ridx - 1
-        q = d["residue_index"].astype(int) - 1
+        if chain in self.qmap:
+            q = self.qmap[chain].astype(int)
+            assert self.qmap_query_len[chain] == qL, (
+                f"{chain}: qmap was built against a query of length "
+                f"{self.qmap_query_len[chain]} but this query is {qL} -- the map is stale"
+            )
+        else:
+            # only reachable when NO qmap was supplied at all (legacy/tests). ⛔ Not a fallback for
+            # a chain merely absent from a supplied map -- __contains__ excludes those.
+            assert not self.qmap, f"{chain}: absent from the qmap; should have been filtered"
+            q = d["residue_index"].astype(int) - 1
+        assert len(q) == len(aat), f"{chain}: qmap has {len(q)} rows, npz has {len(aat)}"
         assert q.min() >= 0 and q.max() < qL, (
-            f"{chain}: npz residue_index {q.min()+1}-{q.max()+1} does not fit a query of length "
-            f"{qL} -- the numbering convention is not what this code assumes"
+            f"{chain}: mapped query positions {q.min()}-{q.max()} do not fit a query of length {qL}"
         )
         # ⭐ Sequence agreement is the real check on that mapping: an off-by-one would still be
         # in-bounds and would silently place every residue's coordinates one slot over. Cheap
