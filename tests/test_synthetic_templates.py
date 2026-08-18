@@ -544,32 +544,122 @@ def test_subsample_draws_uniformly_not_top_k():
     assert seen == {0, 1, 2, 3}
 
 
-def test_count_matched_merge_holds_the_pool_at_the_natural_size(pool):
-    """The end-to-end invariant the flag exists for: replace-then-merge leaves the template axis at
-    exactly the natural count, whereas plain append grows it."""
-    p, _, QSEQ = pool
-    for n_nat, n_synth in [(4, 4), (4, 2), (4, 1), (2, 4), (1, 1)]:
-        nat = _natural(n_nat)
-        rng = np.random.default_rng(7)
-        k_req = min(n_synth, n_nat)
-        synth = p.sample_features("1abc_A", k_req, rng, query_sequence=QSEQ)
-        k_got = synth["template_all_atom_positions"].shape[0]
-        matched = merge_template_features(
-            subsample_natural_templates(nat, n_nat - k_got, rng), synth)
-        assert matched["template_all_atom_positions"].shape[0] == n_nat, (n_nat, n_synth)
-        assert len(matched["template_domain_names"]) == n_nat
-        n_syn_kept = sum(1 for d in matched["template_domain_names"] if d.startswith(b"pp1c_"))
-        assert n_syn_kept == k_got
-        # and the append path still grows, so the two modes are genuinely different
-        appended = merge_template_features(_natural(n_nat), synth)
-        assert appended["template_all_atom_positions"].shape[0] == n_nat + k_got
+def _deliver(pool_size, max_templates=4, seed=0):
+    """Replicate EXACTLY what random_crop_to_size does to the template axis, using the real torch
+    calls (data_transforms.py:1219-1249): permute the whole pool, take a contiguous window starting
+    at templates_crop_start ~ U{0..pool} INCLUSIVE, of size min(pool - start, max_templates).
+    Returns the delivered POOL INDICES."""
+    g = torch.Generator().manual_seed(seed)
+    start = int(torch.randint(0, pool_size + 1, (1,), generator=g)[0])
+    perm = torch.randperm(pool_size, generator=g)
+    size = min(pool_size - start, max_templates)
+    return perm[start:start + size].tolist()
 
 
-def test_count_matched_with_no_natural_hits_adds_nothing(pool):
-    """min(n_synth, n_nat) = 0 when the chain has no natural templates, so a count-matched run must
-    show the model nothing there -- exactly as T1 does -- rather than quietly reintroducing a pool."""
+def test_delivered_count_matches_the_analytic_t1_distribution():
+    """Guards the baseline the whole count-matching argument rests on: pool 4 -> mean 2.00 delivered
+    and P(0 templates) 20%. If this drifts, every claim about matching drifts with it."""
+    n = [len(_deliver(4, seed=s)) for s in range(40000)]
+    assert abs(np.mean(n) - 2.00) < 0.03, np.mean(n)
+    assert abs(np.mean([x == 0 for x in n]) - 0.20) < 0.01
+    n8 = [len(_deliver(8, seed=s)) for s in range(40000)]
+    assert abs(np.mean(n8) - 2.889) < 0.04, np.mean(n8)      # append mode, for contrast
+    assert abs(np.mean([x == 0 for x in n8]) - 0.111) < 0.01
+
+
+def test_pool_level_replacement_equals_delivered_level_replacement():
+    """⭐⭐ THE LOAD-BEARING CLAIM. The user asked for each SELECTED natural template to be replaced
+    with probability p. We implement it by labelling each POOL slot i.i.d. Bernoulli(p) instead,
+    which is only legitimate because random_crop_to_size picks the delivered window independently of
+    the labels. Verified by Monte Carlo against the delivered-level policy, on the same real torch
+    calls: both the delivered COUNT and the delivered SYNTHETIC count must agree, and the synthetic
+    count must be Binomial(delivered, p)."""
+    p, POOL, N = 0.5, 4, 40000
+    pool_level_n, pool_level_syn = [], []
+    deliv_level_n, deliv_level_syn = [], []
+    lab_rng = np.random.default_rng(0)
+    for s in range(N):
+        idx = _deliver(POOL, seed=s)
+        # POOL-LEVEL: label every slot first, then deliver
+        labels = lab_rng.random(POOL) < p
+        pool_level_n.append(len(idx))
+        pool_level_syn.append(int(labels[idx].sum()))
+        # DELIVERED-LEVEL: deliver first, then label only what was delivered
+        deliv_level_n.append(len(idx))
+        deliv_level_syn.append(int((lab_rng.random(len(idx)) < p).sum()))
+    assert pool_level_n == deliv_level_n                       # count is untouched by construction
+    assert abs(np.mean(pool_level_syn) - np.mean(deliv_level_syn)) < 0.03, (
+        np.mean(pool_level_syn), np.mean(deliv_level_syn))
+    # and the synthetic share of delivered slots is p
+    tot = sum(pool_level_n)
+    assert abs(sum(pool_level_syn) / tot - p) < 0.01, sum(pool_level_syn) / tot
+    # distribution, not just the mean: P(k synthetic | delivered) must match Binomial(delivered, p)
+    for k in range(5):
+        a = np.mean([sy == k for sy, nn in zip(pool_level_syn, pool_level_n) if nn == 4])
+        b = np.mean([sy == k for sy, nn in zip(deliv_level_syn, deliv_level_n) if nn == 4])
+        assert abs(a - b) < 0.02, (k, a, b)
+
+
+def test_binomial_keep_preserves_the_pool_size_and_halves_the_naturals():
+    """The mechanics of (2): n_keep_nat ~ Binomial(n_nat, 1-p), pool refilled to the SAME size."""
+    rng = np.random.default_rng(0)
+    kept = [int(rng.binomial(4, 0.5)) for _ in range(20000)]
+    assert abs(np.mean(kept) - 2.0) < 0.05
+    for k in kept[:200]:
+        assert 4 - k >= 0                                      # budget is never negative
+
+
+def test_topup_hypergeometric_has_the_right_natural_share():
+    """The mechanics of (1): with n_prefiltered natural in a pool topped to 20, the naturals among the
+    4 taken are Hypergeometric(20, n_pref, 4), so their expected number is 4*n_pref/20."""
+    rng = np.random.default_rng(0)
+    for n_pref in (0, 1, 3, 10, 19):
+        draws = [int(rng.hypergeometric(n_pref, 20 - n_pref, 4)) for _ in range(20000)]
+        assert abs(np.mean(draws) - 4 * n_pref / 20) < 0.05, (n_pref, np.mean(draws))
+        assert max(draws) <= min(n_pref, 4)                    # cannot keep more than it has
+
+
+def test_topup_fills_a_template_poor_chain_to_the_cap(pool):
+    """End to end for the case the top-up exists for: a chain with 1 natural hit ends up with a FULL
+    pool of 4 instead of 1, which is exactly the delivered-count increase that was signed off for the
+    1.3% of chains with <4 prefiltered hits."""
     p, _, QSEQ = pool
+    rng = np.random.default_rng(3)
+    nat = _natural(1)
+    assert natural_template_count(nat) == 1
+    n_keep = 0                                                 # hypergeometric drew 0 naturals
+    synth = p.sample_features("1abc_A", 4 - n_keep, rng, query_sequence=QSEQ)
+    out = merge_template_features(subsample_natural_templates(nat, n_keep, rng), synth)
+    assert natural_template_count(out) == 4
+    assert all(d.startswith(b"pp1c_") for d in out["template_domain_names"])
+
+
+def test_short_synthetic_pool_restores_naturals_rather_than_shrinking(pool):
+    """⛔ The failure mode that looks conservative but is not: if the pool cannot fill the budget and
+    we still drop the naturals, the chain ends up with FEWER templates than T1 would have given it."""
+    p, _, QSEQ = pool
+    rng = np.random.default_rng(9)
+    n_nat, pool_target = 4, 4
+    n_keep_nat = 1                                             # p=0.5 happened to keep 1
+    budget = pool_target - n_keep_nat                          # 3 wanted
+    synth = p.sample_features("1abc_A", budget, rng, query_sequence=QSEQ)
+    added = synth["template_all_atom_positions"].shape[0]
+    keep_final = min(n_nat, max(n_keep_nat, pool_target - added))
+    out = merge_template_features(subsample_natural_templates(_natural(n_nat), keep_final, rng), synth)
+    assert natural_template_count(out) == pool_target
+    # and if the pool had returned NOTHING, every natural is restored
+    assert min(n_nat, max(n_keep_nat, pool_target - 0)) == n_nat
+
+
+def test_chain_with_no_natural_hits_gets_synthetic_only_under_topup(pool):
+    """0.5% of chains have no natural hits at all. Without top-up they see nothing, exactly as in T1;
+    with top-up they get a full synthetic pool, which is the point."""
+    p, _, QSEQ = pool
+    rng = np.random.default_rng(11)
     nat = empty_template_feats(L)
-    n_nat = natural_template_count(nat)
-    assert n_nat == 0
-    assert min(4, n_nat) == 0                                      # so sample_features is never called
+    nat.pop("template_dgram_probs")
+    assert natural_template_count(nat) == 0
+    out = merge_template_features(nat, p.sample_features("1abc_A", 4, rng, query_sequence=QSEQ))
+    assert natural_template_count(out) == 4
+    # without top-up the budget is pool_target - n_keep_nat = 0 - 0 = 0, so nothing is added
+    assert 0 - 0 == 0

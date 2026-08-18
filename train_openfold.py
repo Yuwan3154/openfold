@@ -1455,19 +1455,35 @@ if __name__ == "__main__":
              "P(4 delivered) = (N+1)/(N+5), so zero-template steps fall from 20.6%% to 11%% at N=4."
     )
     parser.add_argument(
-        "--t2_replace_natural", action="store_true", default=False,
-        help="T2 COUNT-MATCHED variant: put the synthetic templates in the pool by REPLACING that "
-             "many natural hits instead of appending, so the pool stays exactly the size it would "
-             "have been without them. Why: `templates_crop_start ~ Uniform{0..pool}` is INCLUSIVE, "
-             "so appending changes the delivered template COUNT as well as its content (pool 4 -> "
-             "mean 2.00 delivered/step and P(0 templates) 20%%; pool 8 -> 2.89 and 11.1%%). With "
-             "this flag T1 and this run share one delivered-count distribution and differ ONLY in "
-             "template content, which is what makes a measured gap attributable. The natural hits "
-             "that survive are a UNIFORM random subset (not the top-k by sum_probs), so the natural "
-             "component is distributed exactly as in T1. Requested count is clamped to the number "
-             "of natural hits available, and the drop uses however many synthetic templates "
-             "actually arrived -- a chain with few eligible templates keeps its pool size either "
-             "way. Default off, so the append-mode run already in flight is unaffected."
+        "--t2_replace_prob", type=float, default=0.0,
+        help="T2 mixing (user, 2026-08-18): probability that each SELECTED natural template is "
+             "replaced by a synthetic one. 0.5 = the sanctioned even mixture. "
+             "⭐ Why this and not a count: the delivered-template COUNT distribution stays exactly "
+             "T1's (mean 2.00/step, P(0 templates) 20%%) while the delivered synthetic count is "
+             "Binomial(delivered, p) -- so a T1-vs-this gap is attributable to template CONTENT "
+             "alone. Applied per pool slot, which is distributionally IDENTICAL to applying it to the "
+             "delivered set, because random_crop_to_size chooses what to deliver independently of "
+             "whether a slot is natural or synthetic. 0.0 = off (default), i.e. append mode."
+    )
+    parser.add_argument(
+        "--t2_topup_to", type=int, default=0,
+        help="T2 mixing (user, 2026-08-18): when a chain has FEWER than this many prefiltered "
+             "natural hits, top its pre-shuffle template pool up to this size with synthetic ones. "
+             "20 matches config.data.train.shuffle_top_k_prefiltered, the pool the featurizer "
+             "actually shuffles and truncates, so this fills the template-poor case the synthetic "
+             "templates exist for -- measured 11.6%% of chains have <20 (0.5%% have none at all). "
+             "⚠️ For the 1.3%% of chains with <4 prefiltered hits this also RAISES the delivered "
+             "count above T1's; that is the intended effect, and the other 98.7%% stay count-matched. "
+             "Requires --t2_prefiltered_counts. 0 = off (default)."
+    )
+    parser.add_argument(
+        "--t2_prefiltered_counts", type=str, default=None,
+        help="T2: npz from prune_work/build_prefiltered_counts.py mapping chain -> number of hits "
+             "surviving _prefilter_hit. Required by --t2_topup_to, whose rule is defined on that "
+             "number; the featurizer computes it internally and does not report it, and it is static "
+             "given the release-date cutoff, so it is precomputed rather than plumbed out of a core "
+             "path. The stored cutoff is asserted against --max_template_date, so a stale table is "
+             "an error and not a silently wrong count."
     )
     parser.add_argument(
         "--t4_self_distill", action="store_true", default=False,
@@ -1494,9 +1510,10 @@ if __name__ == "__main__":
              "ratio, the analogue of --t2_n_synthetic. 0 = disabled (default): the gate still "
              "measures and, with --t4_pool_dir, still WRITES, but nothing is read back -- which is "
              "the right setting for one epoch of pool-filling before the first consuming run. "
-             "⚠️ With --t2_replace_natural the total added is budgeted against the natural count so "
-             "the pool size is unchanged; without it the pool GROWS and the delivered template count "
-             "shifts as well as its content."
+             "⚠️ Under --t2_replace_prob/--t2_topup_to this CAPS how much of the replacement budget "
+             "goes to promoted templates rather than adding on top of it, which is what keeps the "
+             "pool size -- and so the delivered-count distribution -- equal to T1's. In append mode "
+             "it is additive and the delivered count shifts as well as the content."
     )
     parser.add_argument(
         "--t4_max_per_chain", type=int, default=0,

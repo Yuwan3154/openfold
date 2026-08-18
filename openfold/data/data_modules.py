@@ -65,7 +65,9 @@ class OpenFoldSingleDataset(torch.utils.data.Dataset):
                  enable_recursive_search: bool = True,
                  synthetic_template_pool: Optional[Any] = None,
                  n_synthetic_templates: int = 0,
-                 t2_replace_natural: bool = False,
+                 t2_replace_prob: float = 0.0,
+                 t2_topup_to: int = 0,
+                 prefiltered_counts_path: Optional[str] = None,
                  promoted_template_pool: Optional[Any] = None,
                  n_promoted_templates: int = 0,
                  ):
@@ -117,11 +119,43 @@ class OpenFoldSingleDataset(torch.utils.data.Dataset):
         # T2: pool of Protpardelle synthetic templates mixed into this chain's template hits
         self.synthetic_template_pool = synthetic_template_pool
         self.n_synthetic_templates = n_synthetic_templates
-        # T2 count-matched variant: substitute for natural hits instead of appending to them
-        self.t2_replace_natural = t2_replace_natural
+        # T2 mixing policy (user, 2026-08-18): replace each SELECTED natural template with
+        # probability `t2_replace_prob`, and top a template-poor chain's pre-shuffle pool up to
+        # `t2_topup_to`. See the hook in __getitem__ for why both are exact at this insertion point.
+        self.t2_replace_prob = t2_replace_prob
+        self.t2_topup_to = t2_topup_to
         # T4 phase 3: promoted predictions, mixed in beside the synthetic ones (see the hook below)
         self.promoted_template_pool = promoted_template_pool
         self.n_promoted_templates = n_promoted_templates
+
+        # ⭐⭐ PREFILTERED-HIT COUNTS AS AN INDEX-ALIGNED NUMPY ARRAY, NOT A DICT. The top-up rule
+        # needs the number of hits that survived `_prefilter_hit` -- the pool that
+        # `shuffle_top_k_prefiltered` truncates -- which is computed inside the featurizer and is not
+        # in the features it returns. It is static (it depends only on the hits, the fixed release-date
+        # cutoff and the query), so it is precomputed by
+        # `prune_work/build_prefiltered_counts.py` and looked up here.
+        # `__getitem__` already has the dataset index, so aligning the table to `self._chain_ids`
+        # makes the lookup a single array read and adds NO 88k-entry Python dict for the dataloader
+        # workers to copy-on-write (the [[proteina_dataloader_cow_leak]] pattern, and the leading
+        # suspect for T2's measured RSS growth).
+        self._n_prefiltered = None
+        self._n_prefiltered_missing = 0
+        if prefiltered_counts_path is not None:
+            _z = np.load(prefiltered_counts_path, allow_pickle=False)
+            _stored_cutoff = str(_z["cutoff"])
+            assert _stored_cutoff == str(max_template_date), (
+                f"prefiltered-count table was built for cutoff {_stored_cutoff} but this run uses "
+                f"{max_template_date}. The prefilter applies the date cutoff, so the counts would be "
+                f"wrong -- rebuild it rather than reusing the file."
+            )
+            _tbl = dict(zip((str(c) for c in _z["chains"]),
+                            _z["n_prefiltered"].astype(int).tolist()))
+            self._n_prefiltered = np.array(
+                [_tbl.get(c, -1) for c in self._chain_ids], np.int32)
+            del _tbl
+            # counted ONCE here rather than per step, so a table that does not cover this chain list
+            # is a number visible at launch instead of a silent per-example fallback
+            self._n_prefiltered_missing = int((self._n_prefiltered < 0).sum())
 
         self.chain_data_cache = None
         if chain_data_cache_path is not None:
@@ -342,13 +376,18 @@ class OpenFoldSingleDataset(torch.utils.data.Dataset):
         # `subsample_templates` draws uniformly over the combined list -- the requested "uniform over
         # the mixture" policy with no change to the sampler.
         # ⭐ Both pools expose the identical `(chain, n, rng, query_sequence)` signature and emit the
-        # identical natural-hit layout, so this loop is source-agnostic: T4 stacks on T1 (synthetic
-        # pool absent) or on T2 (both active) with no branching here.
+        # identical natural-hit layout, so this is source-agnostic: T4 stacks on T1 (synthetic pool
+        # absent) or on T2 (both active) with no branching here.
+        # ⚠️ `--t2_n_synthetic` is the APPEND-mode count only. Under the probabilistic policy the
+        # number added comes from the replacement budget instead, so the pool must be active even
+        # when that flag is 0 -- otherwise setting only --t2_replace_prob would silently do nothing.
+        _probabilistic = self.t2_replace_prob > 0.0 or self.t2_topup_to > 0
         extra_pools = []
-        if self.synthetic_template_pool is not None and self.n_synthetic_templates > 0:
-            extra_pools.append((self.synthetic_template_pool, self.n_synthetic_templates))
+        if self.synthetic_template_pool is not None and (_probabilistic
+                                                         or self.n_synthetic_templates > 0):
+            extra_pools.append(("synthetic", self.synthetic_template_pool))
         if self.promoted_template_pool is not None and self.n_promoted_templates > 0:
-            extra_pools.append((self.promoted_template_pool, self.n_promoted_templates))
+            extra_pools.append(("promoted", self.promoted_template_pool))
 
         if extra_pools:
             # ⛔ The query sequence is REQUIRED, not a convenience: the npz is on the native
@@ -358,38 +397,95 @@ class OpenFoldSingleDataset(torch.utils.data.Dataset):
             qseq = data["sequence"][0]
             qseq = qseq.decode() if isinstance(qseq, bytes) else str(qseq)
             n_nat = natural_template_count(data)
-            # ⭐⭐ COUNT-MATCHED MODE (--t2_replace_natural). Appending grows the pool, and
-            # `templates_crop_start ~ Uniform{0..pool}` INCLUSIVE means a bigger pool also changes
-            # the delivered COUNT (pool 4 -> mean 2.00/step, P(0 templates) 20%; pool 8 -> 2.89 and
-            # 11.1%). So append mode differs from T1 in template CONTENT *and* COUNT, and a gap
-            # cannot be attributed to content. In replace mode the TOTAL added is budgeted against
-            # the natural count and exactly that many naturals are dropped, so the pool size -- and
-            # the whole delivered-count distribution -- is IDENTICAL to T1's.
-            # ⚠️ The budget is spent in list order (synthetic before promoted), which only binds when
-            # the requested totals exceed the natural count.
-            budget = n_nat if self.t2_replace_natural else None
-            added = 0
-            extras = []
-            # one rng for every draw here so the whole decision is reproducible under --seed
+            # one rng for every draw here, so the whole mixing decision is reproducible under --seed
             rng = np.random.default_rng(int(torch.randint(0, 2 ** 31 - 1, (1,)).item()))
-            for pool, n_want in extra_pools:
-                n_req = n_want if budget is None else min(n_want, budget - added)
-                if n_req <= 0:
-                    continue
-                extra = pool.sample_features(name, n_req, rng, query_sequence=qseq)
-                if extra is None:
-                    continue
-                added += int(extra["template_all_atom_positions"].shape[0])
-                extras.append(extra)
-            # ⛔ Every pool is sampled BEFORE anything is dropped, and the drop uses what actually
-            # ARRIVED rather than what was requested: a chain with fewer eligible templates gets
-            # fewer back, and dropping the requested count would shrink the pool below T1's and
-            # break the matching in the other direction. Sampling first also keeps
-            # `subsample_natural_templates` operating on a purely natural template axis.
-            if self.t2_replace_natural and added:
-                data = subsample_natural_templates(data, n_nat - added, rng)
-            for extra in extras:
-                data = merge_template_features(data, extra)
+
+            if _probabilistic:
+                # ================= PROBABILISTIC + TOP-UP MIXING (user, 2026-08-18) =============
+                # Two rules, applied in this order:
+                #
+                # (1) TOP-UP. When a chain has fewer than `t2_topup_to` prefiltered natural hits, the
+                #     pre-shuffle pool is treated as topped up to that size with synthetic templates.
+                #     The featurizer then takes `max_templates` from the shuffled pool, so the number
+                #     of NATURALS among them is Hypergeometric(N=topup_to, K=n_prefiltered,
+                #     n=max_templates).
+                #     ⭐⭐ WHY DRAWING IT HERE IS EXACT, not an approximation. The featurizer already
+                #     handed us a uniformly random `min(n_prefiltered, max_templates)` of the chain's
+                #     top-`n_prefiltered` hits (it permutes `idx[:shuffle_top_k]` then takes the cap).
+                #     A uniformly random j of a uniformly random 4 of the top-n IS a uniformly random
+                #     j of the top-n -- so keeping a random j of what we were given has exactly the
+                #     distribution the real top-up would have produced. This is what lets the rule be
+                #     implemented on the featurizer's OUTPUT instead of inside `templates.py`.
+                #
+                # (2) PROBABILISTIC REPLACEMENT. Each surviving natural is independently replaced by a
+                #     synthetic template with probability `t2_replace_prob`.
+                #     ⭐⭐ WHY DOING IT AT POOL LEVEL EQUALS DOING IT TO THE DELIVERED SET (the user's
+                #     "replace the selected natural templates post-filter"): `random_crop_to_size`
+                #     chooses which pool entries to deliver INDEPENDENTLY of whether a given entry is
+                #     natural or synthetic, so labelling each pool slot i.i.d. Bernoulli(p) and then
+                #     taking a random subset gives delivered labels that are also i.i.d. Bernoulli(p).
+                #     The delivered COUNT distribution is untouched -- it is still exactly T1's -- and
+                #     the delivered synthetic count is Binomial(delivered, p). No post-crop hook and
+                #     no re-cropping of synthetic features is needed to get the requested behaviour.
+                max_t = int(self.config.train.max_templates)
+                n_pref = int(self._n_prefiltered[idx]) if self._n_prefiltered is not None else -1
+
+                if self.t2_topup_to > 0 and 0 <= n_pref < self.t2_topup_to:
+                    pool_target = max_t
+                    n_keep_nat = int(rng.hypergeometric(
+                        ngood=max(n_pref, 0), nbad=self.t2_topup_to - max(n_pref, 0),
+                        nsample=max_t))
+                    n_keep_nat = min(n_keep_nat, n_nat)
+                else:
+                    # either the chain is template-rich (no top-up owed) or its count is unknown
+                    # (counted once at startup, never guessed per step) -- in both cases the pool
+                    # stays exactly the size the featurizer produced, i.e. T1's
+                    pool_target = n_nat
+                    n_keep_nat = n_nat
+
+                if self.t2_replace_prob > 0.0 and n_keep_nat > 0:
+                    n_keep_nat = int(rng.binomial(n_keep_nat, 1.0 - self.t2_replace_prob))
+
+                budget = pool_target - n_keep_nat
+                extras, added = [], 0
+                for kind, pool in extra_pools:
+                    if added >= budget:
+                        break
+                    # ⚠️ With T4 active, --t4_n_promoted CAPS how much of the replacement budget goes
+                    # to promoted templates rather than adding on top of it -- that is what keeps the
+                    # pool size (and so the delivered-count distribution) equal to T1's.
+                    n_req = budget - added
+                    if kind == "promoted":
+                        n_req = min(n_req, self.n_promoted_templates)
+                    if n_req <= 0:
+                        continue
+                    extra = pool.sample_features(name, n_req, rng, query_sequence=qseq)
+                    if extra is None:
+                        continue
+                    added += int(extra["template_all_atom_positions"].shape[0])
+                    extras.append(extra)
+
+                # ⛔ Restore naturals for any part of the budget the pools could not fill. Dropping
+                # `n_keep_nat`'s worth regardless would leave a chain with few eligible synthetic
+                # templates holding a pool SMALLER than T1's -- breaking the matching in the other
+                # direction, which is the failure mode that is easy to miss because it looks
+                # conservative.
+                keep_final = min(n_nat, max(n_keep_nat, pool_target - added))
+                if keep_final < n_nat:
+                    data = subsample_natural_templates(data, keep_final, rng)
+                for extra in extras:
+                    data = merge_template_features(data, extra)
+            else:
+                # ===================== APPEND MODE (the live T2 run) ===========================
+                # Grows the pool, which shifts the delivered COUNT as well as the content, because
+                # `templates_crop_start ~ Uniform{0..pool}` is INCLUSIVE. Kept unchanged so the run
+                # already in flight is reproducible.
+                for kind, pool in extra_pools:
+                    n_want = (self.n_synthetic_templates if kind == "synthetic"
+                              else self.n_promoted_templates)
+                    extra = pool.sample_features(name, n_want, rng, query_sequence=qseq)
+                    if extra is not None:
+                        data = merge_template_features(data, extra)
 
         feats = self.feature_pipeline.process_features(
             data, self.mode
@@ -1003,7 +1099,9 @@ class OpenFoldDataModule(pl.LightningDataModule):
                  t2_min_tm: float = 0.3,
                  t2_max_tm: float = 0.9,
                  t2_n_synthetic: int = 0,
-                 t2_replace_natural: bool = False,
+                 t2_replace_prob: float = 0.0,
+                 t2_topup_to: int = 0,
+                 t2_prefiltered_counts: Optional[str] = None,
                  t4_promoted_pool: Optional[Any] = None,
                  t4_n_promoted: int = 0,
                  enable_recursive_search: bool = True,
@@ -1080,14 +1178,23 @@ class OpenFoldDataModule(pl.LightningDataModule):
 
         # T2: built once here (the index is a single npz) and shared by the dataloader workers
         self.n_synthetic_templates = t2_n_synthetic
-        self.t2_replace_natural = t2_replace_natural
+        self.t2_replace_prob = t2_replace_prob
+        self.t2_topup_to = t2_topup_to
+        self.t2_prefiltered_counts = t2_prefiltered_counts
+        assert not (t2_topup_to > 0 and t2_prefiltered_counts is None), (
+            "--t2_topup_to needs --t2_prefiltered_counts: the rule is defined on the number of "
+            "PREFILTERED natural hits, which the featurizer does not report. Build the table with "
+            "prune_work/build_prefiltered_counts.py."
+        )
         self.t4_promoted_pool = t4_promoted_pool
         self.t4_n_promoted = t4_n_promoted
         self.synthetic_template_pool = None
-        if t2_template_index is not None and t2_n_synthetic > 0:
+        if t2_template_index is not None and (t2_n_synthetic > 0 or t2_replace_prob > 0.0
+                                              or t2_topup_to > 0):
             from openfold.data.synthetic_templates import SyntheticTemplatePool
             assert t2_qmap is not None, (
-                "--t2_qmap is REQUIRED with --t2_n_synthetic > 0. Without it the npz rows are "
+                "--t2_qmap is REQUIRED whenever the synthetic pool is active "
+                "(--t2_n_synthetic, --t2_replace_prob or --t2_topup_to). Without it the npz rows are "
                 "placed by residue_index - 1, which desynchronises at the first unresolved residue "
                 "(see prune_work/build_query_index_map.py)."
             )
@@ -1109,7 +1216,10 @@ class OpenFoldDataModule(pl.LightningDataModule):
                 f"({in_band} in the {t2_min_tm}-{t2_max_tm} TM band, "
                 f"{in_band - usable} of those dropped for want of a query-index map); "
                 f"per chain median {int(np.median(sizes)) if sizes else 0}, "
-                f"min {min(sizes) if sizes else 0}; adding {t2_n_synthetic} per training example"
+                f"min {min(sizes) if sizes else 0}; "
+                + (f"replace_prob={t2_replace_prob} topup_to={t2_topup_to}"
+                   if (t2_replace_prob > 0.0 or t2_topup_to > 0)
+                   else f"adding {t2_n_synthetic} per training example (append mode)")
             )
 
     def setup(self, stage=None):
@@ -1139,7 +1249,9 @@ class OpenFoldDataModule(pl.LightningDataModule):
                 # clean measurement of what the model can do on its own
                 synthetic_template_pool=self.synthetic_template_pool,
                 n_synthetic_templates=self.n_synthetic_templates,
-                t2_replace_natural=self.t2_replace_natural,
+                t2_replace_prob=self.t2_replace_prob,
+                t2_topup_to=self.t2_topup_to,
+                prefiltered_counts_path=self.t2_prefiltered_counts,
                 promoted_template_pool=self.t4_promoted_pool,
                 n_promoted_templates=self.t4_n_promoted,
             )

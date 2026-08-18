@@ -1,36 +1,37 @@
 #!/bin/bash
 # ============================================================================================
-# T2-MATCHED (2026-08-18 user directive: "Get this ready as a possible next run for a comparison").
-# T2's recipe with ONE change: the synthetic templates REPLACE natural hits instead of being
-# appended, so the template POOL stays exactly the size T1's was.
+# T2-MATCHED (user directives 2026-08-18). T2's recipe with the mixing policy the user specified,
+# plus the all-X chain exclusion. Two rules, applied in this order per training example:
 #
-# ⭐⭐ WHY THIS RUN EXISTS. The live T2 differs from T1 in TWO ways at once, not one:
-#   content: half the delivered templates are synthetic (TM 0.3-0.9, near-uniform difficulty)
-#   COUNT:   `templates_crop_start ~ Uniform{0..pool}` is INCLUSIVE, so appending 4 to a pool of 4
-#            moves the delivered count from mean 2.00/step (P(0 templates) 20%) to mean 2.89 (11.1%)
-# A T1-vs-T2 gap therefore cannot be attributed to template content. `--t2_replace_natural` clamps
-# the request to the number of natural hits available and drops exactly as many naturals as
-# synthetic templates actually arrived, so the pool size -- and hence the whole delivered-count
-# distribution -- is IDENTICAL to T1's, leaving content as the single variable.
-# The surviving natural hits are a UNIFORM random subset, not the top-k by sum_probs, so the natural
-# component is also distributed exactly as in T1 (keeping the best-k would hand this run better
-# templates than T1's average -- a second difference, biased in the flattering direction).
+#   (1) TOP-UP  --t2_topup_to 20
+#       A chain with fewer than 20 PREFILTERED natural hits has its pre-shuffle pool topped up to 20
+#       with synthetic templates. 20 is config.data.train.shuffle_top_k_prefiltered -- the pool the
+#       featurizer actually shuffles before taking max_template_hits=4 -- so this is the template-poor
+#       case the synthetic templates exist for. Measured: 11.6% of chains have <20 prefiltered hits,
+#       0.5% have none at all.
+#       ⚠️ For the 1.3% with <4 hits this RAISES the delivered count above T1's. Intended: the other
+#       98.7% stay count-matched, and those are the chains a fair comparison rests on.
 #
-# ⛔⛔ T2_N_SYNTHETIC MEANS SOMETHING DIFFERENT HERE AND HAS NO DEFAULT ON PURPOSE. In append mode
-# `--t2_n_synthetic 4` gave a 50/50 content mix (4 synthetic beside 4 natural). In REPLACE mode it
-# is the number of natural hits given up, so with the usual 4 natural hits:
-#     T2_N_SYNTHETIC=2  -> 2 synthetic + 2 natural = 50/50 content, count-matched  (the direct
-#                          content-only analogue of the live T2 run)
-#     T2_N_SYNTHETIC=4  -> 4 synthetic + 0 natural = 100% synthetic, count-matched (measures the
-#                          synthetic templates alone, with no natural hits to fall back on)
-#     T2_N_SYNTHETIC=1  -> 1 synthetic + 3 natural = 25% content
-# Which of these to run is a live experimental decision, so this launcher REFUSES to start without
-# it rather than picking one. Set it explicitly:  T2_N_SYNTHETIC=2 ./run_stock_af2_nomsa_t2_matched.sh
+#   (2) PROBABILISTIC REPLACEMENT  --t2_replace_prob 0.5
+#       Each surviving natural template is independently replaced by a synthetic one with p=0.5.
+#       ⭐⭐ The delivered-template COUNT distribution is EXACTLY T1's (mean 2.00/step, P(0)=20%) and
+#       the delivered synthetic count is Binomial(delivered, 0.5). Implemented per POOL slot, which is
+#       distributionally identical to per DELIVERED slot because random_crop_to_size picks its window
+#       independently of which slots are synthetic -- verified by Monte Carlo against the real torch
+#       calls in tests/test_synthetic_templates.py.
+#
+# ⭐ SUPERSEDES the earlier --t2_replace_natural design (fixed count of naturals dropped at pool
+#   level). That flag is GONE; do not resurrect it.
+#
+# ⛔⛔ ALL-X CHAINS ARE EXCLUDED (user): 243 training chains and 1 val chain have a seqres that is
+#   entirely "X" (non-canonical residues -> aatype 20 everywhere), so the model has no way to know what
+#   the sequence means and the example carries no signal. This launcher points at the *.noallx lists
+#   (87912 train / 53 val) written by prune_work/scan_allx_chains.py.
 #
 # ⛔ Do NOT add the tricks here -- that would collapse stages 2 and 3.
-# ⛔ Do NOT point OUT_DIR at T1's or T2's run dir: the auto-resume block below finds any last.ckpt
-#    inside $OUT, and a stale one silently turns this into a continuation of that run instead of a
-#    clean warm-start from the jax params. (Launch #3 of T2 was aborted for exactly this.)
+# ⛔ Do NOT point OUT_DIR at T1's or T2's run dir: the auto-resume block finds any last.ckpt inside
+#    $OUT, and a stale one silently turns this into a continuation instead of a clean jax warm-start.
+#    (T2 launch #3 was aborted for exactly this.)
 # ============================================================================================
 cd /home/jupyter-chenxi/openfold-esmfold2-recycling
 . ~/miniconda3/etc/profile.d/conda.sh && conda deactivate && conda activate cue_openfold_gated
@@ -51,8 +52,9 @@ KAL=/home/jupyter-chenxi/miniconda3/envs/cue_openfold_gated/bin/kalign
 OBS=/home/jupyter-chenxi/data/pdb_mmcif/obsolete.dat
 CACHE=/home/jupyter-chenxi/data/pdb_mmcif/mmcif_cache.json
 L=/home/jupyter-chenxi/prune_work/lists_pdb
-TRAIN=${TRAIN_LIST:-$L/slim_struct_train.list}
-VAL=${VAL_LIST:-$L/ws5_val_strict_clean.list}
+# ⛔ *.noallx: the 243 fully-X training chains are excluded (user, 2026-08-18)
+TRAIN=${TRAIN_LIST:-$L/slim_struct_train.list.noallx}
+VAL=${VAL_LIST:-$L/ws5_val_strict_clean.list.noallx}
 PDA_MANIFEST=${PDA_VAL_MANIFEST:-/home/jupyter-chenxi/prune_work/eval_out/pda_cluster_representatives.json}
 PDA_CIF_DIR=${PDA_CIF_CACHE_DIR:-/home/jupyter-chenxi/prune_work/eval_out/pda_mmcif_cache}
 PDA_TRAIN_OVERLAP=${PDA_TRAIN_OVERLAP_IDS:-/home/jupyter-chenxi/prune_work/eval_out/pda_train_overlap_ids.json}
@@ -68,20 +70,13 @@ T2_INDEX=${T2_TEMPLATE_INDEX:-/home/jupyter-chenxi/pp1c_work/index_band.npz}
 T2_ROOT=${T2_TEMPLATES_ROOT:-/home/jupyter-chenxi/pp1c_work/templates_band}
 T2_MIN_TM=${T2_MIN_TM:-0.3}
 T2_MAX_TM=${T2_MAX_TM:-0.9}
-# ⛔ NO DEFAULT -- see the header. In replace mode this number sets the synthetic:natural CONTENT
-# ratio, which is a live experimental decision, so refuse rather than guess.
-# ⚠️ Written as an explicit check, not ${VAR:?msg}: the shell parses quoting inside ${...}, so an
-# apostrophe or a paren in the message is a syntax error that only shows up when the script RUNS.
-if [ -z "${T2_N_SYNTHETIC:-}" ]; then
-  echo "ERROR: T2_N_SYNTHETIC is not set, and this launcher will not pick it for you."
-  echo "  In REPLACE mode it is the number of natural hits GIVEN UP, so with the usual 4 natural:"
-  echo "    T2_N_SYNTHETIC=2  -> 2 synthetic + 2 natural = 50/50 content, count-matched"
-  echo "    T2_N_SYNTHETIC=4  -> 4 synthetic + 0 natural = 100% synthetic, count-matched"
-  echo "    T2_N_SYNTHETIC=1  -> 1 synthetic + 3 natural = 25% synthetic, count-matched"
-  echo "  Example: T2_N_SYNTHETIC=2 $0"
-  exit 1
-fi
-T2_N=$T2_N_SYNTHETIC
+# ⛔ The two mixing knobs. Both are user-specified values (2026-08-18): p=0.5 and top-up-to-20.
+T2_REPLACE_PROB=${T2_REPLACE_PROB:-0.5}
+T2_TOPUP_TO=${T2_TOPUP_TO:-20}
+# Table of prefiltered natural-hit counts (prune_work/build_prefiltered_counts.py). The top-up rule is
+# defined on that number and the featurizer does not report it; the stored release-date cutoff is
+# asserted against --max_template_date so a stale table is an error, not a wrong count.
+T2_PREF_COUNTS=${T2_PREF_COUNTS:-/home/jupyter-chenxi/pp1c_work/prefiltered_counts.npz}
 # ⛔ REQUIRED. Without it the npz rows are placed by residue_index - 1, which desynchronises at
 # the first unresolved residue and is what killed launch #2 (1eis_A, 70/85 positions wrong).
 # data_modules.py asserts on its absence rather than silently falling back.
@@ -97,6 +92,7 @@ T2_QMAP=${T2_QMAP:-/home/jupyter-chenxi/pp1c_work/qmap_all_v2.npz}
 [ -f "$T2_INDEX" ] || { echo "ERROR: T2 template index not found: $T2_INDEX"; exit 1; }
 [ -d "$T2_ROOT" ]  || { echo "ERROR: T2 templates root not found: $T2_ROOT"; exit 1; }
 [ -f "$T2_QMAP" ] || { echo "ERROR: T2 query-index map not found: $T2_QMAP"; exit 1; }
+[ -f "$T2_PREF_COUNTS" ] || { echo "ERROR: prefiltered-count table not found: $T2_PREF_COUNTS"; exit 1; }
 # Auto-resume this run's own checkpoint (full state); else warm-start from stock AF2 jax params.
 CK=$(ls -t "$OUT"/lightning_logs/version_*/checkpoints/last.ckpt 2>/dev/null | head -1)
 if [ -n "$CK" ]; then
@@ -106,8 +102,9 @@ else
   RESUME=(--resume_from_jax_params "$JAX")
   echo "INIT (warm-start) from stock AF2 jax params: $JAX"
 fi
-echo "T2-MATCHED (replace mode): index=$T2_INDEX root=$T2_ROOT band=$T2_MIN_TM-$T2_MAX_TM n_replace=$T2_N qmap=$T2_QMAP"
-echo "  pool size stays at the natural count -> delivered-count distribution identical to T1"
+echo "T2-MATCHED: index=$T2_INDEX root=$T2_ROOT band=$T2_MIN_TM-$T2_MAX_TM qmap=$T2_QMAP"
+echo "  mixing: replace_prob=$T2_REPLACE_PROB  topup_to=$T2_TOPUP_TO  counts=$T2_PREF_COUNTS"
+echo "  lists (all-X excluded): train=$TRAIN val=$VAL"
 python train_openfold.py "$MM" "$ALN" "$MM" "$OUT" 2018-04-30 \
   --config_preset finetuning_ptm \
   --kalign_binary_path "$KAL" --obsolete_pdbs_file_path "$OBS" --template_release_dates_cache_path "$CACHE" \
@@ -120,8 +117,9 @@ python train_openfold.py "$MM" "$ALN" "$MM" "$OUT" 2018-04-30 \
   --val_data_dir "$MM" --val_alignment_dir "$ALN" --val_chain_list_path "$VAL" \
   --t2_template_index "$T2_INDEX" --t2_templates_root "$T2_ROOT" \
   --t2_qmap "$T2_QMAP" \
-  --t2_min_tm "$T2_MIN_TM" --t2_max_tm "$T2_MAX_TM" --t2_n_synthetic "$T2_N" \
-  --t2_replace_natural \
+  --t2_min_tm "$T2_MIN_TM" --t2_max_tm "$T2_MAX_TM" \
+  --t2_replace_prob "$T2_REPLACE_PROB" --t2_topup_to "$T2_TOPUP_TO" \
+  --t2_prefiltered_counts "$T2_PREF_COUNTS" \
   --precision bf16 --learning_rate 1e-4 --warmup_no_steps 3000 \
   --train_epoch_len "$EPL" --max_epochs "$MAXEP" --num_sanity_val_steps 0 \
   --grad_accum_steps "$GRAD_ACCUM" \
