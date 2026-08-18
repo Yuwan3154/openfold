@@ -2,10 +2,17 @@
 
 Three claims, each of which would otherwise be an assumption:
 
-  1. ⭐⭐ IGNORES THE a3m COMPLETELY. With the flag on, features built from the FULL alignment dir must
-     be BIT-IDENTICAL to features built from a dir holding only `pdb70_hits.hhr`. This is the claim that
-     licenses shipping hhr-only to Engaging: not "similar", identical. It also proves the a3m is never
-     opened, without having to instrument file IO.
+  1. ⭐⭐ IGNORES THE a3m COMPLETELY. With the flag on, the RAW features built from the FULL alignment
+     dir must be BIT-IDENTICAL to those built from a dir holding only `pdb70_hits.hhr`. This licenses
+     shipping hhr-only to Engaging: not "similar", identical -- and it proves the a3m is never opened
+     without instrumenting file IO.
+     ⛔⛔ COMPARED ON THE **RAW** FEATURES (`_output_raw=True`), NOT the processed ones, and that is not
+     a convenience. The random crop is NOT reproducible under `torch.manual_seed`: three identical
+     builds of the SAME dataset object gave crop offsets 9, 3, 2. So any post-crop comparison of two
+     conditions differs on every NUM_RES feature for reasons that have nothing to do with the thing
+     under test -- an earlier version of this gate "failed" on `aatype`/`all_atom_positions` for exactly
+     that reason. Raw features are pre-crop and deterministic apart from the featurizer's top-20
+     shuffle, which `np.random.seed` does control.
   2. THE EXTRA TRACK IS INERT BUT PRESENT. `extra_msa_mask` and `extra_msa_row_mask` must be 0 -- the
      AF2Rank regime, where the stack keeps its pretrained weights and attends to nothing. Contrast with
      the flag OFF, where the row is live.
@@ -102,11 +109,31 @@ for c in pick:
 
     A, B, C = build(ds_full_forced), build(ds_hhr_forced), build(ds_full_off)
 
-    # ---- claim 1: bit-identical across the two dirs, with the flag on
-    keys = sorted(set(A) & set(B))
-    diff = [k for k in keys if not torch.equal(A[k].float(), B[k].float())]
-    same_keys = set(A) == set(B)
-    ok1 = same_keys and not diff
+    # ---- claim 1: bit-identical RAW features across the two dirs, with the flag on
+    def build_raw(ds):
+        ds._output_raw = True
+        try:
+            np.random.seed(a.seed); torch.manual_seed(a.seed)
+            return ds[i]
+        finally:
+            ds._output_raw = False
+
+    RA, RB = build_raw(ds_full_forced), build_raw(ds_hhr_forced)
+    keys = sorted(set(RA) | set(RB))
+    diff = []
+    for k in keys:
+        if k not in RA or k not in RB:
+            diff.append(f"{k}:MISSING")
+            continue
+        x, y = np.asarray(RA[k]), np.asarray(RB[k])
+        if x.shape != y.shape:
+            diff.append(f"{k}:shape{x.shape}vs{y.shape}")
+        elif x.dtype == object:
+            if not (x == y).all():
+                diff.append(f"{k}:obj")
+        elif not np.array_equal(x, y):
+            diff.append(f"{k}:vals")
+    ok1 = not diff
     n_ident += ok1
 
     # ---- claim 2: the extra row is inert with the flag on, live without it
@@ -122,13 +149,13 @@ for c in pick:
     cl = torch.nonzero(per_ch[25:] > 0).flatten().tolist()
     cluster_changed += bool(cl)
 
-    print(f"  {c}: flag-on full-vs-hhr {'IDENTICAL' if ok1 else 'DIFFERS ' + str(diff[:4])}"
+    print(f"  {c}: flag-on RAW full-vs-hhr {'IDENTICAL' if ok1 else 'DIFFERS ' + str(diff[:4])}"
           f" | extra mask on={m_on:.3f}/row {r_on:.3f}  off={m_off:.3f}/row {r_off:.3f}"
           f" | msa_feat cluster channels changed by the flag: {len(cl)}/24")
 
 n = len(pick)
 print("\n================ VERDICT ================")
-print(f"  1. full-a3m dir == hhr-only dir with the flag ON : {n_ident}/{n}"
+print(f"  1. RAW features: full-a3m dir == hhr-only dir, flag ON : {n_ident}/{n}"
       f"   {'✅ shipping hhr-only is EXACTLY equivalent' if n_ident == n else '❌'}")
 print(f"  2. extra track inert with the flag ON            : {n_inert}/{n}"
       f"   (and live with it OFF: {n_live_off}/{n})")
