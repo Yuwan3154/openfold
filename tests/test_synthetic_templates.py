@@ -619,19 +619,33 @@ def test_topup_hypergeometric_has_the_right_natural_share():
         assert max(draws) <= min(n_pref, 4)                    # cannot keep more than it has
 
 
+def _mix(pool_obj, nat, n_keep_nat, pool_target, chain, qseq, rng):
+    """The hook's exact arithmetic, so the tests exercise the real formula rather than a paraphrase."""
+    n_nat = natural_template_count(nat)
+    budget = pool_target - n_keep_nat
+    extra = pool_obj.sample_features(chain, budget, rng, query_sequence=qseq) if budget > 0 else None
+    added = 0 if extra is None else int(extra["template_all_atom_positions"].shape[0])
+    keep_final = min(n_nat, max(n_keep_nat, pool_target - added))
+    out = subsample_natural_templates(nat, keep_final, rng) if keep_final < n_nat else nat
+    return (merge_template_features(out, extra) if extra is not None else out), added, keep_final
+
+
 def test_topup_fills_a_template_poor_chain_to_the_cap(pool):
     """End to end for the case the top-up exists for: a chain with 1 natural hit ends up with a FULL
-    pool of 4 instead of 1, which is exactly the delivered-count increase that was signed off for the
-    1.3% of chains with <4 prefiltered hits."""
+    pool of max_templates instead of 1 -- the delivered-count increase that was accepted for the 1.3%
+    of chains with <4 prefiltered hits.
+    ⭐ This fixture's chain has only 3 in-band templates, so it also exercises the RESTORE: the pool
+    supplies 3 of the 4 wanted and the 1 natural is kept rather than dropped, still reaching 4."""
     p, _, QSEQ = pool
+    n_elig = len(p.eligible[p.row_of["1abc_A"]])
+    assert n_elig == 3, n_elig                                 # fixture invariant this test relies on
     rng = np.random.default_rng(3)
-    nat = _natural(1)
-    assert natural_template_count(nat) == 1
-    n_keep = 0                                                 # hypergeometric drew 0 naturals
-    synth = p.sample_features("1abc_A", 4 - n_keep, rng, query_sequence=QSEQ)
-    out = merge_template_features(subsample_natural_templates(nat, n_keep, rng), synth)
-    assert natural_template_count(out) == 4
-    assert all(d.startswith(b"pp1c_") for d in out["template_domain_names"])
+    out, added, keep_final = _mix(p, _natural(1), n_keep_nat=0, pool_target=4,
+                                 chain="1abc_A", qseq=QSEQ, rng=rng)
+    assert added == 3                                          # pool could not fill all 4
+    assert keep_final == 1                                     # so the natural was RESTORED
+    assert natural_template_count(out) == 4                    # and the pool still reaches the target
+    assert sum(d.startswith(b"pp1c_") for d in out["template_domain_names"]) == 3
 
 
 def test_short_synthetic_pool_restores_naturals_rather_than_shrinking(pool):
@@ -639,27 +653,33 @@ def test_short_synthetic_pool_restores_naturals_rather_than_shrinking(pool):
     we still drop the naturals, the chain ends up with FEWER templates than T1 would have given it."""
     p, _, QSEQ = pool
     rng = np.random.default_rng(9)
-    n_nat, pool_target = 4, 4
-    n_keep_nat = 1                                             # p=0.5 happened to keep 1
-    budget = pool_target - n_keep_nat                          # 3 wanted
-    synth = p.sample_features("1abc_A", budget, rng, query_sequence=QSEQ)
-    added = synth["template_all_atom_positions"].shape[0]
-    keep_final = min(n_nat, max(n_keep_nat, pool_target - added))
-    out = merge_template_features(subsample_natural_templates(_natural(n_nat), keep_final, rng), synth)
-    assert natural_template_count(out) == pool_target
-    # and if the pool had returned NOTHING, every natural is restored
-    assert min(n_nat, max(n_keep_nat, pool_target - 0)) == n_nat
+    out, added, keep_final = _mix(p, _natural(4), n_keep_nat=1, pool_target=4,
+                                 chain="1abc_A", qseq=QSEQ, rng=rng)
+    assert added == 3 and keep_final == 1
+    assert natural_template_count(out) == 4
+    # and had the pool returned NOTHING, every natural would be restored
+    assert min(4, max(1, 4 - 0)) == 4
 
 
 def test_chain_with_no_natural_hits_gets_synthetic_only_under_topup(pool):
-    """0.5% of chains have no natural hits at all. Without top-up they see nothing, exactly as in T1;
-    with top-up they get a full synthetic pool, which is the point."""
+    """0.36% of training chains have no natural hits at all (measured over all 88155). Without top-up
+    they see nothing, exactly as in T1; with top-up they get an all-synthetic pool, which is the
+    point. Capped here by the fixture's 3 eligible templates, not by the rule."""
     p, _, QSEQ = pool
-    rng = np.random.default_rng(11)
+    n_elig = len(p.eligible[p.row_of["1abc_A"]])
     nat = empty_template_feats(L)
     nat.pop("template_dgram_probs")
     assert natural_template_count(nat) == 0
-    out = merge_template_features(nat, p.sample_features("1abc_A", 4, rng, query_sequence=QSEQ))
-    assert natural_template_count(out) == 4
-    # without top-up the budget is pool_target - n_keep_nat = 0 - 0 = 0, so nothing is added
-    assert 0 - 0 == 0
+    out, added, keep_final = _mix(p, nat, n_keep_nat=0, pool_target=4,
+                                 chain="1abc_A", qseq=QSEQ, rng=np.random.default_rng(11))
+    assert added == n_elig and keep_final == 0
+    assert natural_template_count(out) == n_elig
+    assert all(d.startswith(b"pp1c_") for d in out["template_domain_names"])
+
+    # ⛔ and WITHOUT top-up the same chain must stay exactly as T1 has it: pool_target = n_nat = 0,
+    # so the budget is 0 and nothing is added at all
+    nat2 = empty_template_feats(L)
+    nat2.pop("template_dgram_probs")
+    out2, added2, _ = _mix(p, nat2, n_keep_nat=0, pool_target=0,
+                           chain="1abc_A", qseq=QSEQ, rng=np.random.default_rng(12))
+    assert added2 == 0 and natural_template_count(out2) == 0
