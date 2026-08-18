@@ -683,3 +683,80 @@ def test_chain_with_no_natural_hits_gets_synthetic_only_under_topup(pool):
     out2, added2, _ = _mix(p, nat2, n_keep_nat=0, pool_target=0,
                            chain="1abc_A", qseq=QSEQ, rng=np.random.default_rng(12))
     assert added2 == 0 and natural_template_count(out2) == 0
+
+
+# ---------------------------------------------------------------------------------------------
+# THREE-GROUP PRE-SHUFFLE MIXTURE (natural / synthetic filler / promoted), user's design 2026-08-18.
+# `--t4_n_promoted` is the promoted group's WEIGHT here, not a delivered count -- max_templates=4
+# caps the delivered count, so any value above 4 would be meaningless under a per-step reading.
+# ---------------------------------------------------------------------------------------------
+
+def _draw(g_nat, g_syn, g_pro, max_t=4, n=40000, seed=0):
+    rng = np.random.default_rng(seed)
+    target = min(max_t, g_nat + g_syn + g_pro)
+    if target == 0:
+        return np.zeros((0, 3), int), 0
+    return rng.multivariate_hypergeometric([g_nat, g_syn, g_pro], target, size=n), target
+
+
+def test_promoted_weight_sets_its_delivered_share():
+    """32 promoted beside 20 natural must give each drawn slot p = 32/52 promoted -- the number the
+    flag value is chosen for. If this drifts, `--t4_n_promoted 32` no longer means what was agreed."""
+    d, target = _draw(20, 0, 32)
+    assert target == 4
+    share = d[:, 2].mean() / target
+    assert abs(share - 32 / 52) < 0.01, share
+    assert abs(d[:, 0].mean() / target - 20 / 52) < 0.01
+    assert (d.sum(axis=1) == target).all()          # every slot is filled from some group
+
+
+def test_promoted_group_scales_monotonically_with_the_flag():
+    prev = -1.0
+    for n_pro in (0, 4, 16, 32, 64):
+        d, target = _draw(20, 0, n_pro)
+        share = d[:, 2].mean() / target
+        assert share > prev or n_pro == 0, (n_pro, share, prev)
+        prev = share
+    assert prev > 0.7                                # 64 vs 20 natural is promoted-dominated
+
+
+def test_t4_is_inert_until_the_pool_fills():
+    """⭐ No warmup branching is needed for the READ side: a chain contributes at most what it HAS, so
+    with an empty promoted pool the draw is identical to the no-T4 case."""
+    a, ta = _draw(20, 0, 0, seed=5)
+    b, tb = _draw(20, 0, 0, seed=5)
+    assert ta == tb and np.array_equal(a, b)
+    d, _ = _draw(20, 0, 0)
+    assert d[:, 2].sum() == 0                        # nothing promoted can be drawn
+
+
+def test_topup_and_promoted_compose_on_a_template_poor_chain():
+    """A chain with 2 prefiltered hits, topped to 20, plus 32 promoted: naturals become a small
+    minority, which is the intended "supply templates where natural ones are missing" behaviour."""
+    d, target = _draw(2, 18, 32)
+    assert target == 4
+    assert abs(d[:, 0].mean() / target - 2 / 52) < 0.01     # natural
+    assert abs(d[:, 1].mean() / target - 18 / 52) < 0.01    # synthetic filler
+    assert abs(d[:, 2].mean() / target - 32 / 52) < 0.01    # promoted
+
+
+def test_natural_group_is_capped_at_shuffle_top_k_not_the_raw_count():
+    """⛔ Hit 21+ is UNREACHABLE -- the featurizer permutes only idx[:shuffle_top_k]. Using the raw
+    prefiltered count (median 129) as the group size would claim the mixture is ~87% natural when the
+    reachable natural variety is only 20."""
+    stk = 20
+    for n_pref in (129, 463, 20):
+        assert min(n_pref, stk) == 20
+    d_wrong, t = _draw(129, 0, 32)
+    d_right, _ = _draw(20, 0, 32)
+    assert d_wrong[:, 2].mean() / t < 0.25           # the mistake would nearly erase the promoted group
+    assert d_right[:, 2].mean() / t > 0.55
+
+
+def test_pool_target_never_exceeds_what_the_mixture_holds():
+    """A chain with 2 naturals and no other source keeps T1's pool of 2, not a padded 4."""
+    d, target = _draw(2, 0, 0)
+    assert target == 2
+    assert (d[:, 0] == 2).all()
+    d0, t0 = _draw(0, 0, 0)
+    assert t0 == 0 and d0.shape[0] == 0              # nothing to draw -> hook does nothing
