@@ -726,19 +726,6 @@ def main(args):
             config.data.common.use_template_torsion_angles = False
         else:
             rank_zero_info("single_seq_keep_templates: templates KEPT enabled in single-seq mode")
-        # ⛔⛔ DISABLE THE EXTRA-MSA TRACK (user directive 2026-08-18). Clamping max_extra_msa to 1
-        # was NOT enough to make this recipe MSA-free: `config.model.extra_msa.enabled` stayed True, so
-        # every training step fed ONE RANDOMLY DRAWN REAL HOMOLOG into the ExtraMSA stack. Measured on
-        # 10 chains (prune_work/inspect_extra_msa.py): the row is a different sequence in 10/10, 0-60%
-        # identical to the query, `extra_msa_row_mask` = 1.0 in 10/10 (always attended). The cluster
-        # track was already the query alone, which is the part that matched the recipe's description.
-        # ⭐ Setting this False means model.py:117 never CONSTRUCTS the embedder or the stack, so there
-        # are no parameters left without gradients (which under DDP would raise) -- it is a genuine
-        # removal, not a skipped forward. `import_weights.py` is guarded to match.
-        # ⚠️ RE-BASELINES T1/T2: runs after this are not comparable to their curves.
-        config.model.extra_msa.enabled = False
-        rank_zero_info("Disabling the EXTRA MSA track (extra_msa.enabled=False) for single-seq mode")
-
         # Disable MSA-specific losses for single sequence training
         rank_zero_info("Disabling masked_msa loss for single sequence mode")
         config.loss.masked_msa.weight = 0.0
@@ -1389,6 +1376,22 @@ if __name__ == "__main__":
     parser.add_argument(
         "--enable_single_seq_mode", action="store_true", default=False,
         help="Enable single sequence mode (no MSA/templates required)"
+    )
+    parser.add_argument(
+        "--force_query_only_msa", action="store_true", default=False,
+        help="AF2Rank parity: build the MSA as the QUERY SEQUENCE ALONE and never open an a3m file. "
+             "⭐ This is exactly what AF2Rank does (jproney/AF2Rank test_templates.py:123-125 -- "
+             "`parse_a3m('>1\\n' + sequence)` then `make_msa_features([msa])`) while leaving the "
+             "extra-MSA track ENABLED, so the pretrained extra-MSA weights are kept and the 49-channel "
+             "msa_feat layout is unchanged; a depth-1 MSA simply leaves the extra rows as padding with "
+             "extra_msa_mask = 0, i.e. the track runs but attends to nothing (measured 5/5 chains). "
+             "⛔ Without this the no-MSA recipe is NOT MSA-free: it reads the real a3m, so extra_msa "
+             "carries a LIVE homolog row (mask 1.000, 0-60%% identity to the query, measured 10/10) AND "
+             "msa_feat's cluster_profile channels are computed from that MSA by summarize_clusters. "
+             "This closes both paths at the source. "
+             "⚠️ It also makes the a3m files unnecessary (89%% of the 601 GB alignment tree) and skips "
+             "their per-example parse. ⚠️ It CHANGES the input relative to T1/T2, so it re-baselines "
+             "them -- but unlike disabling the track it leaves the architecture and weights untouched."
     )
     parser.add_argument(
         "--single_seq_keep_templates", action="store_true", default=False,

@@ -800,8 +800,19 @@ class DataPipeline:
     def __init__(
         self,
         template_featurizer: Optional[templates.TemplateHitFeaturizer],
+        force_query_only_msa: bool = False,
     ):
         self.template_featurizer = template_featurizer
+        # ⭐⭐ AF2Rank parity. AF2Rank (jproney/AF2Rank, test_templates.py:123-125) builds its MSA as
+        # `parse_a3m(">1\n%s" % sequence)` + `make_msa_features([msa])` -- an in-memory a3m holding ONLY
+        # the target sequence, never an a3m file -- while leaving `extra_msa` ENABLED in the model with
+        # AF2's default max_extra_msa. A depth-1 MSA leaves no real extra rows, so `make_fixed_size`
+        # pads them and `extra_msa_mask`/`extra_msa_row_mask` come out 0: the track keeps its pretrained
+        # weights and still runs, but attends to nothing. MEASURED here on 5 chains: mask 0.000 in 5/5.
+        # ⛔ Our training pipeline did NOT do this -- it read the real a3m, so `extra_msa` carried a
+        # LIVE homolog row (mask 1.000, 0-60% identity to the query, measured 10/10). This flag closes
+        # that divergence at the source.
+        self.force_query_only_msa = force_query_only_msa
 
     def _parse_msa_data(
         self,
@@ -915,6 +926,20 @@ class DataPipeline:
         input_sequence: Optional[str] = None,
         alignment_index: Optional[Any] = None,
     ):
+        if self.force_query_only_msa:
+            # ⭐ Returns BEFORE `_parse_msa_data`, so the a3m files are never opened at all. That is
+            # not just a saving of the ~4 MB/chain of bytes (median MSA depth ~13,000 sequences): the
+            # parse itself happens on every training example and is pure waste when the result is
+            # discarded down to one row.
+            # ⛔ Deliberately ignores any a3m that IS present, so the behaviour is identical whether or
+            # not the files were shipped -- which is what makes an hhr-only deployment exactly
+            # equivalent to a full one rather than merely similar.
+            if input_sequence is None:
+                raise ValueError(
+                    "force_query_only_msa needs the input sequence: the MSA is built FROM it."
+                )
+            return [make_dummy_msa_obj(input_sequence)]
+
         msa_data = self._parse_msa_data(alignment_dir, alignment_index)
         if(len(msa_data) == 0):
             if(input_sequence is None):

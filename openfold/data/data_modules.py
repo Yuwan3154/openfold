@@ -70,6 +70,7 @@ class OpenFoldSingleDataset(torch.utils.data.Dataset):
                  prefiltered_counts_path: Optional[str] = None,
                  promoted_template_pool: Optional[Any] = None,
                  n_promoted_templates: int = 0,
+                 force_query_only_msa: bool = False,
                  ):
         """
             Args:
@@ -258,6 +259,7 @@ class OpenFoldSingleDataset(torch.utils.data.Dataset):
 
         self.data_pipeline = data_pipeline.DataPipeline(
             template_featurizer=template_featurizer,
+            force_query_only_msa=force_query_only_msa,
         )
 
         if not self._output_raw:
@@ -1113,6 +1115,7 @@ class OpenFoldDataModule(pl.LightningDataModule):
                  t2_prefiltered_counts: Optional[str] = None,
                  t4_promoted_pool: Optional[Any] = None,
                  t4_n_promoted: int = 0,
+                 force_query_only_msa: bool = False,
                  enable_recursive_search: bool = True,
                  **kwargs
                  ):
@@ -1197,6 +1200,11 @@ class OpenFoldDataModule(pl.LightningDataModule):
         )
         self.t4_promoted_pool = t4_promoted_pool
         self.t4_n_promoted = t4_n_promoted
+        # ⚠️ Applies to EVERY split, not just train: it is a property of the recipe, not of a phase.
+        # `dataset_gen` is a partial shared by train/eval/predict, so putting it there guarantees the
+        # three cannot drift apart -- a train-only version would validate on a different input
+        # distribution than it trained on.
+        self.force_query_only_msa = force_query_only_msa
         self.synthetic_template_pool = None
         if t2_template_index is not None and (t2_n_synthetic > 0 or t2_replace_prob > 0.0
                                               or t2_topup_to > 0):
@@ -1240,6 +1248,7 @@ class OpenFoldDataModule(pl.LightningDataModule):
                               kalign_binary_path=self.kalign_binary_path,
                               template_release_dates_cache_path=self.template_release_dates_cache_path,
                               obsolete_pdbs_file_path=self.obsolete_pdbs_file_path,
+                              force_query_only_msa=self.force_query_only_msa,
                               enable_recursive_search=self.enable_recursive_search)
 
         if self.training_mode:
