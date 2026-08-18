@@ -35,6 +35,7 @@ from openfold.utils.lr_schedulers import AlphaFoldLRScheduler
 from openfold.utils.multi_chain_permutation import multi_chain_permutation_align
 from openfold.utils.superimposition import superimpose
 from openfold.utils.t4_self_distill import template_gate_metrics
+from openfold.utils.t4_pool import PromotedTemplatePool, PromotedTemplateWriter
 from openfold.utils.tensor_utils import tensor_tree_map
 from openfold.utils.validation_metrics import (
     drmsd,
@@ -322,6 +323,51 @@ class OpenFoldWrapper(pl.LightningModule):
             self.log("t4/has_template", m["has_template"].mean(), on_step=True, on_epoch=True,
                      logger=True)
 
+            # T4 phase 3: PERSIST the promotions. Two independent guards, so the gate keeps working
+            # as pure measurement when either is off: a pool dir must be configured, and the warmup
+            # epoch must have passed (promoting from step 0 would fill the pool with a barely-trained
+            # model's output and freeze that quality into every later epoch).
+            if self.t4_pool_dir and self.current_epoch >= self.t4_promote_after_epoch:
+                if self._t4_writer is None:
+                    # created here, not in __init__, because it needs the DDP rank -- each rank owns
+                    # its own subtree so no locking or barrier is needed
+                    self._t4_writer = PromotedTemplateWriter(
+                        self.t4_pool_dir, self.trainer.global_rank,
+                        control_fraction=self.t4_control_fraction,
+                    )
+                sel = torch.nonzero(m["promote"] > 0, as_tuple=False).flatten().tolist()
+                if sel:
+                    # ⛔ .datasets[0] is safe only because setup() asserts len(datasets) == 1 when
+                    # T4 is active: batch_idx carries the INNER per-dataset index, so with a second
+                    # dataset every distillation sample would resolve to the wrong chain name.
+                    ds = self.trainer.datamodule.train_dataset.datasets[0]
+                    bidx = batch["batch_idx"]
+                    for i in sel:
+                        self._t4_writer.submit(
+                            chain=ds.idx_to_chain_id(int(bidx[i])),
+                            epoch=int(self.current_epoch), step=int(self.global_step),
+                            tm_pred=float(m["tm_pred"][i]),
+                            tm_template=float(m["tm_template"][i]),
+                            # the PREDICTION is what gets promoted; atom37_atom_exists is the
+                            # per-residue atom validity for its own sequence, which is what a
+                            # template's mask means
+                            coords37=outputs["final_atom_positions"][i].detach().float().cpu().numpy(),
+                            atom_mask37=batch["atom37_atom_exists"][i].detach().cpu().numpy(),
+                            aatype=batch["aatype"][i].detach().cpu().numpy(),
+                            # 0-based query positions (data_pipeline sets arange(num_res)) and a
+                            # NUM_RES feature, so the crop's own offsets ride along -- which is how a
+                            # promoted CROP is located on the full chain at read time
+                            residue_index=batch["residue_index"][i].detach().cpu().numpy(),
+                        )
+                self.log("t4/pool_written", float(self._t4_writer.n_written),
+                         on_step=True, on_epoch=False, logger=True)
+                # a nonzero drop count means the writer thread cannot keep up and promotions are
+                # being thrown away -- visible rather than mysterious
+                self.log("t4/pool_dropped", float(self._t4_writer.n_dropped),
+                         on_step=True, on_epoch=False, logger=True)
+                self.log("t4/control_skipped", float(self._t4_writer.n_control_skipped),
+                         on_step=True, on_epoch=False, logger=True)
+
         # Log it
         self._log(loss_breakdown, batch, outputs)
 
@@ -417,8 +463,26 @@ class OpenFoldWrapper(pl.LightningModule):
         # "next" on_train_epoch_start to defer to.
         self._flush_per_entry_records()
 
+        # T4 phase 3: rebuild the promoted-template snapshot for this epoch. Done at epoch START,
+        # not on every write, so an epoch trains against a FIXED pool -- otherwise two dataloader
+        # workers could disagree about what exists. Whatever the writer thread has not flushed yet
+        # simply appears one epoch later, which costs nothing.
+        _dm = getattr(self.trainer, "datamodule", None)
+        _pool = getattr(_dm, "t4_promoted_pool", None) if _dm is not None else None
+        if _pool is not None:
+            _n = _pool.refresh()
+            rank_zero_info(
+                f"T4 promoted pool @ epoch {self.current_epoch}: {_n} templates over "
+                f"{len(_pool.by_chain)} chains"
+                + (f"; {_pool.n_control_dropped} chains withheld as control"
+                   if _pool.n_control_dropped else "")
+            )
+
     def on_fit_end(self):
         self._flush_per_entry_records()
+        if getattr(self, "_t4_writer", None) is not None:
+            # flush the queue before the process exits, or the last epoch's promotions are lost
+            self._t4_writer.close()
 
     def _flush_per_entry_records(self):
         # T1 per-entry tracking: gather every rank's records (each rank only sees its own DDP
@@ -799,6 +863,13 @@ def main(args):
     model_module.t4_self_distill = getattr(args, "t4_self_distill", False)
     model_module.t4_delta = getattr(args, "t4_delta", 0.05)
     model_module.t4_min_tm = getattr(args, "t4_min_tm", 0.0)
+    # T4 phase 3 (promotion). ⭐ Deliberately independent of what this run was initialised FROM:
+    # nothing here reads the base checkpoint, so T4 stacks on T1 or on T2 unchanged -- the base is
+    # only ever --resume_from_ckpt / --resume_from_jax_params.
+    model_module.t4_pool_dir = getattr(args, "t4_pool_dir", None)
+    model_module.t4_promote_after_epoch = getattr(args, "t4_promote_after_epoch", 0)
+    model_module.t4_control_fraction = getattr(args, "t4_control_fraction", 0.0)
+    model_module._t4_writer = None
 
     # Direction 2: keep only a SUBSET of the 48 Evoformer blocks (shallower full-block model),
     # warm-started from the matching AF2 block weights (full 48 loaded above, then sliced).
@@ -883,9 +954,25 @@ def main(args):
             **vars(args)
         )
     else:
+        # T4 phase 3: the read side. Built here so it can be handed to the datamodule; refreshed
+        # at every epoch start by the module's on_train_epoch_start. ⭐ Nothing about this depends on
+        # which run produced the base weights, so T4 stacks on T1 or T2 identically.
+        _t4_pool = None
+        if getattr(args, "t4_n_promoted", 0) > 0:
+            assert args.t4_pool_dir is not None, (
+                "--t4_n_promoted > 0 needs --t4_pool_dir: there is nowhere to read promoted "
+                "templates from. Point it at the pool an earlier run wrote (or the same dir this "
+                "run writes to, to consume its own promotions from the next epoch on)."
+            )
+            _t4_pool = PromotedTemplatePool(
+                args.t4_pool_dir,
+                max_per_chain=getattr(args, "t4_max_per_chain", 0),
+                control_fraction=getattr(args, "t4_control_fraction", 0.0),
+            )
         data_module = OpenFoldDataModule(
             config=config.data,
             batch_seed=args.seed,
+            t4_promoted_pool=_t4_pool,
             **vars(args)
         )
 
@@ -1368,6 +1455,21 @@ if __name__ == "__main__":
              "P(4 delivered) = (N+1)/(N+5), so zero-template steps fall from 20.6%% to 11%% at N=4."
     )
     parser.add_argument(
+        "--t2_replace_natural", action="store_true", default=False,
+        help="T2 COUNT-MATCHED variant: put the synthetic templates in the pool by REPLACING that "
+             "many natural hits instead of appending, so the pool stays exactly the size it would "
+             "have been without them. Why: `templates_crop_start ~ Uniform{0..pool}` is INCLUSIVE, "
+             "so appending changes the delivered template COUNT as well as its content (pool 4 -> "
+             "mean 2.00 delivered/step and P(0 templates) 20%%; pool 8 -> 2.89 and 11.1%%). With "
+             "this flag T1 and this run share one delivered-count distribution and differ ONLY in "
+             "template content, which is what makes a measured gap attributable. The natural hits "
+             "that survive are a UNIFORM random subset (not the top-k by sum_probs), so the natural "
+             "component is distributed exactly as in T1. Requested count is clamped to the number "
+             "of natural hits available, and the drop uses however many synthetic templates "
+             "actually arrived -- a chain with few eligible templates keeps its pool size either "
+             "way. Default off, so the append-mode run already in flight is unaffected."
+    )
+    parser.add_argument(
         "--t4_self_distill", action="store_true", default=False,
         help="T4: each training step, score the prediction and the best template it was given "
              "against the native (TM, in-loop on the crop) and log t4/{tm_pred,tm_template,"
@@ -1383,6 +1485,51 @@ if __name__ == "__main__":
         "--t4_min_tm", type=float, default=0.0,
         help="T4: absolute floor on TM(pred,native) before a prediction may be promoted. "
              "0.0 disables the floor (default) -- margin alone decides."
+    )
+    parser.add_argument(
+        "--t4_n_promoted", type=int, default=0,
+        help="T4 phase 3: how many PROMOTED templates (past predictions that beat the template they "
+             "were given) to mix into each training example, alongside whatever natural and "
+             "--t2_n_synthetic templates it already gets. This sets the promoted:synthetic:natural "
+             "ratio, the analogue of --t2_n_synthetic. 0 = disabled (default): the gate still "
+             "measures and, with --t4_pool_dir, still WRITES, but nothing is read back -- which is "
+             "the right setting for one epoch of pool-filling before the first consuming run. "
+             "⚠️ With --t2_replace_natural the total added is budgeted against the natural count so "
+             "the pool size is unchanged; without it the pool GROWS and the delivered template count "
+             "shifts as well as its content."
+    )
+    parser.add_argument(
+        "--t4_max_per_chain", type=int, default=0,
+        help="T4 phase 3: cap the promoted pool at this many templates per chain, keeping the best "
+             "by the prediction's own TM (a newest-wins cap would let a late bad epoch evict good "
+             "templates). 0 = uncapped (default). A cap bounds both disk and the chance that one "
+             "easy chain dominates its own template distribution."
+    )
+    parser.add_argument(
+        "--t4_pool_dir", type=str, default=None,
+        help="T4 phase 3: directory for the promoted-template pool. Each rank writes only its own "
+             "rank<N>/ subtree and appends to its own index.jsonl, so DDP needs no locking. "
+             "Unset (default) = promotions are never written, so --t4_self_distill stays pure "
+             "measurement. Set it to enable writing; pass the SAME dir to a later run to consume "
+             "what an earlier one produced."
+    )
+    parser.add_argument(
+        "--t4_promote_after_epoch", type=int, default=0,
+        help="T4 phase 3: first epoch (0-based, inclusive) from which promotions are written. "
+             "Promoting from step 0 captures a barely-warmed-up model's output and then freezes that "
+             "quality into the template distribution for every later epoch, so a warmup is a real "
+             "choice and not a formality. 0 = promote from the very first epoch (default)."
+    )
+    parser.add_argument(
+        "--t4_control_fraction", type=float, default=0.0,
+        help="T4 phase 3: fraction of training chains HELD OUT from promotion entirely, so their "
+             "curve is the counterfactual for the chains that do receive promoted templates -- "
+             "without it, a T4 effect cannot be separated from ordinary further training. "
+             "Membership is deterministic (crc32 of the chain name, so it is identical across ranks, "
+             "dataloader workers and restarts) and is enforced on the WRITE side, so nothing about a "
+             "control chain ever enters the pool. 0.0 = no control set (default). ⚠️ A control chain "
+             "still trains, it just never gets a promoted template, so the cost is measurement "
+             "power on those chains rather than lost training signal."
     )
     parser.add_argument(
         "--pda_val_manifest", type=str, default=None,

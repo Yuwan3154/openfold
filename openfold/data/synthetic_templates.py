@@ -193,6 +193,48 @@ class SyntheticTemplatePool:
         }
 
 
+def natural_template_count(feats: dict) -> int:
+    """How many real template hits `feats` carries.
+
+    Read off the numeric array, never the object ones: the "no templates found" placeholder
+    (`empty_template_feats`) gives the numeric arrays a 0-length template axis but the two object
+    arrays a length-1 one, so `template_sequence` would report 1 hit where there are none.
+    """
+    pos = feats.get("template_all_atom_positions")
+    return 0 if pos is None else int(np.asarray(pos).shape[0])
+
+
+def subsample_natural_templates(feats: dict, keep: int, rng: np.random.Generator) -> dict:
+    """Keep a uniformly random `keep` of the natural template hits, dropping the rest.
+
+    ⭐⭐ WHY RANDOM AND NOT WORST-FIRST. This exists for the count-matched run, whose whole point is
+    that the natural component stays distributionally IDENTICAL to T1's so the only difference left
+    is template content. `HhsearchHitFeaturizer` hands the hits over sorted by `sum_probs`, so
+    keeping the top-k would give this run systematically BETTER natural templates than the random
+    subset T1 actually trains on -- a second difference on top of the one being measured, and one
+    that biases in the flattering direction. A uniform draw makes each surviving slot the same draw
+    T1 would have made. (Worst-first is the right choice for a *production* model, not for this
+    comparison; it is a one-line change if that is ever wanted.)
+
+    Position within the pool is irrelevant either way -- `random_crop_to_size(subsample_templates=
+    True)` permutes the whole pool before taking its window -- so only WHICH hits survive matters.
+    """
+    n = natural_template_count(feats)
+    if n == 0 or keep >= n:
+        return feats
+    idx = np.sort(rng.choice(n, size=keep, replace=False))
+    out = dict(feats)
+    for key in [k for k in feats if k.startswith("template_")]:
+        arr = np.asarray(feats[key])
+        if arr.shape[0] != n:
+            raise ValueError(
+                f"{key} has template axis {arr.shape[0]} but there are {n} natural hits; the "
+                f"template features are ragged, which cropping downstream cannot handle"
+            )
+        out[key] = arr[idx]
+    return out
+
+
 def merge_template_features(feats: dict, synth: dict) -> dict:
     """Concatenate synthetic hits onto whatever template features `feats` already has.
 

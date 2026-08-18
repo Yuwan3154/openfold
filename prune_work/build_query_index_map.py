@@ -18,6 +18,13 @@ is what AF2 does for real templates (`_build_query_to_hit_index_mapping`).
 TIE-BREAKS, stated explicitly because they are correctness choices and not formatting ones:
   * The npz sequence must be a SUBSEQUENCE of the query -- same protein, residues only ever dropped,
     never inserted or substituted. Anything else is reported as a failure rather than forced.
+  * "X" is a wildcard on BOTH sides (see `_match`), matching the runtime assert in
+    `sample_features`. 205 of the generated chains have a seqres that is entirely "X", so for those
+    the sequence check is vacuous by construction and `residue_index - 1` is the only evidence
+    available -- which is exactly why the `ridx - 1`-first policy below is load-bearing rather than
+    a mere optimisation. ⛔ Do NOT "fix" a future all-X failure by falling back to the alignment:
+    with no sequence constraint the leftmost embedding is arbitrary, and the runtime assert cannot
+    catch a wrong one because every comparison it would make is skipped.
   * `residue_index - 1` WINS whenever it is sequence-valid. It was measured sequence-exact on
     1500/1500 randomly sampled chains, whereas a deletion inside a run of identical residues makes
     the alignment ambiguous for 17-48% of chains, where a leftmost pick is arbitrary. Preferring an
@@ -55,30 +62,55 @@ ap.add_argument("--progress-every", type=int, default=200)
 a = ap.parse_args()
 
 
-def _match(sc: str, qc: str) -> bool:
-    # npz aatype 20 renders as "X" (unknown residue); it matches whatever the query has there, since
-    # identity simply cannot be checked at that position. Wildcards stay correct for greedy matching
-    # because a wildcard matches everything, so consuming it as early as possible never blocks a
-    # later match.
+def _match_strict(sc: str, qc: str) -> bool:
+    """npz "X" is a wildcard; a query "X" is NOT. The tightest test available."""
     return sc == qc or sc == "X"
 
 
-def subsequence_map(short: str, long: str):
+def _match_sym(sc: str, qc: str) -> bool:
+    """"X" is a wildcard on BOTH sides -- the criterion the RUNTIME actually enforces.
+
+    ⛔⛔ WHY BOTH MATCHERS EXIST, AND WHY THE ORDER MATTERS (fixed 2026-08-18).
+    "X" means "residue identity unknown here", so it cannot CONTRADICT a concrete residue on the
+    other side, whichever side carries it. The live assert in `SyntheticTemplatePool.sample_features`
+    already works this way -- it drops a position from the comparison when EITHER side is "X"
+    (`(letters != "X") & (qchars != "X")`). This builder used to wildcard only the npz side, making
+    it STRICTER THAN ITS OWN CONSUMER: it rejected 448 chains the training path would have accepted,
+    every one of which had a perfectly valid `residue_index - 1` map. (Diagnosed by
+    `prune_work/diagnose_unmapped_chains.py`; 205 of them have a seqres that is entirely "X" --
+    non-standard polymers where the sequence carries no information at all.)
+
+    ⭐⭐ BUT LOOSENING IS NOT FREE FOR THE ALIGNMENT PATH. A wildcard makes the greedy embedding
+    match earlier, so `subsequence_map` can consume an npz residue at an "X" slot instead of at the
+    concrete residue it really corresponds to. Measured: switching the alignment to the symmetric
+    matcher changed the map for 21 already-mapped chains and turned every one of them AMBIGUOUS
+    (leftmost != rightmost) where 8 had been unambiguous before. So the cascade below is ordered
+    strictest-evidence-first and only loosens when the tighter rule provably cannot explain the
+    data -- which leaves all 82282 previously-mapped chains untouched while still recovering the 448.
+    ⛔ Do NOT collapse these two back into one matcher.
+
+    Wildcards stay correct for greedy matching because a wildcard matches everything, so consuming
+    one as early as possible never blocks a later match.
+    """
+    return sc == qc or sc == "X" or qc == "X"
+
+
+def subsequence_map(short: str, long: str, match):
     """Leftmost embedding of `short` into `long` as a subsequence, or None if there is none."""
     out = np.empty(len(short), np.int32)
     j = 0
     for i, ch in enumerate(long):
-        if j < len(short) and _match(short[j], ch):
+        if j < len(short) and match(short[j], ch):
             out[j] = i
             j += 1
     return out if j == len(short) else None
 
 
-def rightmost_map(short: str, long: str):
+def rightmost_map(short: str, long: str, match):
     out = np.empty(len(short), np.int32)
     j = len(short) - 1
     for i in range(len(long) - 1, -1, -1):
-        if j >= 0 and _match(short[j], long[i]):
+        if j >= 0 and match(short[j], long[i]):
             out[j] = i
             j -= 1
     return out if j < 0 else None
@@ -119,7 +151,8 @@ if a.chain_cache is not None:
 
 names, maps, qlens, flags = [], [], [], []
 stat = dict(ok=0, ambiguous=0, not_subseq=0, no_mmcif=0, no_chain=0, no_npz=0,
-            from_ridx=0, from_align=0, from_cache=0, from_mmcif=0)
+            from_ridx=0, from_ridx_x=0, from_align=0, from_align_x=0,
+            from_cache=0, from_mmcif=0)
 failures = []
 
 for n, i in enumerate(mine):
@@ -159,36 +192,50 @@ for n, i in enumerate(mine):
     # chains that were already placed correctly. The alignment exists for the cases `ridx - 1`
     # provably cannot explain (1eis_A: contiguous numbering across a real gap, 15/85 agreement).
     r = d["residue_index"].astype(int) - 1
-    ridx_ok = (
+    base_ok = (
         len(r) == len(npz_seq)
         and r.min() >= 0 and r.max() < len(query)
-        and (np.diff(r) > 0).all()
-        and all(_match(sc, query[qi]) for sc, qi in zip(npz_seq, r))
+        and bool((np.diff(r) > 0).all())
     )
-    if ridx_ok:
+    # ⭐⭐ STRICTEST EVIDENCE FIRST. `ridx - 1` before any alignment (it carries independent
+    # structural information, and the alignment's leftmost pick is arbitrary wherever it is
+    # ambiguous), and within each, the strict matcher before the symmetric one -- so loosening the
+    # wildcard can only ADD chains, never silently re-place a chain that was already fine.
+    m = amb = src = None
+    if base_ok and all(_match_strict(sc, query[qi]) for sc, qi in zip(npz_seq, r)):
         m, amb, src = r.astype(np.int32), False, "ridx"
+    elif base_ok and all(_match_sym(sc, query[qi]) for sc, qi in zip(npz_seq, r)):
+        # a query "X" facing a concrete npz residue: a modified/unknown seqres position, which is
+        # no evidence against this placement
+        m, amb, src = r.astype(np.int32), False, "ridx_x"
     else:
-        m = subsequence_map(npz_seq, query)
-        if m is None:
-            stat["not_subseq"] += 1
-            failures.append((chain, "ridx-1 invalid AND npz seq is not a subsequence of the query",
-                             f"npz {len(npz_seq)} vs query {len(query)}"))
-            continue
-        rm = rightmost_map(npz_seq, query)
-        amb = rm is None or not np.array_equal(rm, m)
-        src = "align"
+        for match, tag in ((_match_strict, "align"), (_match_sym, "align_x")):
+            cand = subsequence_map(npz_seq, query, match)
+            if cand is None:
+                continue
+            rm = rightmost_map(npz_seq, query, match)
+            m, amb, src = cand, (rm is None or not np.array_equal(rm, cand)), tag
+            break
+    if m is None:
+        stat["not_subseq"] += 1
+        failures.append((chain, "no valid ridx-1 and npz seq is not a subsequence of the query",
+                         f"npz {len(npz_seq)} vs query {len(query)}"))
+        continue
     assert (np.diff(m) > 0).all() and 0 <= m.min() and m.max() < len(query)
-    assert all(_match(sc, query[qi]) for sc, qi in zip(npz_seq, m)), chain
+    # the invariant is checked with the SYMMETRIC matcher because that is what the runtime asserts;
+    # a strict-sourced map satisfies it a fortiori
+    assert all(_match_sym(sc, query[qi]) for sc, qi in zip(npz_seq, m)), chain
 
     stat["ambiguous"] += amb
     stat["ok"] += 1
-    stat["from_ridx"] += (src == "ridx")
-    stat["from_align"] += (src == "align")
+    stat[f"from_{src}"] += 1
 
     names.append(chain)
     maps.append(m)
     qlens.append(len(query))
-    flags.append((2 if src == "align" else 0) | (1 if amb else 0))
+    # bit0 ambiguous, bit1 alignment-sourced, bit2 needed the symmetric-X matcher
+    flags.append((2 if src.startswith("align") else 0) | (1 if amb else 0)
+                 | (4 if src.endswith("_x") else 0))
     if (n + 1) % a.progress_every == 0:
         print(f"  {n+1}/{len(mine)}  ok={stat['ok']} amb={stat['ambiguous']} "
               f"bad={stat['not_subseq']}", flush=True)
@@ -201,7 +248,7 @@ np.savez(
     qmap=np.concatenate(maps) if maps else np.zeros(0, np.int32),
     qmap_len=lens,
     query_len=np.array(qlens, np.int32),
-    # bit0 = ambiguous alignment, bit1 = placement came from the alignment not ridx-1
+    # bit0 = ambiguous alignment, bit1 = from the alignment not ridx-1, bit2 = needed symmetric X
     ambiguous=np.array(flags, np.int8),
 )
 print(f"\nshard {a.shard}: wrote {len(names)} chains to {a.out}")

@@ -19,7 +19,11 @@ from openfold.data import (
     mmcif_parsing,
     templates,
 )
-from openfold.data.synthetic_templates import merge_template_features
+from openfold.data.synthetic_templates import (
+    merge_template_features,
+    natural_template_count,
+    subsample_natural_templates,
+)
 from openfold.utils.tensor_utils import dict_multimap
 from openfold.utils.tensor_utils import (
     tensor_tree_map,
@@ -61,6 +65,9 @@ class OpenFoldSingleDataset(torch.utils.data.Dataset):
                  enable_recursive_search: bool = True,
                  synthetic_template_pool: Optional[Any] = None,
                  n_synthetic_templates: int = 0,
+                 t2_replace_natural: bool = False,
+                 promoted_template_pool: Optional[Any] = None,
+                 n_promoted_templates: int = 0,
                  ):
         """
             Args:
@@ -110,6 +117,11 @@ class OpenFoldSingleDataset(torch.utils.data.Dataset):
         # T2: pool of Protpardelle synthetic templates mixed into this chain's template hits
         self.synthetic_template_pool = synthetic_template_pool
         self.n_synthetic_templates = n_synthetic_templates
+        # T2 count-matched variant: substitute for natural hits instead of appending to them
+        self.t2_replace_natural = t2_replace_natural
+        # T4 phase 3: promoted predictions, mixed in beside the synthetic ones (see the hook below)
+        self.promoted_template_pool = promoted_template_pool
+        self.n_promoted_templates = n_promoted_templates
 
         self.chain_data_cache = None
         if chain_data_cache_path is not None:
@@ -326,24 +338,58 @@ class OpenFoldSingleDataset(torch.utils.data.Dataset):
         if self._output_raw:
             return data
 
-        # T2: concatenate synthetic Protpardelle templates onto the natural hits BEFORE the feature
-        # pipeline, so train-mode `subsample_templates` draws uniformly over the combined list --
-        # which is the requested "mix with real templates, uniform over the mixture" policy with no
-        # change to the sampler. Seeded from the worker's torch RNG so it follows --seed.
+        # T2/T4: extra template sources are mixed in BEFORE the feature pipeline, so train-mode
+        # `subsample_templates` draws uniformly over the combined list -- the requested "uniform over
+        # the mixture" policy with no change to the sampler.
+        # ⭐ Both pools expose the identical `(chain, n, rng, query_sequence)` signature and emit the
+        # identical natural-hit layout, so this loop is source-agnostic: T4 stacks on T1 (synthetic
+        # pool absent) or on T2 (both active) with no branching here.
+        extra_pools = []
         if self.synthetic_template_pool is not None and self.n_synthetic_templates > 0:
+            extra_pools.append((self.synthetic_template_pool, self.n_synthetic_templates))
+        if self.promoted_template_pool is not None and self.n_promoted_templates > 0:
+            extra_pools.append((self.promoted_template_pool, self.n_promoted_templates))
+
+        if extra_pools:
             # ⛔ The query sequence is REQUIRED, not a convenience: the npz is on the native
             # structure's resolved-residue frame and has to be scattered onto the query's full
             # frame. Without it the template arrays come out at the native length and the merge
             # below fails on the NUM_RES axis (this is what killed the first T2 launch).
             qseq = data["sequence"][0]
             qseq = qseq.decode() if isinstance(qseq, bytes) else str(qseq)
-            synth = self.synthetic_template_pool.sample_features(
-                name, self.n_synthetic_templates,
-                np.random.default_rng(int(torch.randint(0, 2 ** 31 - 1, (1,)).item())),
-                query_sequence=qseq,
-            )
-            if synth is not None:
-                data = merge_template_features(data, synth)
+            n_nat = natural_template_count(data)
+            # ⭐⭐ COUNT-MATCHED MODE (--t2_replace_natural). Appending grows the pool, and
+            # `templates_crop_start ~ Uniform{0..pool}` INCLUSIVE means a bigger pool also changes
+            # the delivered COUNT (pool 4 -> mean 2.00/step, P(0 templates) 20%; pool 8 -> 2.89 and
+            # 11.1%). So append mode differs from T1 in template CONTENT *and* COUNT, and a gap
+            # cannot be attributed to content. In replace mode the TOTAL added is budgeted against
+            # the natural count and exactly that many naturals are dropped, so the pool size -- and
+            # the whole delivered-count distribution -- is IDENTICAL to T1's.
+            # ⚠️ The budget is spent in list order (synthetic before promoted), which only binds when
+            # the requested totals exceed the natural count.
+            budget = n_nat if self.t2_replace_natural else None
+            added = 0
+            extras = []
+            # one rng for every draw here so the whole decision is reproducible under --seed
+            rng = np.random.default_rng(int(torch.randint(0, 2 ** 31 - 1, (1,)).item()))
+            for pool, n_want in extra_pools:
+                n_req = n_want if budget is None else min(n_want, budget - added)
+                if n_req <= 0:
+                    continue
+                extra = pool.sample_features(name, n_req, rng, query_sequence=qseq)
+                if extra is None:
+                    continue
+                added += int(extra["template_all_atom_positions"].shape[0])
+                extras.append(extra)
+            # ⛔ Every pool is sampled BEFORE anything is dropped, and the drop uses what actually
+            # ARRIVED rather than what was requested: a chain with fewer eligible templates gets
+            # fewer back, and dropping the requested count would shrink the pool below T1's and
+            # break the matching in the other direction. Sampling first also keeps
+            # `subsample_natural_templates` operating on a purely natural template axis.
+            if self.t2_replace_natural and added:
+                data = subsample_natural_templates(data, n_nat - added, rng)
+            for extra in extras:
+                data = merge_template_features(data, extra)
 
         feats = self.feature_pipeline.process_features(
             data, self.mode
@@ -957,6 +1003,9 @@ class OpenFoldDataModule(pl.LightningDataModule):
                  t2_min_tm: float = 0.3,
                  t2_max_tm: float = 0.9,
                  t2_n_synthetic: int = 0,
+                 t2_replace_natural: bool = False,
+                 t4_promoted_pool: Optional[Any] = None,
+                 t4_n_promoted: int = 0,
                  enable_recursive_search: bool = True,
                  **kwargs
                  ):
@@ -1031,6 +1080,9 @@ class OpenFoldDataModule(pl.LightningDataModule):
 
         # T2: built once here (the index is a single npz) and shared by the dataloader workers
         self.n_synthetic_templates = t2_n_synthetic
+        self.t2_replace_natural = t2_replace_natural
+        self.t4_promoted_pool = t4_promoted_pool
+        self.t4_n_promoted = t4_n_promoted
         self.synthetic_template_pool = None
         if t2_template_index is not None and t2_n_synthetic > 0:
             from openfold.data.synthetic_templates import SyntheticTemplatePool
@@ -1087,6 +1139,9 @@ class OpenFoldDataModule(pl.LightningDataModule):
                 # clean measurement of what the model can do on its own
                 synthetic_template_pool=self.synthetic_template_pool,
                 n_synthetic_templates=self.n_synthetic_templates,
+                t2_replace_natural=self.t2_replace_natural,
+                promoted_template_pool=self.t4_promoted_pool,
+                n_promoted_templates=self.t4_n_promoted,
             )
 
             distillation_dataset = None
@@ -1119,6 +1174,18 @@ class OpenFoldDataModule(pl.LightningDataModule):
                 generator = torch.Generator()
                 generator = generator.manual_seed(self.batch_seed + 1)
 
+            # ⛔⛔ T4 resolves the chain a promoted prediction belongs to from
+            # `batch["batch_idx"]`, which `OpenFoldSingleDataset.__getitem__` stamps with the INNER
+            # (per-dataset) index. `OpenFoldDataset` does NOT record which dataset a sample came
+            # from, so with two datasets every distillation sample would resolve to the wrong chain
+            # name and promote a template onto it. Assert rather than rely on it.
+            if self.t4_n_promoted > 0 or self.t4_promoted_pool is not None:
+                assert len(datasets) == 1, (
+                    "T4 promotion needs len(datasets) == 1 so batch_idx identifies the chain "
+                    f"unambiguously, but got {len(datasets)} (--distillation_data_dir set?). "
+                    "Chain resolution would silently attribute promoted templates to the wrong "
+                    "chains."
+                )
             self.train_dataset = OpenFoldDataset(
                 datasets=datasets,
                 probabilities=probabilities,
@@ -1175,6 +1242,18 @@ class OpenFoldDataModule(pl.LightningDataModule):
             num_workers=self.config.data_module.data_loaders.num_workers,
             collate_fn=batch_collator,
         )
+
+        # ⛔⛔ The T4 promoted pool is refreshed in the MAIN process at epoch start, and reaches the
+        # workers only because they are re-forked for each epoch's iterator. Turning
+        # persistent_workers on (the [[proteina_dataloader_cow_leak]] fix) would freeze every
+        # worker's pool at the first epoch's snapshot and training would carry on against a stale
+        # template set with no error. Assert instead of relying on the default staying False.
+        if stage == "train" and self.t4_promoted_pool is not None:
+            assert not getattr(dl, "persistent_workers", False), (
+                "T4 promotion requires persistent_workers=False: refresh() runs in the main "
+                "process at epoch start and only reaches workers when they are re-forked. With "
+                "persistent workers the pool silently freezes at the first epoch's contents."
+            )
 
         return dl
 

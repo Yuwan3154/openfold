@@ -32,18 +32,43 @@ from pathlib import Path
 
 import numpy as np
 
+from openfold.np import residue_constants as rc
+
 CA = 1
+
+
+def is_control_chain(chain: str, control_fraction: float) -> bool:
+    """Held-out membership: True when this chain must NEVER receive promoted templates.
+
+    ⭐ The control set exists so the effect of promotion is measurable: chains inside it keep the
+    template distribution they started with, so their validation curve is the counterfactual for the
+    chains outside it. That only works if membership is decided the SAME way everywhere.
+
+    ⛔ crc32 of the name, never builtin `hash()`: `hash()` is randomized per process, so the split
+    would differ between DDP ranks, between dataloader workers and between restarts -- and promoted
+    templates would leak into the very chains meant to be clean, silently destroying the control.
+    (This is the same trap that broke resumability in the production template run.)
+    ⭐ The `t4-control:` prefix makes this split statistically INDEPENDENT of the output sharding,
+    which hashes the bare chain name -- without it, control membership would correlate with which
+    shard directory a chain lives in.
+    """
+    if control_fraction <= 0.0:
+        return False
+    return (zlib.crc32(b"t4-control:" + chain.encode()) % 1_000_000) < control_fraction * 1_000_000
 
 
 class PromotedTemplateWriter:
     """Background writer for promoted predictions. One instance per rank."""
 
-    def __init__(self, pool_dir: str, rank: int, max_queue: int = 64):
+    def __init__(self, pool_dir: str, rank: int, max_queue: int = 64,
+                 control_fraction: float = 0.0):
         self.root = Path(pool_dir) / f"rank{rank}"
         self.root.mkdir(parents=True, exist_ok=True)
         self.index_path = self.root / "index.jsonl"
+        self.control_fraction = control_fraction
         self.n_written = 0
         self.n_dropped = 0
+        self.n_control_skipped = 0
         self._q: queue.Queue = queue.Queue(maxsize=max_queue)
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -72,6 +97,11 @@ class PromotedTemplateWriter:
     def submit(self, chain, epoch, step, tm_pred, tm_template,
                coords37, atom_mask37, aatype, residue_index):
         """Queue one promoted prediction. Non-blocking: drops rather than stalling the step."""
+        # held-out chains are refused at the WRITE side, so nothing about them ever reaches the pool
+        # -- cheaper and safer than filtering on read, where one forgotten call site leaks
+        if is_control_chain(chain, self.control_fraction):
+            self.n_control_skipped += 1
+            return
         mask = np.asarray(atom_mask37, dtype=bool)
         rec = {
             "chain": chain, "epoch": int(epoch), "step": int(step),
@@ -104,10 +134,12 @@ class PromotedTemplatePool:
     mutating underneath it -- otherwise two dataloader workers could disagree about what exists.
     """
 
-    def __init__(self, pool_dir: str, max_per_chain: int = 0):
+    def __init__(self, pool_dir: str, max_per_chain: int = 0, control_fraction: float = 0.0):
         self.root = Path(pool_dir)
         self.max_per_chain = max_per_chain
+        self.control_fraction = control_fraction
         self.by_chain: dict[str, list] = {}
+        self.n_control_dropped = 0
 
     def refresh(self) -> int:
         by_chain: dict[str, list] = {}
@@ -119,6 +151,13 @@ class PromotedTemplatePool:
                 rec = json.loads(line)
                 rec["_path"] = rank_root / rec["npz"]
                 by_chain.setdefault(rec["chain"], []).append(rec)
+        # belt-and-braces: the writer already refuses control chains, but a pool carried over
+        # from a run with a different --t4_control_fraction would otherwise serve them
+        if self.control_fraction > 0.0:
+            before = len(by_chain)
+            by_chain = {c: v for c, v in by_chain.items()
+                        if not is_control_chain(c, self.control_fraction)}
+            self.n_control_dropped = before - len(by_chain)
         if self.max_per_chain > 0:
             # keep the BEST by the prediction's own TM -- a cap that kept the newest instead would
             # let a late bad epoch evict good templates
@@ -132,30 +171,63 @@ class PromotedTemplatePool:
         return bool(self.by_chain.get(chain))
 
     def sample_features(self, chain: str, n: int, rng: np.random.Generator,
-                        n_res: int) -> dict | None:
-        """`n` promoted templates for `chain`, in the raw pre-transform layout, length `n_res`.
+                        query_sequence: str) -> dict | None:
+        """`n` promoted templates for `chain`, in the NATURAL-HIT layout on the query frame.
 
-        `n_res` is the FULL chain length; each promoted crop is placed at its own residue_index and
-        masked elsewhere.
+        ⛔⛔ THE LAYOUT IS THE WHOLE POINT OF THIS SIGNATURE. Phase 2 returned
+        `positions/mask/aatype/tm`, which `merge_template_features` does not consume: it copies only
+        keys already present in the natural features and ZERO-FILLS anything it cannot find, so a
+        `positions` key would have been silently discarded and the model handed four blank templates.
+        This emits exactly what `SyntheticTemplatePool.sample_features` emits, with the same
+        `(chain, n, rng, query_sequence)` signature, so the two pools are interchangeable at the call
+        site and neither can drift from the layout the feature pipeline expects.
+
+        ⛔ `template_aatype` must be HHBLITS-ordered: `fix_templates_aatype` argmaxes it and then
+        gathers through `MAP_HHBLITS_AATYPE_TO_OUR_AATYPE`, so a restype-ordered one-hot silently
+        becomes the WRONG amino acids.
+
+        ⚠️ Unlike the synthetic pool -- where every template of a chain covers the same residues and
+        can share one sequence -- each promoted template is a different CROP, so coverage differs per
+        template and the sequence/one-hot are built per template rather than broadcast.
         """
         recs = self.by_chain.get(chain)
         if not recs:
             return None
+        n_res = len(query_sequence)
         pick = rng.choice(len(recs), size=min(n, len(recs)), replace=False)
         k = len(pick)
         pos = np.zeros((k, n_res, 37, 3), np.float32)
         msk = np.zeros((k, n_res, 37), np.float32)
-        aat = np.zeros((k, n_res), np.int64)
+        onehot = np.zeros((k, n_res, 22), np.float32)
+        seqs, names = [], []
         for j, i in enumerate(pick):
             rec = recs[i]
             d = np.load(rec["_path"], allow_pickle=False)
             m = d["atom_mask"]                                  # (n_crop, 37) bool
-            ridx = d["residue_index"].astype(int)               # (n_crop,)
-            keep = ridx < n_res                                 # guard a stale pool entry
+            ridx = d["residue_index"].astype(int)               # (n_crop,) query positions
+            # guard a stale pool entry: a chain re-cropped shorter, or a pool carried across runs
+            keep = (ridx >= 0) & (ridx < n_res)
             full = np.zeros((m.shape[0], 37, 3), np.float32)
             full[m] = d["coords"]
-            pos[j, ridx[keep]] = full[keep]
-            msk[j, ridx[keep]] = m[keep].astype(np.float32)
-            aat[j, ridx[keep]] = d["aatype"][keep]
-        return {"positions": pos, "mask": msk, "aatype": aat,
-                "tm": np.array([recs[i]["tm_pred"] for i in pick], np.float32)}
+            q = ridx[keep]
+            pos[j, q] = full[keep]
+            msk[j, q] = m[keep].astype(np.float32)
+            aat = d["aatype"].astype(int)[keep]
+            # "-" wherever this crop does not reach, matching templates._extract_template_features
+            chars = ["-"] * n_res
+            for t, p in enumerate(q):
+                chars[p] = rc.restypes[aat[t]] if aat[t] < len(rc.restypes) else "X"
+            seq = "".join(chars)
+            onehot[j] = rc.sequence_to_onehot(seq, rc.HHBLITS_AA_TO_ID).astype(np.float32)
+            seqs.append(seq.encode())
+            names.append(f"t4_{chain}_e{rec['epoch']}_s{rec['step']}".encode())
+        return {
+            "template_all_atom_positions": pos,
+            "template_all_atom_mask": msk,
+            "template_aatype": onehot,
+            "template_sequence": np.array(seqs, dtype=object),
+            "template_domain_names": np.array(names, dtype=object),
+            # no hhsearch analogue; zeros match empty_template_feats' own convention
+            "template_sum_probs": np.zeros((k, 1), np.float32),
+            "_tm": np.array([recs[i]["tm_pred"] for i in pick], np.float32),
+        }

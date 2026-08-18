@@ -10,7 +10,12 @@ import pytest
 import torch
 import zlib
 
-from openfold.data.synthetic_templates import SyntheticTemplatePool, merge_template_features
+from openfold.data.synthetic_templates import (
+    SyntheticTemplatePool,
+    merge_template_features,
+    natural_template_count,
+    subsample_natural_templates,
+)
 from openfold.data.data_transforms import fix_templates_aatype
 from openfold.data.templates import empty_template_feats
 from openfold.np import residue_constants as rc
@@ -446,3 +451,125 @@ def test_no_qmap_at_all_still_uses_residue_index(tmp_path):
     assert not p.qmap
     f = p.sample_features(chain, 1, np.random.default_rng(0), query_sequence=qseq)
     assert f["template_all_atom_positions"].shape[1] == len(qseq)
+
+
+# ---------------------------------------------------------------------------------------------
+# COUNT-MATCHED MODE (--t2_replace_natural): the pool must stay exactly the size it would have been
+# without synthetic templates, because `templates_crop_start ~ Uniform{0..pool}` is INCLUSIVE and so
+# a bigger pool silently changes the delivered COUNT as well as the content.
+# ---------------------------------------------------------------------------------------------
+
+def _natural(k, tag=b"nat"):
+    """k natural hits whose per-hit content is IDENTIFIABLE, so a subsample can be checked by name.
+
+    ⛔ The template axis length is passed in explicitly rather than derived from anything the
+    synthetic side produces -- deriving one side's shape from the other is what made the original
+    merge test unable to catch the query-frame bug.
+    """
+    return {
+        "template_all_atom_positions": np.arange(k * L * 37 * 3, dtype=np.float32).reshape(k, L, 37, 3),
+        "template_all_atom_mask": np.ones((k, L, 37), np.float32),
+        "template_aatype": np.zeros((k, L, 22), np.float32),
+        "template_sum_probs": np.arange(k, dtype=np.float32).reshape(k, 1),
+        "template_domain_names": np.array([tag + b"_%d" % i for i in range(k)], dtype=object),
+        "template_sequence": np.array([b"S%d" % i for i in range(k)], dtype=object),
+        "aatype": np.zeros((L,), np.int64),
+    }
+
+
+def test_natural_template_count_reads_the_numeric_array_not_the_placeholder():
+    """empty_template_feats gives the numeric arrays a 0-length axis but the object arrays length 1;
+    counting off template_sequence would report a hit that does not exist."""
+    e = empty_template_feats(L)
+    assert len(e["template_domain_names"]) == 1                    # the trap
+    assert natural_template_count(e) == 0                          # the correct answer
+    assert natural_template_count(_natural(4)) == 4
+    assert natural_template_count({}) == 0
+
+
+def test_subsample_keeps_exactly_k_and_touches_only_template_keys():
+    nat = _natural(4)
+    out = subsample_natural_templates(nat, 2, np.random.default_rng(0))
+    assert out["template_all_atom_positions"].shape == (2, L, 37, 3)
+    assert out["template_sum_probs"].shape == (2, 1)
+    assert len(out["template_domain_names"]) == 2
+    assert len(out["template_sequence"]) == 2
+    assert out["aatype"].shape == (L,)                             # non-template key untouched
+    assert nat["template_all_atom_positions"].shape[0] == 4        # input not mutated
+
+
+def test_subsample_keeps_whole_hits_together():
+    """Every kept key must come from the SAME hit indices -- a per-key independent draw would
+    silently pair one template's coordinates with another's sequence."""
+    nat = _natural(5)
+    out = subsample_natural_templates(nat, 3, np.random.default_rng(1))
+    kept = [int(n.split(b"_")[1]) for n in out["template_domain_names"]]
+    assert [int(x) for x in out["template_sum_probs"][:, 0]] == kept
+    assert [int(s[1:]) for s in [b.decode().encode() for b in out["template_sequence"]]] == kept
+    for j, orig in enumerate(kept):
+        assert np.array_equal(out["template_all_atom_positions"][j],
+                              nat["template_all_atom_positions"][orig])
+
+
+def test_subsample_is_a_noop_when_nothing_needs_dropping():
+    nat = _natural(3)
+    for keep in (3, 4):
+        out = subsample_natural_templates(nat, keep, np.random.default_rng(2))
+        assert out["template_all_atom_positions"].shape[0] == 3
+    assert subsample_natural_templates(empty_template_feats(L), 0, np.random.default_rng(2)) is not None
+
+
+def test_subsample_to_zero_leaves_a_mergeable_empty_axis():
+    """keep=0 happens whenever the synthetic count equals the natural count; the result still has to
+    merge cleanly rather than leaving a ragged or phantom template axis."""
+    out = subsample_natural_templates(_natural(4), 0, np.random.default_rng(3))
+    assert out["template_all_atom_positions"].shape[0] == 0
+    assert len(out["template_domain_names"]) == 0
+
+
+def test_subsample_rejects_a_ragged_template_axis():
+    nat = _natural(4)
+    nat["template_sequence"] = np.array([b"only_one"], dtype=object)
+    with pytest.raises(ValueError, match="ragged"):
+        subsample_natural_templates(nat, 2, np.random.default_rng(4))
+
+
+def test_subsample_draws_uniformly_not_top_k():
+    """The natural component must stay distributed as in T1, so the survivors cannot be the top-k by
+    sum_probs. Over many draws every hit index has to appear."""
+    seen = set()
+    for s in range(60):
+        out = subsample_natural_templates(_natural(4), 2, np.random.default_rng(s))
+        seen.update(int(n.split(b"_")[1]) for n in out["template_domain_names"])
+    assert seen == {0, 1, 2, 3}
+
+
+def test_count_matched_merge_holds_the_pool_at_the_natural_size(pool):
+    """The end-to-end invariant the flag exists for: replace-then-merge leaves the template axis at
+    exactly the natural count, whereas plain append grows it."""
+    p, _, QSEQ = pool
+    for n_nat, n_synth in [(4, 4), (4, 2), (4, 1), (2, 4), (1, 1)]:
+        nat = _natural(n_nat)
+        rng = np.random.default_rng(7)
+        k_req = min(n_synth, n_nat)
+        synth = p.sample_features("1abc_A", k_req, rng, query_sequence=QSEQ)
+        k_got = synth["template_all_atom_positions"].shape[0]
+        matched = merge_template_features(
+            subsample_natural_templates(nat, n_nat - k_got, rng), synth)
+        assert matched["template_all_atom_positions"].shape[0] == n_nat, (n_nat, n_synth)
+        assert len(matched["template_domain_names"]) == n_nat
+        n_syn_kept = sum(1 for d in matched["template_domain_names"] if d.startswith(b"pp1c_"))
+        assert n_syn_kept == k_got
+        # and the append path still grows, so the two modes are genuinely different
+        appended = merge_template_features(_natural(n_nat), synth)
+        assert appended["template_all_atom_positions"].shape[0] == n_nat + k_got
+
+
+def test_count_matched_with_no_natural_hits_adds_nothing(pool):
+    """min(n_synth, n_nat) = 0 when the chain has no natural templates, so a count-matched run must
+    show the model nothing there -- exactly as T1 does -- rather than quietly reintroducing a pool."""
+    p, _, QSEQ = pool
+    nat = empty_template_feats(L)
+    n_nat = natural_template_count(nat)
+    assert n_nat == 0
+    assert min(4, n_nat) == 0                                      # so sample_features is never called
