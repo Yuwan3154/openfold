@@ -78,11 +78,14 @@ n_query_like, n_homolog, n_masked_out = 0, 0, 0
 for c in pick:
     torch.manual_seed(a.seed); np.random.seed(a.seed)
     f = ds[idx_of[c]]
-    take = lambda t: t[..., 0] if t.dim() > (2 if t.dim() > 2 else 1) else t
-    msa = f["msa"][..., 0] if f["msa"].dim() > 2 else f["msa"]
-    ex = f["extra_msa"][..., 0] if f["extra_msa"].dim() > 2 else f["extra_msa"]
-    exm = f["extra_msa_mask"][..., 0] if f["extra_msa_mask"].dim() > 2 else f["extra_msa_mask"]
-    aat = f["aatype"][..., 0] if f["aatype"].dim() > 1 else f["aatype"]
+    # ⛔ `msa` does NOT survive the feature pipeline -- it is consumed into `msa_feat` and `true_msa`.
+    # `true_msa` is the pre-masking cluster MSA, still HHBLITS-coded, so it is the right comparison row.
+    strip = lambda t: t[..., 0]                      # every feature carries a trailing recycling dim
+    msa = strip(f["true_msa"])
+    ex = strip(f["extra_msa"])
+    exm = strip(f["extra_msa_mask"])
+    exrm = strip(f["extra_msa_row_mask"])
+    aat = strip(f["aatype"])
 
     q_rt = de_rt(aat.numpy())
     m0 = de_hh(msa[0].numpy())
@@ -93,13 +96,13 @@ for c in pick:
     ident = 100.0 * same / len(m0)
     print(f"\n=== {c} ===  msa {tuple(msa.shape)}  extra_msa {tuple(ex.shape)}")
     print(f"  aatype (restype ids) : {q_rt[:80]}")
-    print(f"  msa[0]   (=cluster)  : {m0[:80]}")
+    print(f"  true_msa[0] (cluster): {m0[:80]}")
     print(f"  extra_msa[0]         : {e0[:80]}")
-    print(f"  extra_msa[0] identity to msa[0]: {ident:.1f}%  ({same}/{len(m0)})")
-    print(f"  extra_msa_mask[0] mean = {live:.3f}  -> row is "
-          f"{'LIVE (attended)' if live > 0 else 'MASKED OUT (inert)'}")
+    print(f"  extra_msa[0] identity to true_msa[0]: {ident:.1f}%  ({same}/{len(m0)})")
+    print(f"  extra_msa_mask[0] mean = {live:.3f}   extra_msa_row_mask[0] = {float(exrm[0]):.3f}"
+          f"  -> row is {'LIVE (attended)' if live > 0 and float(exrm[0]) > 0 else 'MASKED OUT (inert)'}")
     print(f"  distinct symbols in extra_msa[0]: {sorted(set(e0))[:25]}")
-    if live == 0:
+    if live == 0 or float(exrm[0]) == 0:
         n_masked_out += 1
     elif ident > 95:
         n_query_like += 1
