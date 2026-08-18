@@ -59,14 +59,19 @@ random.seed(a.seed)
 pick = random.sample(chains, a.n_chains)
 idx_of = {ds.idx_to_chain_id(i): i for i in range(len(ds))}
 
-# ⛔ extra_msa/msa hold HHBLITS-ordered ids; aatype holds restype-ordered ids. Two different alphabets.
-HH = np.array([rc.ID_TO_HHBLITS_AA[i] for i in range(len(rc.ID_TO_HHBLITS_AA))])
+# ⛔⛔ THE MSA IS NOT HHBLITS-CODED BY THE TIME WE SEE IT. `input_pipeline.py:27` runs
+# `correct_msa_restypes` as one of the FIRST transforms, gathering through
+# MAP_HHBLITS_AATYPE_TO_OUR_AATYPE, so `true_msa`/`extra_msa` are in OUR restype order with X=20 and
+# GAP=21 -- i.e. `restypes_with_x_and_gap`. Decoding them with ID_TO_HHBLITS_AA (as this script first
+# did) prints a plausible-looking but WRONG sequence, and the tell is that the decoded `true_msa[0]`
+# does not match `aatype` even though the cluster row IS the query. Asserted below rather than trusted.
+MSA_ALPHA = np.array(rc.restypes_with_x_and_gap)          # 22 symbols: 20 aa + X + '-'
 RT = np.array(rc.restypes + ["X"])
 
 
-def de_hh(v):
+def de_msa(v):
     v = np.asarray(v, int)
-    return "".join(HH[np.clip(v, 0, len(HH) - 1)])
+    return "".join(MSA_ALPHA[np.clip(v, 0, len(MSA_ALPHA) - 1)])
 
 
 def de_rt(v):
@@ -75,6 +80,7 @@ def de_rt(v):
 
 
 n_query_like, n_homolog, n_masked_out = 0, 0, 0
+gaps = []
 for c in pick:
     torch.manual_seed(a.seed); np.random.seed(a.seed)
     f = ds[idx_of[c]]
@@ -88,13 +94,18 @@ for c in pick:
     aat = strip(f["aatype"])
 
     q_rt = de_rt(aat.numpy())
-    m0 = de_hh(msa[0].numpy())
-    e0 = de_hh(ex[0].numpy())
+    m0 = de_msa(msa[0].numpy())
+    e0 = de_msa(ex[0].numpy())
     live = float(exm[0].float().mean())
     # identity of the extra row to the CLUSTER row (both HHBLITS-coded, so directly comparable)
     same = int((ex[0] == msa[0]).sum())
     ident = 100.0 * same / len(m0)
-    print(f"\n=== {c} ===  msa {tuple(msa.shape)}  extra_msa {tuple(ex.shape)}")
+    # ⭐ the load-bearing sanity check: the cluster row must BE the query, decoded in the same
+    # alphabet. If this fails the decode is wrong and nothing below can be trusted.
+    gap = 100.0 * e0.count("-") / len(e0)
+    print(f"\n=== {c} ===  true_msa {tuple(msa.shape)}  extra_msa {tuple(ex.shape)}")
+    print(f"  cluster row == query?  {'YES' if m0 == q_rt else 'NO <-- DECODE IS WRONG'}")
+    print(f"  extra_msa[0] gap fraction: {gap:.1f}%")
     print(f"  aatype (restype ids) : {q_rt[:80]}")
     print(f"  true_msa[0] (cluster): {m0[:80]}")
     print(f"  extra_msa[0]         : {e0[:80]}")
@@ -108,9 +119,13 @@ for c in pick:
         n_query_like += 1
     else:
         n_homolog += 1
+    gaps.append(gap)
 
 print(f"\n================ VERDICT ================")
 print(f"  rows masked out entirely (track inert) : {n_masked_out}/{len(pick)}")
 print(f"  rows >95% identical to the query row   : {n_query_like}/{len(pick)}")
 print(f"  rows that are a DIFFERENT sequence     : {n_homolog}/{len(pick)}")
+print(f"  gap fraction of the extra row: median {np.median(gaps):.1f}%  "
+      f"min {min(gaps):.1f}%  max {max(gaps):.1f}%")
 print("  => the hypothesis 'extra MSA is just the query' holds only if the first two account for all.")
+print("  => a HIGH gap fraction means the leaked row is mostly empty even when it is a real homolog.")
