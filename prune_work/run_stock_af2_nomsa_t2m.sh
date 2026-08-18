@@ -23,10 +23,12 @@
 # ⭐ SUPERSEDES the earlier --t2_replace_natural design (fixed count of naturals dropped at pool
 #   level). That flag is GONE; do not resurrect it.
 #
-# ⛔⛔ ALL-X CHAINS ARE EXCLUDED (user): 243 training chains and 1 val chain have a seqres that is
-#   entirely "X" (non-canonical residues -> aatype 20 everywhere), so the model has no way to know what
-#   the sequence means and the example carries no signal. This launcher points at the *.noallx lists
-#   (87912 train / 53 val) written by prune_work/scan_allx_chains.py.
+# ⛔⛔ NON-CANONICAL-SEQUENCE CHAINS ARE EXCLUDED (user, 2026-08-18). A seqres of "X" means a
+#   non-canonical residue, which mmcif_parsing maps to aatype 20 (unknown), so the model has no way to
+#   know what the sequence means and the example carries no signal. Threshold is on the KNOWN side:
+#   chains with <5% canonical residues are cut -- 243 fully-X PLUS 26 that are 90-99.9% X.
+#   **269 training chains and 1 val chain** removed -> the *.noallx lists (87886 train / 53 val)
+#   written by `prune_work/scan_allx_chains.py --min-known-fraction 0.05`.
 #
 # ⛔ Do NOT add the tricks here -- that would collapse stages 2 and 3.
 # ⛔ Do NOT point OUT_DIR at T1's or T2's run dir: the auto-resume block finds any last.ckpt inside

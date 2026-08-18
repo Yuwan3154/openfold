@@ -7,10 +7,12 @@ an uninformative input. They were found via the T2 qmap (205 of the 82733 genera
 training list is larger than the generated set (5422 chains are L>512 and were never generated), so
 the lists have to be scanned independently rather than reusing that number.
 
-⚠️ THE THRESHOLD IS A USER DECISION AND IS NOT INVENTED HERE. `--max-x-fraction` defaults to 1.0,
-i.e. exclude ONLY chains that are 100% X, which is exactly what was asked for. The histogram this
-prints exists so the near-all-X tier (e.g. 185 of 189 residues X) can be judged on evidence: those
-carry almost as little signal, but where to cut is not ours to pick.
+⭐ THE THRESHOLD IS EXPRESSED ON THE **KNOWN** SIDE (`--min-known-fraction`), not the X side, because
+that is the quantity the decision is actually about -- "how much real sequence does the model get" --
+and it removes the >=/> ambiguity that an X-fraction threshold has at the boundary. User set it to
+0.05 on 2026-08-18 ("cut them too"): a chain with under 5% canonical residues is excluded, which is
+the 243 fully-X chains PLUS the 26 that are 90-99.9% X (one is 185 of 189 X). 1.0 would exclude
+everything; 0.0 excludes only fully-X.
 """
 
 import argparse
@@ -22,8 +24,10 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--chain-cache", required=True, help="chain_data_cache_full.json")
 ap.add_argument("--lists", nargs="+", required=True, help="chain list files to scan")
 ap.add_argument("--mmcif-dir", default=None, help="fallback for chains absent from the cache")
-ap.add_argument("--max-x-fraction", type=float, default=1.0,
-                help="exclude a chain when its X fraction is >= this. 1.0 = only fully-X chains.")
+ap.add_argument("--min-known-fraction", type=float, required=True,
+                help="exclude a chain when its fraction of CANONICAL (non-X) residues is BELOW this. "
+                     "0.05 = keep only chains with at least 5%% real sequence (user, 2026-08-18). "
+                     "Use 0.0 to exclude only fully-X chains.")
 ap.add_argument("--out-json", required=True)
 a = ap.parse_args()
 
@@ -61,13 +65,16 @@ for lst in a.lists:
             no_seq.append(c)
             continue
         f = s.count("X") / len(s)
+        known = 1.0 - f
         fracs.append(f)
         # ⭐ bucket on the KNOWN-residue side too, since that is what the model actually has to work
         # with: a 189-residue chain with 4 known residues is not meaningfully different from 0
         key = ("100% X" if f >= 1.0 else ">=99%" if f >= 0.99 else ">=90%" if f >= 0.90
                else ">=50%" if f >= 0.50 else ">=10%" if f >= 0.10 else ">0%" if f > 0 else "0%")
         hist[key] += 1
-        if f >= a.max_x_fraction:
+        # ⛔ strict `<`: a chain sitting exactly AT the threshold is kept, so the flag reads as
+        # "at least this much known sequence" with no boundary surprise
+        if known < a.min_known_fraction or f >= 1.0:
             excl.append(c)
     name = Path(lst).name
     print(f"\n=== {name}: {len(chains)} chains ===")
@@ -78,7 +85,7 @@ for lst in a.lists:
     print(f"  chains with <5% KNOWN residues (incl. fully-X): {n_known_lt5}")
     print(f"  no sequence available          : {len(no_seq)}"
           + (f"  e.g. {no_seq[:4]}" if no_seq else ""))
-    print(f"  EXCLUDED at --max-x-fraction {a.max_x_fraction}: {len(excl)}"
+    print(f"  EXCLUDED at --min-known-fraction {a.min_known_fraction}: {len(excl)}"
           + (f"  e.g. {excl[:5]}" if excl else ""))
     keep = [c for c in chains if c not in set(excl)]
     out[name] = {"total": len(chains), "excluded": excl, "n_keep": len(keep),
