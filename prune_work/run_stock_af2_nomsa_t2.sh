@@ -1,4 +1,9 @@
 #!/bin/bash
+# ⛔⛔ BEHAVIOUR CHANGED 2026-08-18 -- THIS SCRIPT NO LONGER REPRODUCES THE RUN IT IS NAMED FOR.
+#   `--enable_single_seq_mode` now also forces a QUERY-ONLY MSA (AF2Rank parity): the a3m files are
+#   never opened, so the extra-MSA track attends to fully-masked padding instead of a real homolog, and
+#   msa_feat's cluster_profile channels no longer carry homology. The runs that produced the recorded
+#   T1/T2 curves did NOT have this. To reproduce those exactly, add --no-force-query-only-msa.
 # ============================================================================================
 # T2 (2026-08-17 user directive): T1's recipe PLUS Protpardelle-1c partial-diffusion synthetic
 # templates mixed into the TRAIN split. Stage 2 of the 3-stage ladder:

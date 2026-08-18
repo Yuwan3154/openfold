@@ -760,3 +760,34 @@ def test_pool_target_never_exceeds_what_the_mixture_holds():
     assert (d[:, 0] == 2).all()
     d0, t0 = _draw(0, 0, 0)
     assert t0 == 0 and d0.shape[0] == 0              # nothing to draw -> hook does nothing
+
+
+# ---------------------------------------------------------------------------------------------
+# QUERY-ONLY MSA DEFAULT (2026-08-18). The resolution is tri-state and both wrong answers are
+# expensive: ON for a full-MSA run silently destroys it, OFF for a single-seq run silently
+# reintroduces the homology leak that --enable_single_seq_mode is supposed to exclude.
+# ---------------------------------------------------------------------------------------------
+
+def _resolve_force_query_only(flag, single_seq):
+    """Mirror of train_openfold.py's resolution, so the intended truth table is pinned somewhere
+    executable rather than living only in an if-statement two files away."""
+    if single_seq:
+        return True if flag is None else flag
+    return False if flag is None else flag
+
+
+def test_query_only_msa_default_truth_table():
+    # unset + single-seq  -> ON (the new default)
+    assert _resolve_force_query_only(None, True) is True
+    # unset + full MSA    -> OFF (never force it into a run that wants a real MSA)
+    assert _resolve_force_query_only(None, False) is False
+    # explicit opt-out reproduces the pre-2026-08-18 behaviour, i.e. T1/T2
+    assert _resolve_force_query_only(False, True) is False
+    # explicit opt-in works outside single-seq mode too
+    assert _resolve_force_query_only(True, False) is True
+
+
+def test_default_never_silently_changes_a_full_msa_run():
+    """The dangerous direction: a full-MSA run must not acquire a query-only MSA by default."""
+    for flag in (None, False):
+        assert _resolve_force_query_only(flag, single_seq=False) is False

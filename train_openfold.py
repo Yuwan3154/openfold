@@ -726,6 +726,21 @@ def main(args):
             config.data.common.use_template_torsion_angles = False
         else:
             rank_zero_info("single_seq_keep_templates: templates KEPT enabled in single-seq mode")
+        # ⭐⭐ Make single-seq mode actually single-sequence. Clamping max_msa_clusters/max_extra_msa
+        # to 1 never did that: the a3m was still read, so `extra_msa` carried a LIVE random homolog
+        # (mask 1.000, 0-60% identity, measured 10/10 chains) and `msa_feat`'s cluster_profile channels
+        # were computed from that MSA by summarize_clusters (24/24 channels change without this).
+        # AF2Rank does the right thing -- `parse_a3m(">1\n" + sequence)`, the query alone, with the
+        # extra-MSA track left ENABLED so it keeps its pretrained weights and simply attends to
+        # fully-masked padding. This reproduces that.
+        if getattr(args, "force_query_only_msa", None) is None:
+            args.force_query_only_msa = True
+        if args.force_query_only_msa:
+            rank_zero_info("Forcing a QUERY-ONLY MSA (AF2Rank parity): a3m files are never opened")
+        else:
+            rank_zero_info("⚠️ --no-force-query-only-msa: reading the real a3m, so the extra-MSA track "
+                           "will carry a real homolog -- pre-2026-08-18 behaviour, T1/T2 reproduction")
+
         # Disable MSA-specific losses for single sequence training
         rank_zero_info("Disabling masked_msa loss for single sequence mode")
         config.loss.masked_msa.weight = 0.0
@@ -949,6 +964,11 @@ def main(args):
             **vars(args)
         )
     else:
+        # ⛔ Normalise the tri-state: outside single-seq mode an unset flag means OFF. Left as None it
+        # would reach the datamodule as None -- falsy today, but a silent trap for any later `is False`.
+        if getattr(args, "force_query_only_msa", None) is None:
+            args.force_query_only_msa = False
+
         # T4 phase 3: the read side. Built here so it can be handed to the datamodule; refreshed
         # at every epoch start by the module's on_train_epoch_start. ⭐ Nothing about this depends on
         # which run produced the base weights, so T4 stacks on T1 or T2 identically.
@@ -1378,8 +1398,14 @@ if __name__ == "__main__":
         help="Enable single sequence mode (no MSA/templates required)"
     )
     parser.add_argument(
-        "--force_query_only_msa", action="store_true", default=False,
+        "--force_query_only_msa", action=argparse.BooleanOptionalAction, default=None,
         help="AF2Rank parity: build the MSA as the QUERY SEQUENCE ALONE and never open an a3m file. "
+             "⭐⭐ DEFAULT (2026-08-18): unset means ON whenever --enable_single_seq_mode is given, and "
+             "OFF otherwise. Tied to that flag rather than defaulted ON globally, because forcing a "
+             "query-only MSA into a full-MSA run would silently destroy it -- and because "
+             "--enable_single_seq_mode is supposed to MEAN single-sequence, which is exactly what it "
+             "failed to do. Pass --no-force-query-only-msa to restore the old behaviour, which is what "
+             "reproducing T1/T2 requires. "
              "⭐ This is exactly what AF2Rank does (jproney/AF2Rank test_templates.py:123-125 -- "
              "`parse_a3m('>1\\n' + sequence)` then `make_msa_features([msa])`) while leaving the "
              "extra-MSA track ENABLED, so the pretrained extra-MSA weights are kept and the 49-channel "
