@@ -68,8 +68,20 @@ T2_INDEX=${T2_TEMPLATE_INDEX:-/home/jupyter-chenxi/pp1c_work/index_band.npz}
 T2_ROOT=${T2_TEMPLATES_ROOT:-/home/jupyter-chenxi/pp1c_work/templates_band}
 T2_MIN_TM=${T2_MIN_TM:-0.3}
 T2_MAX_TM=${T2_MAX_TM:-0.9}
-# ⛔ no default -- see the header. An unset value is a user decision, not something to guess.
-T2_N=${T2_N_SYNTHETIC:?set T2_N_SYNTHETIC explicitly (2 = 50/50 content, 4 = all-synthetic); see this script's header}
+# ⛔ NO DEFAULT -- see the header. In replace mode this number sets the synthetic:natural CONTENT
+# ratio, which is a live experimental decision, so refuse rather than guess.
+# ⚠️ Written as an explicit check, not ${VAR:?msg}: the shell parses quoting inside ${...}, so an
+# apostrophe or a paren in the message is a syntax error that only shows up when the script RUNS.
+if [ -z "${T2_N_SYNTHETIC:-}" ]; then
+  echo "ERROR: T2_N_SYNTHETIC is not set, and this launcher will not pick it for you."
+  echo "  In REPLACE mode it is the number of natural hits GIVEN UP, so with the usual 4 natural:"
+  echo "    T2_N_SYNTHETIC=2  -> 2 synthetic + 2 natural = 50/50 content, count-matched"
+  echo "    T2_N_SYNTHETIC=4  -> 4 synthetic + 0 natural = 100% synthetic, count-matched"
+  echo "    T2_N_SYNTHETIC=1  -> 1 synthetic + 3 natural = 25% synthetic, count-matched"
+  echo "  Example: T2_N_SYNTHETIC=2 $0"
+  exit 1
+fi
+T2_N=$T2_N_SYNTHETIC
 # ⛔ REQUIRED. Without it the npz rows are placed by residue_index - 1, which desynchronises at
 # the first unresolved residue and is what killed launch #2 (1eis_A, 70/85 positions wrong).
 # data_modules.py asserts on its absence rather than silently falling back.
