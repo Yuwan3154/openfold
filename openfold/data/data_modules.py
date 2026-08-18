@@ -401,80 +401,89 @@ class OpenFoldSingleDataset(torch.utils.data.Dataset):
             rng = np.random.default_rng(int(torch.randint(0, 2 ** 31 - 1, (1,)).item()))
 
             if _probabilistic:
-                # ================= PROBABILISTIC + TOP-UP MIXING (user, 2026-08-18) =============
-                # Two rules, applied in this order:
+                # ============ PRE-SHUFFLE MIXTURE DRAW (user's design, 2026-08-18) ==============
+                # The pre-shuffle pool is modelled as THREE groups, and `max_templates` slots are
+                # drawn from it without replacement (multivariate hypergeometric):
                 #
-                # (1) TOP-UP. When a chain has fewer than `t2_topup_to` prefiltered natural hits, the
-                #     pre-shuffle pool is treated as topped up to that size with synthetic templates.
-                #     The featurizer then takes `max_templates` from the shuffled pool, so the number
-                #     of NATURALS among them is Hypergeometric(N=topup_to, K=n_prefiltered,
-                #     n=max_templates).
-                #     ⭐⭐ WHY DRAWING IT HERE IS EXACT, not an approximation. The featurizer already
-                #     handed us a uniformly random `min(n_prefiltered, max_templates)` of the chain's
-                #     top-`n_prefiltered` hits (it permutes `idx[:shuffle_top_k]` then takes the cap).
-                #     A uniformly random j of a uniformly random 4 of the top-n IS a uniformly random
-                #     j of the top-n -- so keeping a random j of what we were given has exactly the
-                #     distribution the real top-up would have produced. This is what lets the rule be
-                #     implemented on the featurizer's OUTPUT instead of inside `templates.py`.
+                #   natural   min(n_prefiltered, shuffle_top_k_prefiltered)
+                #             ⭐ capped at shuffle_top_k because the featurizer permutes only
+                #             `idx[:shuffle_top_k]` -- hit 21+ is unreachable no matter how long
+                #             training runs, so it is not part of the mixture in the first place.
+                #   synthetic `--t2_topup_to` MINUS the natural group, i.e. the filler that brings a
+                #             template-poor chain's pool up to size (0 when it is already rich)
+                #   promoted  `--t4_n_promoted`, the promoted group's WEIGHT in the mixture
+                #             (user 2026-08-18: a pre-shuffle contribution, the analogue of
+                #             --t2_topup_to -- NOT a cap on the delivered count, which could never
+                #             exceed max_templates=4 and would make any value >4 meaningless)
                 #
-                # (2) PROBABILISTIC REPLACEMENT. Each surviving natural is independently replaced by a
-                #     synthetic template with probability `t2_replace_prob`.
-                #     ⭐⭐ WHY DOING IT AT POOL LEVEL EQUALS DOING IT TO THE DELIVERED SET (the user's
-                #     "replace the selected natural templates post-filter"): `random_crop_to_size`
-                #     chooses which pool entries to deliver INDEPENDENTLY of whether a given entry is
-                #     natural or synthetic, so labelling each pool slot i.i.d. Bernoulli(p) and then
-                #     taking a random subset gives delivered labels that are also i.i.d. Bernoulli(p).
-                #     The delivered COUNT distribution is untouched -- it is still exactly T1's -- and
-                #     the delivered synthetic count is Binomial(delivered, p). No post-crop hook and
-                #     no re-cropping of synthetic features is needed to get the requested behaviour.
+                # ⭐⭐ WHY DRAWING IT HERE IS EXACT, not an approximation. The featurizer already
+                # handed us a uniformly random `min(n_prefiltered, max_templates)` of the chain's
+                # top-`n_prefiltered` hits, and a uniformly random j of a uniformly random 4 of the
+                # top-n IS a uniformly random j of the top-n. So keeping a random j of what we were
+                # given has exactly the distribution the real mixture would have produced -- which is
+                # what lets all of this live on the featurizer's OUTPUT instead of inside templates.py.
+                #
+                # Then each surviving natural is independently replaced by a synthetic one with
+                # probability `--t2_replace_prob`.
+                # ⭐⭐ WHY THAT IS EQUIVALENT TO REPLACING THE *DELIVERED* ONES (what was asked for):
+                # `random_crop_to_size` picks its delivered window INDEPENDENTLY of whether a slot is
+                # natural or synthetic, so labelling pool slots i.i.d. Bernoulli(p) and then
+                # delivering gives delivered labels that are also i.i.d. Bernoulli(p). The delivered
+                # COUNT distribution is therefore untouched -- still exactly T1's.
                 max_t = int(self.config.train.max_templates)
+                stk = int(self.config.train.shuffle_top_k_prefiltered)
                 n_pref = int(self._n_prefiltered[idx]) if self._n_prefiltered is not None else -1
 
-                if self.t2_topup_to > 0 and 0 <= n_pref < self.t2_topup_to:
-                    pool_target = max_t
-                    n_keep_nat = int(rng.hypergeometric(
-                        ngood=max(n_pref, 0), nbad=self.t2_topup_to - max(n_pref, 0),
-                        nsample=max_t))
-                    n_keep_nat = min(n_keep_nat, n_nat)
-                else:
-                    # either the chain is template-rich (no top-up owed) or its count is unknown
-                    # (counted once at startup, never guessed per step) -- in both cases the pool
-                    # stays exactly the size the featurizer produced, i.e. T1's
-                    pool_target = n_nat
-                    n_keep_nat = n_nat
+                # unknown prefiltered count (chains with no pdb70_hits.hhr -- counted once at startup,
+                # never guessed per step): fall back to what the featurizer actually produced, which
+                # reproduces T1 exactly rather than inventing a group size
+                g_nat = min(n_pref, stk) if n_pref >= 0 else n_nat
+                g_syn = 0
+                if self.t2_topup_to > 0 and self.synthetic_template_pool is not None:
+                    g_syn = min(max(0, self.t2_topup_to - g_nat),
+                                self.synthetic_template_pool.n_for_chain(name))
+                g_pro = 0
+                if self.promoted_template_pool is not None and self.n_promoted_templates > 0:
+                    # a chain cannot contribute more promoted templates than it has, and early in
+                    # training it has none -- so T4 is inert until the pool fills, with no branching
+                    g_pro = min(self.n_promoted_templates,
+                                self.promoted_template_pool.n_for_chain(name))
 
-                if self.t2_replace_prob > 0.0 and n_keep_nat > 0:
-                    n_keep_nat = int(rng.binomial(n_keep_nat, 1.0 - self.t2_replace_prob))
+                total = g_nat + g_syn + g_pro
+                pool_target = min(max_t, total)
+                if pool_target > 0:
+                    k_nat, k_syn, k_pro = (int(x) for x in rng.multivariate_hypergeometric(
+                        [g_nat, g_syn, g_pro], pool_target))
+                    # the featurizer can yield FEWER naturals than g_nat implies (duplicate
+                    # template_sequence hits are skipped, and a hit can fail to process), so the draw
+                    # has to be clamped to what is actually in hand
+                    k_nat = min(k_nat, n_nat)
 
-                budget = pool_target - n_keep_nat
-                extras, added = [], 0
-                for kind, pool in extra_pools:
-                    if added >= budget:
-                        break
-                    # ⚠️ With T4 active, --t4_n_promoted CAPS how much of the replacement budget goes
-                    # to promoted templates rather than adding on top of it -- that is what keeps the
-                    # pool size (and so the delivered-count distribution) equal to T1's.
-                    n_req = budget - added
-                    if kind == "promoted":
-                        n_req = min(n_req, self.n_promoted_templates)
-                    if n_req <= 0:
-                        continue
-                    extra = pool.sample_features(name, n_req, rng, query_sequence=qseq)
-                    if extra is None:
-                        continue
-                    added += int(extra["template_all_atom_positions"].shape[0])
-                    extras.append(extra)
+                    if self.t2_replace_prob > 0.0 and k_nat > 0:
+                        keep = int(rng.binomial(k_nat, 1.0 - self.t2_replace_prob))
+                        k_syn += k_nat - keep
+                        k_nat = keep
 
-                # ⛔ Restore naturals for any part of the budget the pools could not fill. Dropping
-                # `n_keep_nat`'s worth regardless would leave a chain with few eligible synthetic
-                # templates holding a pool SMALLER than T1's -- breaking the matching in the other
-                # direction, which is the failure mode that is easy to miss because it looks
-                # conservative.
-                keep_final = min(n_nat, max(n_keep_nat, pool_target - added))
-                if keep_final < n_nat:
-                    data = subsample_natural_templates(data, keep_final, rng)
-                for extra in extras:
-                    data = merge_template_features(data, extra)
+                    extras, added = [], 0
+                    for kind, pool in extra_pools:
+                        n_req = k_syn if kind == "synthetic" else k_pro
+                        if n_req <= 0:
+                            continue
+                        extra = pool.sample_features(name, n_req, rng, query_sequence=qseq)
+                        if extra is None:
+                            continue
+                        added += int(extra["template_all_atom_positions"].shape[0])
+                        extras.append(extra)
+
+                    # ⛔ Restore naturals for any part of the pool the sources could not fill.
+                    # Dropping regardless would leave a chain with FEWER templates than T1 gave it --
+                    # breaking the matching in the direction that looks conservative and so goes
+                    # unnoticed.
+                    keep_final = min(n_nat, max(k_nat, pool_target - added))
+                    if keep_final < n_nat:
+                        data = subsample_natural_templates(data, keep_final, rng)
+                    for extra in extras:
+                        data = merge_template_features(data, extra)
             else:
                 # ===================== APPEND MODE (the live T2 run) ===========================
                 # Grows the pool, which shifts the delivered COUNT as well as the content, because

@@ -37,38 +37,15 @@ from openfold.np import residue_constants as rc
 CA = 1
 
 
-def is_control_chain(chain: str, control_fraction: float) -> bool:
-    """Held-out membership: True when this chain must NEVER receive promoted templates.
-
-    ⭐ The control set exists so the effect of promotion is measurable: chains inside it keep the
-    template distribution they started with, so their validation curve is the counterfactual for the
-    chains outside it. That only works if membership is decided the SAME way everywhere.
-
-    ⛔ crc32 of the name, never builtin `hash()`: `hash()` is randomized per process, so the split
-    would differ between DDP ranks, between dataloader workers and between restarts -- and promoted
-    templates would leak into the very chains meant to be clean, silently destroying the control.
-    (This is the same trap that broke resumability in the production template run.)
-    ⭐ The `t4-control:` prefix makes this split statistically INDEPENDENT of the output sharding,
-    which hashes the bare chain name -- without it, control membership would correlate with which
-    shard directory a chain lives in.
-    """
-    if control_fraction <= 0.0:
-        return False
-    return (zlib.crc32(b"t4-control:" + chain.encode()) % 1_000_000) < control_fraction * 1_000_000
-
-
 class PromotedTemplateWriter:
     """Background writer for promoted predictions. One instance per rank."""
 
-    def __init__(self, pool_dir: str, rank: int, max_queue: int = 64,
-                 control_fraction: float = 0.0):
+    def __init__(self, pool_dir: str, rank: int, max_queue: int = 64):
         self.root = Path(pool_dir) / f"rank{rank}"
         self.root.mkdir(parents=True, exist_ok=True)
         self.index_path = self.root / "index.jsonl"
-        self.control_fraction = control_fraction
         self.n_written = 0
         self.n_dropped = 0
-        self.n_control_skipped = 0
         self._q: queue.Queue = queue.Queue(maxsize=max_queue)
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -97,11 +74,6 @@ class PromotedTemplateWriter:
     def submit(self, chain, epoch, step, tm_pred, tm_template,
                coords37, atom_mask37, aatype, residue_index):
         """Queue one promoted prediction. Non-blocking: drops rather than stalling the step."""
-        # held-out chains are refused at the WRITE side, so nothing about them ever reaches the pool
-        # -- cheaper and safer than filtering on read, where one forgotten call site leaks
-        if is_control_chain(chain, self.control_fraction):
-            self.n_control_skipped += 1
-            return
         mask = np.asarray(atom_mask37, dtype=bool)
         rec = {
             "chain": chain, "epoch": int(epoch), "step": int(step),
@@ -134,12 +106,10 @@ class PromotedTemplatePool:
     mutating underneath it -- otherwise two dataloader workers could disagree about what exists.
     """
 
-    def __init__(self, pool_dir: str, max_per_chain: int = 0, control_fraction: float = 0.0):
+    def __init__(self, pool_dir: str, max_per_chain: int = 0):
         self.root = Path(pool_dir)
         self.max_per_chain = max_per_chain
-        self.control_fraction = control_fraction
         self.by_chain: dict[str, list] = {}
-        self.n_control_dropped = 0
 
     def refresh(self) -> int:
         by_chain: dict[str, list] = {}
@@ -151,13 +121,6 @@ class PromotedTemplatePool:
                 rec = json.loads(line)
                 rec["_path"] = rank_root / rec["npz"]
                 by_chain.setdefault(rec["chain"], []).append(rec)
-        # belt-and-braces: the writer already refuses control chains, but a pool carried over
-        # from a run with a different --t4_control_fraction would otherwise serve them
-        if self.control_fraction > 0.0:
-            before = len(by_chain)
-            by_chain = {c: v for c, v in by_chain.items()
-                        if not is_control_chain(c, self.control_fraction)}
-            self.n_control_dropped = before - len(by_chain)
         if self.max_per_chain > 0:
             # keep the BEST by the prediction's own TM -- a cap that kept the newest instead would
             # let a late bad epoch evict good templates
@@ -169,6 +132,15 @@ class PromotedTemplatePool:
 
     def __contains__(self, chain: str) -> bool:
         return bool(self.by_chain.get(chain))
+
+    def n_for_chain(self, chain: str) -> int:
+        """How many promoted templates this chain has in the current snapshot.
+
+        The pre-shuffle draw needs this: `--t4_n_promoted` is the promoted group's WEIGHT in that
+        mixture, but a chain cannot contribute more than it actually has, and early in training most
+        chains have none at all.
+        """
+        return len(self.by_chain.get(chain, ()))
 
     def sample_features(self, chain: str, n: int, rng: np.random.Generator,
                         query_sequence: str) -> dict | None:

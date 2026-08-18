@@ -332,9 +332,7 @@ class OpenFoldWrapper(pl.LightningModule):
                     # created here, not in __init__, because it needs the DDP rank -- each rank owns
                     # its own subtree so no locking or barrier is needed
                     self._t4_writer = PromotedTemplateWriter(
-                        self.t4_pool_dir, self.trainer.global_rank,
-                        control_fraction=self.t4_control_fraction,
-                    )
+                        self.t4_pool_dir, self.trainer.global_rank)
                 sel = torch.nonzero(m["promote"] > 0, as_tuple=False).flatten().tolist()
                 if sel:
                     # ⛔ .datasets[0] is safe only because setup() asserts len(datasets) == 1 when
@@ -365,8 +363,7 @@ class OpenFoldWrapper(pl.LightningModule):
                 # being thrown away -- visible rather than mysterious
                 self.log("t4/pool_dropped", float(self._t4_writer.n_dropped),
                          on_step=True, on_epoch=False, logger=True)
-                self.log("t4/control_skipped", float(self._t4_writer.n_control_skipped),
-                         on_step=True, on_epoch=False, logger=True)
+
 
         # Log it
         self._log(loss_breakdown, batch, outputs)
@@ -474,8 +471,7 @@ class OpenFoldWrapper(pl.LightningModule):
             rank_zero_info(
                 f"T4 promoted pool @ epoch {self.current_epoch}: {_n} templates over "
                 f"{len(_pool.by_chain)} chains"
-                + (f"; {_pool.n_control_dropped} chains withheld as control"
-                   if _pool.n_control_dropped else "")
+
             )
 
     def on_fit_end(self):
@@ -868,7 +864,6 @@ def main(args):
     # only ever --resume_from_ckpt / --resume_from_jax_params.
     model_module.t4_pool_dir = getattr(args, "t4_pool_dir", None)
     model_module.t4_promote_after_epoch = getattr(args, "t4_promote_after_epoch", 0)
-    model_module.t4_control_fraction = getattr(args, "t4_control_fraction", 0.0)
     model_module._t4_writer = None
 
     # Direction 2: keep only a SUBSET of the 48 Evoformer blocks (shallower full-block model),
@@ -965,10 +960,7 @@ def main(args):
                 "run writes to, to consume its own promotions from the next epoch on)."
             )
             _t4_pool = PromotedTemplatePool(
-                args.t4_pool_dir,
-                max_per_chain=getattr(args, "t4_max_per_chain", 0),
-                control_fraction=getattr(args, "t4_control_fraction", 0.0),
-            )
+                args.t4_pool_dir, max_per_chain=getattr(args, "t4_max_per_chain", 0))
         data_module = OpenFoldDataModule(
             config=config.data,
             batch_seed=args.seed,
@@ -1504,16 +1496,17 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--t4_n_promoted", type=int, default=0,
-        help="T4 phase 3: how many PROMOTED templates (past predictions that beat the template they "
-             "were given) to mix into each training example, alongside whatever natural and "
-             "--t2_n_synthetic templates it already gets. This sets the promoted:synthetic:natural "
-             "ratio, the analogue of --t2_n_synthetic. 0 = disabled (default): the gate still "
-             "measures and, with --t4_pool_dir, still WRITES, but nothing is read back -- which is "
-             "the right setting for one epoch of pool-filling before the first consuming run. "
-             "⚠️ Under --t2_replace_prob/--t2_topup_to this CAPS how much of the replacement budget "
-             "goes to promoted templates rather than adding on top of it, which is what keeps the "
-             "pool size -- and so the delivered-count distribution -- equal to T1's. In append mode "
-             "it is additive and the delivered count shifts as well as the content."
+        help="T4 phase 3: the promoted group's WEIGHT in the PRE-SHUFFLE template mixture -- the "
+             "analogue of --t2_topup_to, not a per-step count. The mixture is natural "
+             "min(n_prefiltered, shuffle_top_k=20) + synthetic top-up filler + this many promoted, "
+             "and max_templates=4 slots are drawn from it without replacement. With 32 promoted "
+             "beside 20 natural, each delivered slot is promoted with p = 32/52 = 0.62. "
+             "⛔ It is NOT a delivered count: the model never sees more than max_templates=4 per step, "
+             "so any value above 4 would be indistinguishable under that reading. "
+             "A chain contributes at most what it HAS, so T4 is inert until the pool fills -- no "
+             "warmup branching needed beyond --t4_promote_after_epoch. 0 = disabled (default): the "
+             "gate still measures and, with --t4_pool_dir, still WRITES, which is the right setting "
+             "for filling the pool before the first consuming run."
     )
     parser.add_argument(
         "--t4_max_per_chain", type=int, default=0,
@@ -1536,17 +1529,6 @@ if __name__ == "__main__":
              "Promoting from step 0 captures a barely-warmed-up model's output and then freezes that "
              "quality into the template distribution for every later epoch, so a warmup is a real "
              "choice and not a formality. 0 = promote from the very first epoch (default)."
-    )
-    parser.add_argument(
-        "--t4_control_fraction", type=float, default=0.0,
-        help="T4 phase 3: fraction of training chains HELD OUT from promotion entirely, so their "
-             "curve is the counterfactual for the chains that do receive promoted templates -- "
-             "without it, a T4 effect cannot be separated from ordinary further training. "
-             "Membership is deterministic (crc32 of the chain name, so it is identical across ranks, "
-             "dataloader workers and restarts) and is enforced on the WRITE side, so nothing about a "
-             "control chain ever enters the pool. 0.0 = no control set (default). ⚠️ A control chain "
-             "still trains, it just never gets a promoted template, so the cost is measurement "
-             "power on those chains rather than lost training signal."
     )
     parser.add_argument(
         "--pda_val_manifest", type=str, default=None,

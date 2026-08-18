@@ -100,6 +100,17 @@ class SyntheticTemplatePool:
         # no query map => cannot place this chain's templates correctly => it has none
         return not self.qmap or chain in self.qmap
 
+    def n_for_chain(self, chain: str) -> int:
+        """How many in-band synthetic templates this chain has.
+
+        The pre-shuffle mixture draw needs it: a top-up asks for `topup_to - n_natural` filler slots,
+        but the chain may not have that many eligible templates, and a draw computed on a group size
+        the pool cannot supply would misstate the natural:synthetic proportion.
+        """
+        if chain not in self:
+            return 0
+        return int(len(self.eligible[self.row_of[chain]]))
+
     def npz_path(self, chain: str) -> Path:
         import zlib
         # must match generate_templates.py's sharding EXACTLY -- and it is crc32, not hash(),

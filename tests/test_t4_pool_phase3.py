@@ -1,11 +1,10 @@
-"""Gate tests for T4 phase 3: the promoted pool's output layout and the held-out control set.
+"""Gate tests for T4 phase 3: the promoted pool's output layout.
 
 The failure modes here are all silent ones. A pool that returns the phase-2 `positions`/`mask` keys
 merges into a template axis of ZEROS, because `merge_template_features` copies only keys already
 present in the natural features and zero-fills the rest -- the model would be handed blank templates
 and training would look fine. A restype-ordered one-hot survives `fix_templates_aatype` as the WRONG
-amino acids. And a control set decided with builtin `hash()` differs per process, so promoted
-templates leak into the chains meant to be clean.
+amino acids. And a promoted CROP placed at the wrong residues still yields plausible-looking features.
 """
 
 import json
@@ -22,20 +21,15 @@ from openfold.data.synthetic_templates import (
 )
 from openfold.data.templates import empty_template_feats
 from openfold.np import residue_constants as rc
-from openfold.utils.t4_pool import (
-    PromotedTemplatePool,
-    PromotedTemplateWriter,
-    is_control_chain,
-)
+from openfold.utils.t4_pool import PromotedTemplatePool, PromotedTemplateWriter
 
 QUERY = "ACDEFGHIKLMNPQRSTVWY"          # 20 residues, every standard type exactly once
 L = len(QUERY)
 
 
-def _write(pool_dir, chain, epoch, step, first, n, tm_pred=0.8, rank=0,
-           control_fraction=0.0):
+def _write(pool_dir, chain, epoch, step, first, n, tm_pred=0.8, rank=0):
     """Persist one promoted crop covering query positions [first, first+n)."""
-    w = PromotedTemplateWriter(str(pool_dir), rank, control_fraction=control_fraction)
+    w = PromotedTemplateWriter(str(pool_dir), rank)
     ridx = np.arange(first, first + n)
     aat = np.array([rc.restype_order[QUERY[i]] for i in ridx], np.int8)
     mask = np.zeros((n, 37), bool)
@@ -187,66 +181,28 @@ def test_stale_entry_beyond_the_query_is_dropped_not_crashed(tmp_path):
 
 
 # --------------------------------------------------------------------------------------------
-# held-out control set
+# ⛔ The held-out control set was REMOVED 2026-08-18. The user's reasoning: the eval sets (PDA de novo
+# designs + ws5 val) contain NO training chains and are template-free anyway, so withholding promoted
+# templates from some training chains has nothing in this pipeline to be measured against. The
+# rationale for it was imported from a generic self-distillation design and did not fit here. Do not
+# reintroduce it without an eval that actually scores training chains.
 # --------------------------------------------------------------------------------------------
 
-def test_control_membership_is_deterministic_and_process_independent():
-    """⛔ builtin hash() is randomized per process; with it the split would differ between ranks,
-    workers and restarts, leaking promoted templates into the control chains."""
-    chains = [f"{i:04d}_A" for i in range(4000)]
-    a = [is_control_chain(c, 0.25) for c in chains]
-    b = [is_control_chain(c, 0.25) for c in chains]
-    assert a == b
-    frac = sum(a) / len(a)
-    assert 0.20 < frac < 0.30, frac                      # roughly the requested fraction
-    assert not any(is_control_chain(c, 0.0) for c in chains)   # 0.0 = feature off
-    assert all(is_control_chain(c, 1.0) for c in chains)       # 1.0 = everything held out
-
-
-def test_control_split_is_independent_of_the_output_sharding():
-    """Both use crc32; without the distinct prefix, control membership would correlate with which
-    shard directory a chain's npz lands in."""
-    import zlib
-    chains = [f"{i:05d}_B" for i in range(4000)]
-    ctrl = np.array([is_control_chain(c, 0.5) for c in chains])
-    shard_lo = np.array([zlib.crc32(c.encode()) % 1000 < 500 for c in chains])
-    overlap = (ctrl == shard_lo).mean()
-    assert 0.45 < overlap < 0.55, overlap                # ~chance, i.e. uncorrelated
-
-
-def test_writer_refuses_control_chains(tmp_path):
-    chains = [f"{i:04d}_A" for i in range(200)]
-    held = [c for c in chains if is_control_chain(c, 0.5)]
-    kept = [c for c in chains if not is_control_chain(c, 0.5)]
-    assert held and kept
-    w = PromotedTemplateWriter(str(tmp_path), 0, control_fraction=0.5)
-    ridx = np.arange(L)
-    aat = np.array([rc.restype_order[c] for c in QUERY], np.int8)
-    mask = np.zeros((L, 37), bool); mask[:, :3] = True
-    for c in held[:5] + kept[:5]:
-        w.submit(chain=c, epoch=0, step=0, tm_pred=0.8, tm_template=0.5,
-                 coords37=np.zeros((L, 37, 3), np.float32), atom_mask37=mask,
-                 aatype=aat, residue_index=ridx)
-    w.close()
-    assert w.n_control_skipped == 5
+def test_pool_reports_how_many_a_chain_has(tmp_path):
+    """The three-group pre-shuffle draw needs this: --t4_n_promoted is the promoted group's WEIGHT in
+    the mixture, but a chain cannot contribute more than it actually has, and early in training most
+    chains have none at all. The number the draw must see is the POST-CAP one."""
     p = PromotedTemplatePool(str(tmp_path))
     p.refresh()
-    assert all(c not in p for c in held[:5])
-    assert all(c in p for c in kept[:5])
-
-
-def test_pool_drops_control_chains_even_if_a_stale_pool_contains_them(tmp_path):
-    """Defence in depth: a pool written by a run with a different --t4_control_fraction would
-    otherwise serve chains this run is meant to keep clean."""
-    chains = [f"{i:04d}_A" for i in range(200)]
-    held = [c for c in chains if is_control_chain(c, 0.5)][:3]
-    for i, c in enumerate(held):
-        _write(tmp_path, c, 0, i, first=0, n=L, rank=i)          # written with NO control set
-    open_pool = PromotedTemplatePool(str(tmp_path), control_fraction=0.0)
-    assert open_pool.refresh() == 3
-    guarded = PromotedTemplatePool(str(tmp_path), control_fraction=0.5)
-    assert guarded.refresh() == 0
-    assert guarded.n_control_dropped == 3
+    assert p.n_for_chain("nope_A") == 0
+    for i in range(3):
+        _write(tmp_path, "8fff_A", 0, i, first=0, n=L, rank=i)
+    p.refresh()
+    assert p.n_for_chain("8fff_A") == 3
+    assert p.n_for_chain("nope_A") == 0
+    capped = PromotedTemplatePool(str(tmp_path), max_per_chain=2)
+    capped.refresh()
+    assert capped.n_for_chain("8fff_A") == 2
 
 
 def test_dropped_promotions_are_counted_not_silent(tmp_path):
