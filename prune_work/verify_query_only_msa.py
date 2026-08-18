@@ -16,7 +16,10 @@ Three claims, each of which would otherwise be an assumption:
 """
 
 import argparse
+import os
 import random
+import shutil
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -27,7 +30,9 @@ from openfold.data.data_modules import OpenFoldSingleDataset
 ap = argparse.ArgumentParser()
 ap.add_argument("--data-dir", required=True)
 ap.add_argument("--aln-dir", required=True)
-ap.add_argument("--hhr-only-aln-dir", required=True)
+ap.add_argument("--hhr-only-aln-dir", required=True,
+                help="scratch path; this script BUILDS the mirror itself for exactly the chains it "
+                     "tests -- see the comment at the build site for why reusing one is a trap")
 ap.add_argument("--chain-list", required=True)
 ap.add_argument("--obsolete", required=True)
 ap.add_argument("--kalign", required=True)
@@ -47,6 +52,7 @@ print(f"extra_msa.enabled={cfg.model.extra_msa.enabled} (kept ON, as AF2Rank doe
 
 
 def make_ds(aln, force):
+    aln = str(aln)
     return OpenFoldSingleDataset(
         data_dir=a.data_dir, alignment_dir=aln, template_mmcif_dir=a.data_dir,
         max_template_date="2018-04-30", config=cfg.data, chain_data_cache_path=None,
@@ -59,13 +65,32 @@ def make_ds(aln, force):
 
 
 ds_full_forced = make_ds(a.aln_dir, True)          # full a3m present, but flag ON
-ds_hhr_forced = make_ds(a.hhr_only_aln_dir, True)  # a3m absent, flag ON
 ds_full_off = make_ds(a.aln_dir, False)            # the current T1/T2 behaviour
 
 chains = [l.strip() for l in open(a.chain_list) if l.strip()]
 idx_of = {ds_full_forced.idx_to_chain_id(i): i for i in range(len(ds_full_forced))}
 random.seed(a.seed)
 pick = [c for c in random.sample(chains, 600) if c in idx_of][: a.n_chains]
+
+# ⛔⛔ BUILD THE MIRROR FOR EXACTLY THESE CHAINS. Reusing a mirror built for some other subset made this
+# gate report a spurious failure on `aatype`/`all_atom_positions` -- STRUCTURE features, which no MSA
+# change can touch. Cause: a chain absent from the mirror has no `pdb70_hits.hhr` there, so it gets zero
+# templates, `random_crop_to_size` then draws `randperm(num_templates)` over a different size, the torch
+# RNG stream diverges, and the CROP OFFSET moves. The comparison was measuring its own missing files.
+# ⭐ The lesson generalises: when two conditions must differ in exactly one input, construct the second
+# condition FROM the first rather than from a previously-prepared artifact.
+mirror = Path(a.hhr_only_aln_dir)
+if mirror.exists():
+    shutil.rmtree(mirror)
+mirror.mkdir(parents=True)
+for c in pick:
+    (mirror / c).mkdir()
+    src = Path(a.aln_dir) / c / "pdb70_hits.hhr"
+    assert src.is_file(), f"{c} has no pdb70_hits.hhr -- cannot build a comparable mirror"
+    os.symlink(src, mirror / c / "pdb70_hits.hhr")
+print(f"built an hhr-only mirror for exactly the {len(pick)} chains under test")
+
+ds_hhr_forced = make_ds(mirror, True)              # a3m absent, flag ON
 
 n_ident, n_inert, n_live_off, cluster_changed = 0, 0, 0, 0
 for c in pick:
