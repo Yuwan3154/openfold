@@ -13,6 +13,10 @@ import pytest
 from openfold.utils.t4_pool import PromotedTemplatePool, PromotedTemplateWriter
 
 L_FULL, L_CROP = 40, 12
+# ⚠️ Only the LENGTH of this matters to the pool: a promoted template's own sequence is built
+# from the aatype STORED with the crop, not from the query -- unlike the synthetic pool, which
+# cross-checks the two. The query is the frame, not the content.
+Q_FULL = ("ACDEFGHIKLMNPQRSTVWY" * 2)[:L_FULL]
 
 
 def _promote(w, chain, epoch=0, step=0, start=5, tm=0.8, seed=0):
@@ -73,14 +77,18 @@ def test_crop_is_placed_at_its_residue_index(written):
     # pick the tm=0.80 entry deterministically by capping the pool to the single best
     pool.max_per_chain = 1
     pool.refresh()
-    f = pool.sample_features("1abc_A", 1, np.random.default_rng(0), n_res=L_FULL)
-    assert f["positions"].shape == (1, L_FULL, 37, 3)
+    f = pool.sample_features("1abc_A", 1, np.random.default_rng(0), query_sequence=Q_FULL)
+    # ⛔ phase 3 renamed these to the NATURAL-HIT layout on purpose: merge_template_features copies
+    # only keys already present in the natural features and zero-fills the rest, so the old
+    # positions/mask keys would have been silently dropped and the model handed blank templates.
+    pos, msk = f["template_all_atom_positions"], f["template_all_atom_mask"]
+    assert pos.shape == (1, L_FULL, 37, 3)
     covered = np.arange(5, 5 + L_CROP)
-    assert (f["mask"][0][covered][:, :5] == 1).all()
+    assert (msk[0][covered][:, :5] == 1).all()
     outside = np.setdiff1d(np.arange(L_FULL), covered)
-    assert (f["mask"][0][outside] == 0).all()
-    assert (f["positions"][0][outside] == 0).all()
-    np.testing.assert_allclose(f["positions"][0][covered][mask], coords[mask], rtol=1e-6)
+    assert (msk[0][outside] == 0).all()
+    assert (pos[0][outside] == 0).all()
+    np.testing.assert_allclose(pos[0][covered][mask], coords[mask], rtol=1e-6)
 
 
 def test_cap_keeps_the_best_not_the_newest(written):
@@ -97,7 +105,8 @@ def test_missing_chain_returns_none(written):
     pool = PromotedTemplatePool(str(root))
     pool.refresh()
     assert "nosuch_A" not in pool
-    assert pool.sample_features("nosuch_A", 1, np.random.default_rng(0), n_res=L_FULL) is None
+    assert pool.sample_features("nosuch_A", 1, np.random.default_rng(0),
+                                query_sequence=Q_FULL) is None
 
 
 def test_stale_entry_longer_than_the_chain_is_clipped(tmp_path):
@@ -107,9 +116,9 @@ def test_stale_entry_longer_than_the_chain_is_clipped(tmp_path):
     w.close()
     pool = PromotedTemplatePool(str(tmp_path))
     pool.refresh()
-    f = pool.sample_features("1abc_A", 1, np.random.default_rng(0), n_res=L_FULL)
-    assert f["mask"].shape == (1, L_FULL, 37)
-    assert (f["mask"][0][: L_FULL - 4] == 0).all()
+    f = pool.sample_features("1abc_A", 1, np.random.default_rng(0), query_sequence=Q_FULL)
+    assert f["template_all_atom_mask"].shape == (1, L_FULL, 37)
+    assert (f["template_all_atom_mask"][0][: L_FULL - 4] == 0).all()
 
 
 def test_full_queue_drops_instead_of_blocking(tmp_path):
