@@ -142,12 +142,20 @@ for c in pick:
         e0 = e0[0] if e0.dim() > 1 else e0
         q = aat[..., 0] if aat.dim() > 1 else aat
         same = bool((e0[: q.shape[0]] == q).all())
-        row[tag] = (f"shape {tuple(ex.shape)} identical_to_query={same} "
-                    f"n_distinct_res={len(torch.unique(e0))}")
+        # ⛔⛔ `identical_to_query` is NOT the discriminator and must not be used as one -- measured
+        # False in BOTH conditions, because the hhr-only row is constant PADDING rather than the query.
+        # A verdict resting on it would read "12/12 real homologs" even if the a3m contributed nothing:
+        # it passes with and without the effect it claims to detect.
+        # ⭐ The decisive number is the count of DISTINCT residue types in the row: a real protein
+        # sequence shows 14-21 over a 256-residue crop, a constant padding row shows exactly 1.
+        n_distinct = int(len(torch.unique(e0)))
+        row[tag] = (f"shape {tuple(ex.shape)} n_distinct_res={n_distinct} "
+                    f"({'REAL SEQUENCE' if n_distinct > 2 else 'constant/padding'}) "
+                    f"identical_to_query={same} [not a discriminator, see comment]")
         if tag == "a3m":
             n_total += 1
-            n_real += (not same)
-            n_query += same
+            n_real += (n_distinct > 2)
+            n_query += (n_distinct <= 2)
     print(f"  {c}\n     with a3m : {row['a3m']}\n     hhr only : {row['hhr']}")
     for k in ("msa_feat", "extra_msa", "msa_mask", "true_msa"):
         if k in FA and k in HB:
@@ -157,7 +165,9 @@ for c in pick:
                    ("IDENTICAL" if torch.equal(x, y) else f"max|d|={(x - y).abs().max():.4g}"))
             print(f"     {k:12s} {tag}")
 
-print(f"\nVERDICT INPUT: with the a3m present, extra_msa carried a REAL homolog in {n_real}/{n_total} "
-      f"chains and merely the query in {n_query}/{n_total}.")
-print("  -> if n_real > 0 the a3m DOES change the model input, so hhr-only is NOT comparable to T1/T2.")
+print(f"\nVERDICT INPUT (on n_distinct_res, NOT on identical_to_query): with the a3m present, "
+      f"extra_msa carried a REAL sequence in {n_real}/{n_total} chains and a constant row in "
+      f"{n_query}/{n_total}. Without it, every chain got a constant row.")
+print("  -> a3m present => the ExtraMSA stack sees a real homolog; absent => padding. So the a3m DOES")
+print("     change the model input, and hhr-only is NOT comparable to T1/T2.")
 shutil.rmtree(work)
