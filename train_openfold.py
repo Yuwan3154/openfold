@@ -726,6 +726,19 @@ def main(args):
             config.data.common.use_template_torsion_angles = False
         else:
             rank_zero_info("single_seq_keep_templates: templates KEPT enabled in single-seq mode")
+        # ⛔⛔ DISABLE THE EXTRA-MSA TRACK (user directive 2026-08-18). Clamping max_extra_msa to 1
+        # was NOT enough to make this recipe MSA-free: `config.model.extra_msa.enabled` stayed True, so
+        # every training step fed ONE RANDOMLY DRAWN REAL HOMOLOG into the ExtraMSA stack. Measured on
+        # 10 chains (prune_work/inspect_extra_msa.py): the row is a different sequence in 10/10, 0-60%
+        # identical to the query, `extra_msa_row_mask` = 1.0 in 10/10 (always attended). The cluster
+        # track was already the query alone, which is the part that matched the recipe's description.
+        # ⭐ Setting this False means model.py:117 never CONSTRUCTS the embedder or the stack, so there
+        # are no parameters left without gradients (which under DDP would raise) -- it is a genuine
+        # removal, not a skipped forward. `import_weights.py` is guarded to match.
+        # ⚠️ RE-BASELINES T1/T2: runs after this are not comparable to their curves.
+        config.model.extra_msa.enabled = False
+        rank_zero_info("Disabling the EXTRA MSA track (extra_msa.enabled=False) for single-seq mode")
+
         # Disable MSA-specific losses for single sequence training
         rank_zero_info("Disabling masked_msa loss for single sequence mode")
         config.loss.masked_msa.weight = 0.0

@@ -426,8 +426,19 @@ def generate_translation_dict(model, version, is_multimer=False):
     ############################
     # translations dict overflow
     ############################
-    ems_blocks = model.extra_msa_stack.blocks
-    ems_blocks_params = stacked([ExtraMSABlockParams(b) for b in ems_blocks])
+    # ⛔⛔ The ExtraMSA embedder + stack are only CONSTRUCTED when config.model.extra_msa.enabled is
+    # True (model.py:117). With the extra-MSA track disabled they do not exist, and touching
+    # model.extra_msa_stack here would raise AttributeError before a single weight was loaded --
+    # i.e. the warm-start would die, not degrade.
+    # ⭐ Omitting the two keys is SAFE, and this is why: `import_jax_weights_` asserts only
+    # `len(incorrect) == 0`, where `incorrect` is translation keys absent from the npz. The reverse
+    # list (`missing` = npz keys with no translation) is computed but deliberately NOT asserted, so
+    # AF2's unused extra-MSA parameters are simply left unread.
+    _has_extra_msa = hasattr(model, "extra_msa_stack")
+    ems_blocks_params = (
+        stacked([ExtraMSABlockParams(b) for b in model.extra_msa_stack.blocks])
+        if _has_extra_msa else None
+    )
 
     evo_blocks = model.evoformer.blocks
     evo_blocks_params = stacked([EvoformerBlockParams(b) for b in evo_blocks])
@@ -449,10 +460,6 @@ def generate_translation_dict(model, version, is_multimer=False):
                 "pair_activiations": LinearParams(
                     model.input_embedder.linear_relpos
                 ),
-                "extra_msa_activations": LinearParams(
-                    model.extra_msa_embedder.linear
-                ),
-                "extra_msa_stack": ems_blocks_params,
                 "evoformer_iteration": evo_blocks_params,
                 "single_activations": LinearParams(model.evoformer.linear),
             },
@@ -507,10 +514,6 @@ def generate_translation_dict(model, version, is_multimer=False):
                         model.input_embedder.linear_relpos
                     ),
                 },
-                "extra_msa_activations": LinearParams(
-                    model.extra_msa_embedder.linear
-                ),
-                "extra_msa_stack": ems_blocks_params,
                 "evoformer_iteration": evo_blocks_params,
                 "single_activations": LinearParams(model.evoformer.linear),
             },
@@ -642,6 +645,14 @@ def generate_translation_dict(model, version, is_multimer=False):
         translations["predicted_aligned_error_head"] = {
             "logits": LinearParams(model.aux_heads.tm.linear)
         }
+
+    # re-attached here rather than inline, so the dict literals above never dereference a module
+    # that a disabled extra-MSA track never created
+    if _has_extra_msa:
+        translations["evoformer"]["extra_msa_activations"] = LinearParams(
+            model.extra_msa_embedder.linear
+        )
+        translations["evoformer"]["extra_msa_stack"] = ems_blocks_params
 
     return translations
 
