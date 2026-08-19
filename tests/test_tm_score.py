@@ -231,3 +231,33 @@ def test_short_chain_below_min_seed_len():
     """Crops shorter than min_seed_len must still produce a full-length seed, not an empty list."""
     x = _helix(12)[None]
     assert float(tm_score(x, x, **FAST_KWARGS)) > 0.99
+
+
+def test_kabsch_works_in_bfloat16():
+    """⛔ torch.linalg.svd has no bf16 CUDA kernel. Under --precision bf16 this raised
+    `"svd_cuda_gesvdjBatched" not implemented for 'BFloat16'` the first time the T4 gate ran on a GPU
+    -- every earlier measurement of the gate was CPU-only, so nothing caught it. _kabsch now computes
+    in fp32 and casts back; this pins that, and that the dtype contract is preserved."""
+    from openfold.utils.tm_score import _kabsch
+    torch.manual_seed(0)
+    P = torch.randn(4, 16, 3)
+    R_true = torch.linalg.qr(torch.randn(3, 3))[0]
+    Q = P @ R_true.T + 2.0
+    w = torch.ones(4, 16)
+    R32, t32 = _kabsch(P, Q, w)
+    Rb, tb = _kabsch(P.bfloat16(), Q.bfloat16(), w.bfloat16())
+    assert Rb.dtype == torch.bfloat16 and tb.dtype == torch.bfloat16, "must return the input dtype"
+    assert torch.allclose(Rb.float(), R32, atol=5e-2), (Rb.float() - R32).abs().max()
+
+
+def test_kabsch_recovers_a_known_rotation():
+    """Guards the fp32 cast against a silent transpose/reflection slip while touching this function."""
+    from openfold.utils.tm_score import _kabsch
+    torch.manual_seed(1)
+    P = torch.randn(2, 24, 3)
+    R_true = torch.linalg.qr(torch.randn(3, 3))[0]
+    if torch.linalg.det(R_true) < 0:
+        R_true[:, 2] *= -1
+    Q = P @ R_true.T
+    R, t = _kabsch(P, Q, torch.ones(2, 24))
+    assert torch.allclose(R, R_true.expand(2, 3, 3), atol=1e-4), (R - R_true).abs().max()

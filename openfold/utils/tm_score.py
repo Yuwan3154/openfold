@@ -45,7 +45,18 @@ FAST_KWARGS = {"n_iter": 10, "min_seed_len": 32}
 
 
 def _kabsch(P: torch.Tensor, Q: torch.Tensor, w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Weighted Kabsch. P,Q: (B,L,3); w: (B,L) non-negative. Returns (R, t) mapping P -> Q."""
+    """Weighted Kabsch. P,Q: (B,L,3); w: (B,L) non-negative. Returns (R, t) mapping P -> Q.
+
+    ⛔⛔ FORCED TO float32. `torch.linalg.svd` has no bf16 CUDA kernel -- under `--precision bf16` this
+    raised `"svd_cuda_gesvdjBatched" not implemented for 'BFloat16'` the first time the T4 gate ever ran
+    on a GPU (every prior measurement of it was CPU-only). ⭐ fp32 is also the right precision on the
+    merits, not merely a workaround: this is a 3x3 SVD whose output feeds a d0-normalised TM sum, and
+    fp32/fp64 were measured to agree to the printed digit, whereas bf16 has ~3 decimal digits of
+    mantissa -- far too coarse for a rotation that decides a promotion at delta = 0.05 TM.
+    The result is cast back to the caller's dtype so nothing downstream changes shape or type.
+    """
+    _in_dtype = P.dtype
+    P, Q, w = P.float(), Q.float(), w.float()
     wsum = w.sum(dim=1, keepdim=True).clamp_min(1e-8)
     Pc = (P * w[..., None]).sum(dim=1) / wsum
     Qc = (Q * w[..., None]).sum(dim=1) / wsum
@@ -60,7 +71,7 @@ def _kabsch(P: torch.Tensor, Q: torch.Tensor, w: torch.Tensor) -> tuple[torch.Te
     D[:, 2, 2] = d
     R = V @ D @ Ut
     t = Qc - torch.einsum("bij,bj->bi", R, Pc)
-    return R, t
+    return R.to(_in_dtype), t.to(_in_dtype)
 
 
 def _seed_windows(L: int, min_seed_len: int, max_seeds: int | None) -> list[tuple[int, int]]:
