@@ -233,11 +233,27 @@ def test_short_chain_below_min_seed_len():
     assert float(tm_score(x, x, **FAST_KWARGS)) > 0.99
 
 
+def test_kabsch_works_under_bf16_autocast():
+    """⛔⛔ THE REGRESSION THAT COST TWO LAUNCHES. torch.linalg.svd has no bf16 CUDA kernel, and merely
+    casting the inputs to float() does NOT save it: autocast intercepts torch.einsum and returns bf16
+    even from fp32 operands, so H comes back bf16 and the SVD fails at the same line. The first fix did
+    exactly that and failed identically.
+    ⭐ This test must therefore run INSIDE an autocast context -- a plain bf16-tensor test passes even
+    with the broken version, which is why the first attempt looked verified."""
+    from openfold.utils.tm_score import _kabsch
+    torch.manual_seed(0)
+    P = torch.randn(4, 16, 3)
+    R_true = torch.linalg.qr(torch.randn(3, 3))[0]
+    Q = P @ R_true.T + 2.0
+    w = torch.ones(4, 16)
+    R32, _ = _kabsch(P, Q, w)
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        R_ac, t_ac = _kabsch(P, Q, w)
+    assert torch.allclose(R_ac.float(), R32, atol=1e-4), (R_ac.float() - R32).abs().max()
+
+
 def test_kabsch_works_in_bfloat16():
-    """⛔ torch.linalg.svd has no bf16 CUDA kernel. Under --precision bf16 this raised
-    `"svd_cuda_gesvdjBatched" not implemented for 'BFloat16'` the first time the T4 gate ran on a GPU
-    -- every earlier measurement of the gate was CPU-only, so nothing caught it. _kabsch now computes
-    in fp32 and casts back; this pins that, and that the dtype contract is preserved."""
+    """Plain bf16 inputs, no autocast -- the weaker check, kept for the dtype contract."""
     from openfold.utils.tm_score import _kabsch
     torch.manual_seed(0)
     P = torch.randn(4, 16, 3)
