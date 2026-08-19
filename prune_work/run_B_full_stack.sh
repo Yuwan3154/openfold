@@ -6,7 +6,7 @@
 #   1. COUNT-MATCHED synthetic templates   --t2_replace_prob 0.5 --t2_topup_to 20
 #   2. ESMFold2 tricks                     --contractive_recycling --gaussian_pair_init
 #   3. T4 self-distillation                --t4_self_distill --t4_n_promoted 32 ...
-#   4. Explorative modeling (best-of-K)    --explore_k 5 --explore_select plddt
+#   4. Explorative modeling (best-of-K)    --explore_k 5 --explore_select hybrid (loss->pTM @10)
 #
 # ⭐ 2 and 4 are coupled by design: --gaussian_pair_init draws a fresh z_0 inside iteration() on
 #   EVERY forward, which is the only reason the K samples differ. Without it, best-of-K would be K
@@ -81,7 +81,13 @@ T2_PREF_COUNTS=${T2_PREF_COUNTS:-/home/jupyter-chenxi/pp1c_work/prefiltered_coun
 # another; each DDP rank writes only its own rank<N>/ subtree, so no locking is needed.
 T4_POOL=${T4_POOL_DIR:-$OUT/t4_pool}
 EXPLORE_K=${EXPLORE_K:-5}
-EXPLORE_SELECT=${EXPLORE_SELECT:-plddt}
+# ⛔⛔ HYBRID (user 2026-08-19): the TRUE loss for epochs 0-9, then pTM from epoch 10.
+# pLDDT was tried first and MEASURED BAD as a within-target selector -- Run B epochs 0-1
+# agreed with the loss-argmin only 28-29% vs 20% for random choice among 5, costing ~0.4
+# loss/step. pTM is the better proxy here: rank correlation with true TM = 0.87 on the val
+# set. ⚠️ pTM, NOT pLDDT, was specified explicitly.
+EXPLORE_SELECT=${EXPLORE_SELECT:-hybrid}
+EXPLORE_SWITCH_EPOCH=${EXPLORE_SWITCH_EPOCH:-10}
 # ⛔ REQUIRED. Without it the npz rows are placed by residue_index - 1, which desynchronises at
 # the first unresolved residue and is what killed launch #2 (1eis_A, 70/85 positions wrong).
 # data_modules.py asserts on its absence rather than silently falling back.
@@ -108,7 +114,7 @@ else
   echo "INIT (warm-start) from stock AF2 jax params: $JAX"
 fi
 echo "RUN B (full stack): index=$T2_INDEX root=$T2_ROOT band=$T2_MIN_TM-$T2_MAX_TM qmap=$T2_QMAP"
-echo "  tricks: contractive_recycling + gaussian_pair_init | explore: K=$EXPLORE_K select=$EXPLORE_SELECT"
+echo "  tricks: contractive_recycling + gaussian_pair_init | explore: K=$EXPLORE_K select=$EXPLORE_SELECT switch_epoch=$EXPLORE_SWITCH_EPOCH"
 echo "  T4: n_promoted=32 max_per_chain=64 promote_after_epoch=5 pool=$T4_POOL"
 echo "  mixing: replace_prob=$T2_REPLACE_PROB  topup_to=$T2_TOPUP_TO  counts=$T2_PREF_COUNTS"
 echo "  lists (all-X excluded): train=$TRAIN val=$VAL"
@@ -129,6 +135,7 @@ python train_openfold.py "$MM" "$ALN" "$MM" "$OUT" 2018-04-30 \
   --t2_prefiltered_counts "$T2_PREF_COUNTS" \
   --contractive_recycling --gaussian_pair_init \
   --explore_k "$EXPLORE_K" --explore_select "$EXPLORE_SELECT" \
+  --explore_switch_epoch "$EXPLORE_SWITCH_EPOCH" \
   --t4_self_distill --t4_n_promoted 32 --t4_max_per_chain 64 \
   --t4_promote_after_epoch 5 --t4_pool_dir "$T4_POOL" \
   --precision bf16 --learning_rate 1e-4 --warmup_no_steps 3000 \
