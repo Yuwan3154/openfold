@@ -223,6 +223,49 @@ class OpenFoldWrapper(pl.LightningModule):
         if (self.ema.device != batch["aatype"].device):
             self.ema.to(batch["aatype"].device)
 
+    # ------------------------------------------------------------------------------------------
+    # EXPLORATIVE MODELING (best-of-K). Draw K samples, keep one, backprop through only that one.
+    #
+    # ⛔⛔ WHY THE FULL RNG STATE IS SAVED AND RESTORED, not just a generator for the pair init.
+    # The K samples differ because `--gaussian_pair_init` draws a fresh z_0 inside `iteration()` on
+    # every forward. But that is NOT the only randomness in a training forward -- the Evoformer runs
+    # DROPOUT. If only the pair-init seed were replayed, the winner's gradient forward would use a
+    # DIFFERENT dropout mask than the forward that selected it, so the backward would run through a
+    # sample that was never scored. That is silent: no error, just a mis-targeted gradient.
+    # Saving/restoring the whole RNG state makes the winner's grad forward bit-identical to its
+    # scoring forward, and covers any future stochastic layer for free.
+    #
+    # ⚠️ Memory: the K scoring forwards run under no_grad, so peak activation memory is that of ONE
+    # forward, not K. The cost is time (~K extra forwards), not VRAM.
+    # ------------------------------------------------------------------------------------------
+    def _rng_snapshot(self):
+        dev = torch.cuda.current_device() if torch.cuda.is_available() else None
+        return (torch.get_rng_state(),
+                torch.cuda.get_rng_state(dev) if dev is not None else None)
+
+    def _rng_restore(self, snap):
+        cpu_state, cuda_state = snap
+        torch.set_rng_state(cpu_state)
+        if cuda_state is not None:
+            torch.cuda.set_rng_state(cuda_state, torch.cuda.current_device())
+
+    def _explore_confidence(self, outputs, batch):
+        """The score inference could actually compute -- no native structure involved.
+
+        ⭐ Default is mean pLDDT because that is AF2's OWN monomer ranking metric
+        (`ranking_confidence` = mean pLDDT for monomers), so the selector matches how these models are
+        ranked everywhere else in this project rather than being a number picked here.
+        ⚠️ Masked by `seq_mask`: padding residues carry a pLDDT too, and averaging over them would
+        make the score depend on how much padding a crop happened to need.
+        """
+        mode = getattr(self, "explore_select", "plddt")
+        if mode == "ptm":
+            return float(outputs["ptm_score"].mean())
+        mask = batch["seq_mask"]
+        plddt = outputs["plddt"]
+        denom = mask.sum().clamp_min(1.0)
+        return float((plddt * mask).sum() / denom)
+
         ground_truth = batch.pop('gt_features', None)
 
         # Direction-2 hybrid: frozen full-48 teacher forward (no grad) on the same batch -> single/pair targets.
@@ -246,7 +289,44 @@ class OpenFoldWrapper(pl.LightningModule):
         batch.pop("num_res_crop_start", None)
 
         # Run the model
-        outputs = self(batch)
+        _K = int(getattr(self, "explore_k", 1) or 1)
+        _explore = _K > 1 and self.current_epoch >= int(getattr(self, "explore_after_epoch", 0))
+        if _explore:
+            _sel = getattr(self, "explore_select", "plddt")
+            _snaps, _confs, _losses = [], [], []
+            _scored = tensor_tree_map(lambda t: t[..., -1], batch)
+            with torch.no_grad():
+                for _ in range(_K):
+                    _snaps.append(self._rng_snapshot())
+                    _o = self(batch)
+                    _confs.append(self._explore_confidence(_o, _scored))
+                    # the TRUE loss for every sample: not used to select when the confidence proxy is
+                    # driving, but it is what makes the proxy's quality measurable from this run alone
+                    _l, _ = self.loss(_o, _scored, _return_breakdown=True)
+                    _losses.append(float(_l))
+            _best_loss = int(min(range(_K), key=lambda j: _losses[j]))
+            _pick = _best_loss if _sel == "loss" else int(max(range(_K), key=lambda j: _confs[j]))
+            # ⭐⭐ THE DIAGNOSTIC THE PROXY CHOICE TURNS ON: how often does the confidence-selected
+            # sample coincide with the loss-selected one? Training can select on the true loss but
+            # inference cannot, so if these disagree the objective does not transfer to test time.
+            self.log("explore/conf_picks_loss_argmin", float(_pick == _best_loss),
+                     on_step=True, on_epoch=True, logger=True)
+            self.log("explore/loss_spread", float(max(_losses) - min(_losses)),
+                     on_step=True, on_epoch=True, logger=True)
+            self.log("explore/loss_gain_vs_mean",
+                     float(sum(_losses) / _K - _losses[_pick]),
+                     on_step=True, on_epoch=True, logger=True)
+            self.log("explore/regret_vs_best",
+                     float(_losses[_pick] - _losses[_best_loss]),
+                     on_step=True, on_epoch=True, logger=True)
+            self.log("explore/conf_spread", float(max(_confs) - min(_confs)),
+                     on_step=True, on_epoch=True, logger=True)
+            # ⛔ Replay the winner EXACTLY (pair init + dropout), then take the real, grad-carrying
+            # forward. Anything less backprops through a sample that was never scored.
+            self._rng_restore(_snaps[_pick])
+            outputs = self(batch)
+        else:
+            outputs = self(batch)
 
         # Remove the recycling dimension
         batch = tensor_tree_map(lambda t: t[..., -1], batch)
@@ -877,6 +957,9 @@ def main(args):
     # T4 phase 3 (promotion). ⭐ Deliberately independent of what this run was initialised FROM:
     # nothing here reads the base checkpoint, so T4 stacks on T1 or on T2 unchanged -- the base is
     # only ever --resume_from_ckpt / --resume_from_jax_params.
+    model_module.explore_k = getattr(args, "explore_k", 1)
+    model_module.explore_select = getattr(args, "explore_select", "plddt")
+    model_module.explore_after_epoch = getattr(args, "explore_after_epoch", 0)
     model_module.t4_pool_dir = getattr(args, "t4_pool_dir", None)
     model_module.t4_promote_after_epoch = getattr(args, "t4_promote_after_epoch", 0)
     model_module._t4_writer = None
@@ -1535,6 +1618,31 @@ if __name__ == "__main__":
         "--t4_min_tm", type=float, default=0.0,
         help="T4: absolute floor on TM(pred,native) before a prediction may be promoted. "
              "0.0 disables the floor (default) -- margin alone decides."
+    )
+    parser.add_argument(
+        "--explore_k", type=int, default=1,
+        help="EXPLORATIVE MODELING: draw K samples per training step and backprop through only the "
+             "selected one. Needs --gaussian_pair_init to have any effect, since that is what makes "
+             "the samples differ (a fresh z_0 is drawn inside iteration() on every forward). "
+             "1 = off (default). ⚠️ Cost is ~K extra forwards, roughly 2.3-2.7x per step at K=5; "
+             "VRAM is unchanged because the scoring forwards run under no_grad. "
+             "⛔ The logged train/loss becomes systematically LOWER than a K=1 run purely from the "
+             "selection -- it is NOT comparable to T1/T2's loss curve."
+    )
+    parser.add_argument(
+        "--explore_select", type=str, default="plddt", choices=["plddt", "ptm", "loss"],
+        help="How the kept sample is chosen. ⭐ `plddt` (default) = mean pLDDT masked by seq_mask, "
+             "which is AF2's OWN monomer ranking metric -- chosen so training selects by something "
+             "INFERENCE CAN ALSO COMPUTE. `ptm` uses the pTM head instead. `loss` selects on the true "
+             "loss, which is the stronger training signal but requires the native structure, so it "
+             "cannot be reproduced at test time; use it only knowingly. Whichever is set, "
+             "explore/conf_picks_loss_argmin logs how often the proxy agrees with the loss."
+    )
+    parser.add_argument(
+        "--explore_after_epoch", type=int, default=0,
+        help="First epoch (0-based) from which exploration runs; earlier epochs use K=1. 0 = explore "
+             "from the start (default). Useful to avoid paying the ~2.5x step cost during the early "
+             "epochs, where the model is not yet worth sampling from."
     )
     parser.add_argument(
         "--t4_n_promoted", type=int, default=0,

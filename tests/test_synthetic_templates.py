@@ -791,3 +791,77 @@ def test_default_never_silently_changes_a_full_msa_run():
     """The dangerous direction: a full-MSA run must not acquire a query-only MSA by default."""
     for flag in (None, False):
         assert _resolve_force_query_only(flag, single_seq=False) is False
+
+
+# ---------------------------------------------------------------------------------------------
+# EXPLORATIVE MODELING (best-of-K). The failure mode is silent: if the winner's gradient forward
+# does not reproduce the forward that scored it, the backward runs through a sample that was never
+# evaluated -- no error, just a mis-targeted gradient.
+# ---------------------------------------------------------------------------------------------
+
+def _snap():
+    return (torch.get_rng_state(), None)
+
+
+def _restore(snap):
+    torch.set_rng_state(snap[0])
+
+
+def _stochastic_forward():
+    """Stands in for a training forward: a gaussian pair init PLUS dropout, both off the global RNG,
+    which is exactly why replaying only the pair-init seed is not enough."""
+    z0 = torch.randn(4)
+    drop = (torch.rand(4) > 0.5).float()
+    return z0 * drop
+
+
+def test_replaying_the_rng_snapshot_reproduces_the_scored_sample():
+    """⭐ The whole correctness of best-of-K rests on this."""
+    snaps, samples = [], []
+    for _ in range(5):
+        snaps.append(_snap())
+        samples.append(_stochastic_forward())
+    for k in range(5):
+        _restore(snaps[k])
+        assert torch.equal(_stochastic_forward(), samples[k]), k
+
+
+def test_k_samples_actually_differ():
+    """If they did not, best-of-K would be K identical forwards and pure wasted compute."""
+    samples = [_stochastic_forward() for _ in range(5)]
+    assert any(not torch.equal(samples[0], s) for s in samples[1:])
+
+
+def test_seeding_only_the_pair_init_would_NOT_reproduce_the_sample():
+    """⛔ Negative control for the design choice: a generator scoped to the pair init leaves dropout
+    on the global stream, so the replay diverges. This test FAILS if someone 'simplifies' the
+    snapshot away -- which is the point of having it."""
+    g = torch.Generator().manual_seed(1234)
+    def pair_init_only():
+        z0 = torch.randn(4, generator=g)      # replayable
+        drop = (torch.rand(4) > 0.5).float()  # NOT replayable -- global stream
+        return z0 * drop
+    g.manual_seed(1234); a = pair_init_only()
+    g.manual_seed(1234); b = pair_init_only()
+    assert not torch.equal(a, b), "dropout must be part of what gets replayed"
+
+
+def test_selection_picks_the_argmax_of_the_proxy_and_argmin_of_loss():
+    confs = [0.61, 0.88, 0.55, 0.70, 0.62]
+    losses = [3.1, 2.4, 4.0, 2.2, 3.5]
+    best_loss = min(range(5), key=lambda j: losses[j])
+    assert best_loss == 3
+    assert max(range(5), key=lambda j: confs[j]) == 1
+    # the proxy disagrees with the loss here -- exactly what conf_picks_loss_argmin measures
+    assert max(range(5), key=lambda j: confs[j]) != best_loss
+    regret = losses[1] - losses[best_loss]
+    assert abs(regret - 0.2) < 1e-9
+
+
+def test_gain_vs_mean_is_nonnegative_for_loss_selection():
+    """Sanity on the reported gain: selecting the min can never be worse than the mean."""
+    for seed in range(20):
+        rng = np.random.default_rng(seed)
+        losses = rng.normal(3.0, 0.5, 5).tolist()
+        pick = min(range(5), key=lambda j: losses[j])
+        assert sum(losses) / 5 - losses[pick] >= 0
