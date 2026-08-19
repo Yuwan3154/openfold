@@ -152,14 +152,15 @@ def test_merge_after_replacing_naturals_holds_the_pool_size(tmp_path):
     assert sum(1 for d in out["template_domain_names"] if d.startswith(b"t4_")) == k
 
 
-def test_max_per_chain_keeps_the_best_by_tm(tmp_path):
-    """A newest-wins cap would let a late bad epoch evict good templates."""
+def test_max_per_chain_is_fifo(tmp_path):
+    """⛔ INVERTED 2026-08-19 (user): deterministic FIFO, newest kept. tm_pred no longer decides
+    retention at all -- it is recorded for diagnostics and for the promotion gate only."""
     for i, tm in enumerate([0.4, 0.9, 0.6, 0.95]):
         _write(tmp_path, "6ddd_A", 0, i, first=0, n=L, tm_pred=tm, rank=i)
     p = PromotedTemplatePool(str(tmp_path), max_per_chain=2)
     assert p.refresh() == 2
-    kept = sorted(r["tm_pred"] for r in p.by_chain["6ddd_A"])
-    assert kept == [0.9, 0.95]
+    assert sorted(r["step"] for r in p.by_chain["6ddd_A"]) == [2, 3]      # the two newest
+    assert sorted(r["tm_pred"] for r in p.by_chain["6ddd_A"]) == [0.6, 0.95]
 
 
 def test_unknown_chain_returns_none(tmp_path):

@@ -120,12 +120,21 @@ class PromotedTemplatePool:
                     continue
                 rec = json.loads(line)
                 rec["_path"] = rank_root / rec["npz"]
+                # int, so it can be a deterministic sort key; "rank3" -> 3
+                rec["_rank"] = int(rank_root.name[4:])
                 by_chain.setdefault(rec["chain"], []).append(rec)
         if self.max_per_chain > 0:
-            # keep the BEST by the prediction's own TM -- a cap that kept the newest instead would
-            # let a late bad epoch evict good templates
+            # ⛔⛔ DETERMINISTIC FIFO -- newest kept, oldest evicted (user, 2026-08-19).
+            # This REPLACED a keep-the-best-by-tm_pred cap, deliberately. That cap's rationale was
+            # "a newest-wins cap would let a late bad epoch evict good templates", but under
+            # promote-all it inverts: with ~K times as many candidates per chain the top-N filter
+            # gets MORE selective, freezes an early-epoch snapshot in place, and starves exactly the
+            # recombination signal the pool exists to provide. The pool's job is to keep showing the
+            # model its own CURRENT predictions.
+            # ⚠️ The tiebreak is not cosmetic: (epoch, step) TIES across the DDP ranks, which write
+            # independently, and every dataloader worker must agree on what the snapshot contains.
             for c, v in by_chain.items():
-                v.sort(key=lambda r: -r["tm_pred"])
+                v.sort(key=lambda r: (-r["epoch"], -r["step"], -r["_rank"], r["npz"]))
                 by_chain[c] = v[: self.max_per_chain]
         self.by_chain = by_chain
         return sum(len(v) for v in by_chain.values())

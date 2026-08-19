@@ -1717,10 +1717,12 @@ help="How the kept sample is chosen. ⭐ `hybrid` (user-chosen 2026-08-19) = the
     )
     parser.add_argument(
         "--t4_max_per_chain", type=int, default=0,
-        help="T4 phase 3: cap the promoted pool at this many templates per chain, keeping the best "
-             "by the prediction's own TM (a newest-wins cap would let a late bad epoch evict good "
-             "templates). 0 = uncapped (default). A cap bounds both disk and the chance that one "
-             "easy chain dominates its own template distribution."
+        help="T4 phase 3: cap the promoted pool at this many templates per chain, keeping the NEWEST "
+             "(deterministic FIFO on (epoch, step, rank, path); user 2026-08-19, so the model keeps "
+             "seeing its own current predictions). Replaced a keep-the-best-by-tm_pred cap, which "
+             "under promote-all would freeze an early-epoch snapshot in place. 0 = uncapped "
+             "(default). A cap bounds both disk and the chance that one easy chain dominates its own "
+             "template distribution."
     )
     parser.add_argument(
         "--t4_pool_dir", type=str, default=None,

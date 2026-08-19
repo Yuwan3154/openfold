@@ -74,9 +74,10 @@ def test_crop_is_placed_at_its_residue_index(written):
     root, coords, mask = written
     pool = PromotedTemplatePool(str(root))
     pool.refresh()
-    # pick the tm=0.80 entry deterministically by capping the pool to the single best
-    pool.max_per_chain = 1
-    pool.refresh()
+    # ⚠️ Select the start=5 crop EXPLICITLY rather than via the cap. This test is about crop
+    # placement, and routing that through the retention rule made it silently policy-dependent --
+    # the FIFO cap keeps the other entry, so the old version broke when retention changed.
+    pool.by_chain["1abc_A"] = [r for r in pool.by_chain["1abc_A"] if r["step"] == 0]
     f = pool.sample_features("1abc_A", 1, np.random.default_rng(0), query_sequence=Q_FULL)
     # ⛔ phase 3 renamed these to the NATURAL-HIT layout on purpose: merge_template_features copies
     # only keys already present in the natural features and zero-fills the rest, so the old
@@ -91,13 +92,48 @@ def test_crop_is_placed_at_its_residue_index(written):
     np.testing.assert_allclose(pos[0][covered][mask], coords[mask], rtol=1e-6)
 
 
-def test_cap_keeps_the_best_not_the_newest(written):
-    """A cap that evicted by recency would let a late bad epoch push out good templates."""
+def test_cap_is_fifo_keeps_the_newest(written):
+    """⛔ INVERTED 2026-08-19 (user): the cap is now deterministic FIFO, so the NEWEST survives even
+    when it scores worse. The old rationale -- "a late bad epoch could evict good templates" -- is
+    real but was overridden: under promote-all a keep-the-best cap freezes an early-epoch snapshot
+    and starves the recombination signal the pool exists for."""
     root, _, _ = written
     pool = PromotedTemplatePool(str(root), max_per_chain=1)
     pool.refresh()
     assert len(pool.by_chain["1abc_A"]) == 1
-    assert pool.by_chain["1abc_A"][0]["tm_pred"] == pytest.approx(0.80)
+    kept = pool.by_chain["1abc_A"][0]
+    assert kept["step"] == 1
+    assert kept["tm_pred"] == pytest.approx(0.60)      # the WORSE of the two, on purpose
+
+
+def test_fifo_is_deterministic_across_ranks_and_refreshes(tmp_path):
+    """⛔⛔ (epoch, step) TIES across DDP ranks -- they write independently and can land on the same
+    step. Without a rank/path tiebreak the survivor would depend on glob order, and two dataloader
+    workers could disagree about what the epoch's snapshot contains."""
+    for r in range(4):
+        w = PromotedTemplateWriter(str(tmp_path), rank=r)
+        _promote(w, "1abc_A", epoch=2, step=7, tm=0.3 + 0.1 * r, seed=r)
+        w.close()
+    seen = []
+    for _ in range(3):
+        pool = PromotedTemplatePool(str(tmp_path), max_per_chain=2)
+        assert pool.refresh() == 2
+        seen.append([r["npz"] for r in pool.by_chain["1abc_A"]])
+    assert seen[0] == seen[1] == seen[2]
+    # highest rank first, by the declared key
+    assert [r["_rank"] for r in pool.by_chain["1abc_A"]] == [3, 2]
+
+
+def test_fifo_prefers_a_later_epoch_over_a_later_step(tmp_path):
+    """epoch dominates step: step counters are global, but the ordering must stay epoch-major so a
+    resumed run cannot rank an old high-step record above a fresh one."""
+    w = PromotedTemplateWriter(str(tmp_path), rank=0)
+    _promote(w, "1abc_A", epoch=1, step=9999, tm=0.9, seed=1)
+    _promote(w, "1abc_A", epoch=4, step=3, tm=0.1, seed=2)
+    w.close()
+    pool = PromotedTemplatePool(str(tmp_path), max_per_chain=1)
+    pool.refresh()
+    assert pool.by_chain["1abc_A"][0]["epoch"] == 4
 
 
 def test_missing_chain_returns_none(written):
