@@ -219,10 +219,6 @@ class OpenFoldWrapper(pl.LightningModule):
                     sync_dist=sync_epoch_metrics,
                 )
 
-    def training_step(self, batch, batch_idx):
-        if (self.ema.device != batch["aatype"].device):
-            self.ema.to(batch["aatype"].device)
-
     # ------------------------------------------------------------------------------------------
     # EXPLORATIVE MODELING (best-of-K). Draw K samples, keep one, backprop through only that one.
     #
@@ -265,6 +261,10 @@ class OpenFoldWrapper(pl.LightningModule):
         plddt = outputs["plddt"]
         denom = mask.sum().clamp_min(1.0)
         return float((plddt * mask).sum() / denom)
+
+    def training_step(self, batch, batch_idx):
+        if (self.ema.device != batch["aatype"].device):
+            self.ema.to(batch["aatype"].device)
 
         ground_truth = batch.pop('gt_features', None)
 
