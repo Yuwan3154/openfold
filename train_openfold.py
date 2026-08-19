@@ -245,22 +245,43 @@ class OpenFoldWrapper(pl.LightningModule):
         if cuda_state is not None:
             torch.cuda.set_rng_state(cuda_state, torch.cuda.current_device())
 
-    def _explore_confidence(self, outputs, batch):
+    def _explore_confidence(self, outputs, batch, mode):
         """The score inference could actually compute -- no native structure involved.
 
-        ⭐ Default is mean pLDDT because that is AF2's OWN monomer ranking metric
-        (`ranking_confidence` = mean pLDDT for monomers), so the selector matches how these models are
-        ranked everywhere else in this project rather than being a number picked here.
-        ⚠️ Masked by `seq_mask`: padding residues carry a pLDDT too, and averaging over them would
-        make the score depend on how much padding a crop happened to need.
+        ⚠️ Takes the RESOLVED mode, not `self.explore_select`, because under `hybrid` the effective
+        selector changes with the epoch and reading the raw flag here would silently keep using the
+        phase-1 rule forever.
+
+        ⛔⛔ pLDDT MEASURED BAD AS A WITHIN-TARGET SELECTOR (Run B, epochs 0-1): it picked the true
+        loss-argmin only 28-29% of the time against 20% for choosing at random among 5, at a cost of
+        ~0.4 loss per step (`explore/regret_vs_best`). Mean pLDDT is AF2's own monomer RANKING metric,
+        but ranking different targets is a far easier problem than ranking 5 samples of the SAME target,
+        and it does not transfer. Hence the user's move to pTM.
+        ⚠️ Masked by `seq_mask` for pLDDT: padding residues carry a pLDDT too, so an unmasked mean would
+        depend on how much padding a crop happened to need. pTM is already a global scalar.
         """
-        mode = getattr(self, "explore_select", "plddt")
         if mode == "ptm":
             return float(outputs["ptm_score"].mean())
         mask = batch["seq_mask"]
         plddt = outputs["plddt"]
         denom = mask.sum().clamp_min(1.0)
         return float((plddt * mask).sum() / denom)
+
+    def _resolve_explore_select(self):
+        """`hybrid` = the TRUE loss for the first `--explore_switch_epoch` epochs, then pTM.
+
+        ⭐ Rationale (user, 2026-08-19): the true loss is the strongest signal but needs the native
+        structure, so it cannot be reproduced at inference; pTM can. Training on loss while the model
+        is still weak, then handing over to pTM, buys the early signal AND ends on an objective that
+        transfers -- and it gives the confidence pathway a model worth ranking by the time it takes over.
+        ⚠️ `self.current_epoch` is THIS run's epoch counter, so a run warm-started from another
+        checkpoint restarts the phase clock at 0.
+        """
+        sel = getattr(self, "explore_select", "loss")
+        if sel != "hybrid":
+            return sel
+        switch = int(getattr(self, "explore_switch_epoch", 0))
+        return "loss" if self.current_epoch < switch else "ptm"
 
     def training_step(self, batch, batch_idx):
         if (self.ema.device != batch["aatype"].device):
@@ -292,14 +313,14 @@ class OpenFoldWrapper(pl.LightningModule):
         _K = int(getattr(self, "explore_k", 1) or 1)
         _explore = _K > 1 and self.current_epoch >= int(getattr(self, "explore_after_epoch", 0))
         if _explore:
-            _sel = getattr(self, "explore_select", "plddt")
+            _sel = self._resolve_explore_select()
             _snaps, _confs, _losses = [], [], []
             _scored = tensor_tree_map(lambda t: t[..., -1], batch)
             with torch.no_grad():
                 for _ in range(_K):
                     _snaps.append(self._rng_snapshot())
                     _o = self(batch)
-                    _confs.append(self._explore_confidence(_o, _scored))
+                    _confs.append(self._explore_confidence(_o, _scored, _sel))
                     # the TRUE loss for every sample: not used to select when the confidence proxy is
                     # driving, but it is what makes the proxy's quality measurable from this run alone
                     _l, _ = self.loss(_o, _scored, _return_breakdown=True)
@@ -320,6 +341,10 @@ class OpenFoldWrapper(pl.LightningModule):
                      float(_losses[_pick] - _losses[_best_loss]),
                      on_step=True, on_epoch=True, logger=True)
             self.log("explore/conf_spread", float(max(_confs) - min(_confs)),
+                     on_step=True, on_epoch=True, logger=True)
+            # ⭐ which rule is actually driving right now: 1 = the true loss, 0 = a confidence proxy.
+            # Without it, a hybrid run's logs cannot be split into its two phases after the fact.
+            self.log("explore/using_true_loss", 1.0 if _sel == "loss" else 0.0,
                      on_step=True, on_epoch=True, logger=True)
             # ⛔ Replay the winner EXACTLY (pair init + dropout), then take the real, grad-carrying
             # forward. Anything less backprops through a sample that was never scored.
@@ -958,7 +983,16 @@ def main(args):
     # nothing here reads the base checkpoint, so T4 stacks on T1 or on T2 unchanged -- the base is
     # only ever --resume_from_ckpt / --resume_from_jax_params.
     model_module.explore_k = getattr(args, "explore_k", 1)
-    model_module.explore_select = getattr(args, "explore_select", "plddt")
+    model_module.explore_select = getattr(args, "explore_select", "loss")
+    if model_module.explore_select == "hybrid":
+        assert getattr(args, "explore_switch_epoch", None) is not None, (
+            "--explore_select hybrid requires --explore_switch_epoch: the handover epoch is an "
+            "experimental choice, not something to default."
+        )
+        rank_zero_info(
+            f"explore: HYBRID selector -- true loss for epochs 0-{args.explore_switch_epoch - 1}, "
+            f"then pTM from epoch {args.explore_switch_epoch}")
+    model_module.explore_switch_epoch = getattr(args, "explore_switch_epoch", None) or 0
     model_module.explore_after_epoch = getattr(args, "explore_after_epoch", 0)
     model_module.t4_pool_dir = getattr(args, "t4_pool_dir", None)
     model_module.t4_promote_after_epoch = getattr(args, "t4_promote_after_epoch", 0)
@@ -1630,13 +1664,26 @@ if __name__ == "__main__":
              "selection -- it is NOT comparable to T1/T2's loss curve."
     )
     parser.add_argument(
-        "--explore_select", type=str, default="plddt", choices=["plddt", "ptm", "loss"],
-        help="How the kept sample is chosen. ⭐ `plddt` (default) = mean pLDDT masked by seq_mask, "
-             "which is AF2's OWN monomer ranking metric -- chosen so training selects by something "
-             "INFERENCE CAN ALSO COMPUTE. `ptm` uses the pTM head instead. `loss` selects on the true "
-             "loss, which is the stronger training signal but requires the native structure, so it "
-             "cannot be reproduced at test time; use it only knowingly. Whichever is set, "
-             "explore/conf_picks_loss_argmin logs how often the proxy agrees with the loss."
+        "--explore_select", type=str, default="loss",
+        choices=["plddt", "ptm", "loss", "hybrid"],
+help="How the kept sample is chosen. ⭐ `hybrid` (user-chosen 2026-08-19) = the TRUE loss for the "
+             "first --explore_switch_epoch epochs, then pTM: the loss is the strongest signal but needs "
+             "the native structure and so cannot be reproduced at inference, while pTM can, so this "
+             "buys the early signal and still ends on an objective that transfers. "
+             "⛔⛔ `plddt` MEASURED BAD as a within-target selector (Run B epochs 0-1: agreed with the "
+             "loss-argmin only 28-29%% vs 20%% for random choice among 5, costing ~0.4 loss/step). Mean "
+             "pLDDT is AF2's monomer RANKING metric, but ranking different targets is far easier than "
+             "ranking 5 samples of the SAME target. `ptm` is the better proxy here -- pTM's rank "
+             "correlation with true TM measured 0.87 on the val set. `loss` selects on the true loss "
+             "throughout. explore/conf_picks_loss_argmin logs proxy-vs-loss agreement either way, and "
+             "explore/using_true_loss records which phase a hybrid run was in."
+    )
+    parser.add_argument(
+        "--explore_switch_epoch", type=int, default=None,
+        help="With --explore_select hybrid: the first epoch (0-based) that uses pTM instead of the true "
+             "loss. REQUIRED with hybrid and has no default, because it sets how long training gets the "
+             "stronger-but-untransferable signal before handing over -- a real experimental choice. "
+             "User-set to 10 on 2026-08-19."
     )
     parser.add_argument(
         "--explore_after_epoch", type=int, default=0,

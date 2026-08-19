@@ -865,3 +865,45 @@ def test_gain_vs_mean_is_nonnegative_for_loss_selection():
         losses = rng.normal(3.0, 0.5, 5).tolist()
         pick = min(range(5), key=lambda j: losses[j])
         assert sum(losses) / 5 - losses[pick] >= 0
+
+
+# ---------------------------------------------------------------------------------------------
+# HYBRID SELECTOR (user 2026-08-19): the TRUE loss for the first --explore_switch_epoch epochs, then
+# pTM. Both boundaries matter: an off-by-one either wastes a loss-phase epoch or hands over early.
+# ---------------------------------------------------------------------------------------------
+
+def _resolve_hybrid(select, epoch, switch):
+    """Mirror of OpenFoldWrapper._resolve_explore_select, pinned somewhere executable."""
+    if select != "hybrid":
+        return select
+    return "loss" if epoch < switch else "ptm"
+
+
+def test_hybrid_switches_at_the_named_epoch_and_not_before():
+    for e in range(10):
+        assert _resolve_hybrid("hybrid", e, 10) == "loss", e
+    for e in (10, 11, 25, 99):
+        assert _resolve_hybrid("hybrid", e, 10) == "ptm", e
+
+
+def test_hybrid_boundary_is_inclusive_of_the_switch_epoch():
+    """Epoch 10 with switch=10 must already be pTM -- 'after 10 epochs' means epochs 0..9 use loss."""
+    assert _resolve_hybrid("hybrid", 9, 10) == "loss"
+    assert _resolve_hybrid("hybrid", 10, 10) == "ptm"
+
+
+def test_non_hybrid_modes_are_epoch_independent():
+    for mode in ("loss", "ptm", "plddt"):
+        for e in (0, 5, 10, 50):
+            assert _resolve_hybrid(mode, e, 10) == mode
+
+
+def test_switch_zero_means_ptm_from_the_start():
+    assert _resolve_hybrid("hybrid", 0, 0) == "ptm"
+
+
+def test_hybrid_uses_ptm_not_plddt_for_its_confidence_phase():
+    """⛔ The user specified pTM explicitly, NOT pLDDT: pLDDT measured 28-29% agreement with the
+    loss-argmin in Run B epochs 0-1, against 20% for random choice among 5."""
+    assert _resolve_hybrid("hybrid", 99, 10) == "ptm"
+    assert _resolve_hybrid("hybrid", 99, 10) != "plddt"
