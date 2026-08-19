@@ -128,35 +128,15 @@ class OpenFoldSingleDataset(torch.utils.data.Dataset):
         # T4 phase 3: promoted predictions, mixed in beside the synthetic ones (see the hook below)
         self.promoted_template_pool = promoted_template_pool
         self.n_promoted_templates = n_promoted_templates
-
-        # ⭐⭐ PREFILTERED-HIT COUNTS AS AN INDEX-ALIGNED NUMPY ARRAY, NOT A DICT. The top-up rule
-        # needs the number of hits that survived `_prefilter_hit` -- the pool that
-        # `shuffle_top_k_prefiltered` truncates -- which is computed inside the featurizer and is not
-        # in the features it returns. It is static (it depends only on the hits, the fixed release-date
-        # cutoff and the query), so it is precomputed by
-        # `prune_work/build_prefiltered_counts.py` and looked up here.
-        # `__getitem__` already has the dataset index, so aligning the table to `self._chain_ids`
-        # makes the lookup a single array read and adds NO 88k-entry Python dict for the dataloader
-        # workers to copy-on-write (the [[proteina_dataloader_cow_leak]] pattern, and the leading
-        # suspect for T2's measured RSS growth).
+        # ⛔ Only stashed here. The prefiltered-count table is index-ALIGNED to `self._chain_ids`, and
+        # that list does not exist yet -- it is built and then FILTERED further down (filter_path,
+        # chain_data_cache). Building the array here read an attribute that did not exist and killed
+        # the first Run B launch; building it before the filtering would have been worse, since the
+        # array would have silently mis-aligned with the final chain order.
+        self._prefiltered_counts_path = prefiltered_counts_path
         self._n_prefiltered = None
         self._n_prefiltered_missing = 0
-        if prefiltered_counts_path is not None:
-            _z = np.load(prefiltered_counts_path, allow_pickle=False)
-            _stored_cutoff = str(_z["cutoff"])
-            assert _stored_cutoff == str(max_template_date), (
-                f"prefiltered-count table was built for cutoff {_stored_cutoff} but this run uses "
-                f"{max_template_date}. The prefilter applies the date cutoff, so the counts would be "
-                f"wrong -- rebuild it rather than reusing the file."
-            )
-            _tbl = dict(zip((str(c) for c in _z["chains"]),
-                            _z["n_prefiltered"].astype(int).tolist()))
-            self._n_prefiltered = np.array(
-                [_tbl.get(c, -1) for c in self._chain_ids], np.int32)
-            del _tbl
-            # counted ONCE here rather than per step, so a table that does not cover this chain list
-            # is a number visible at launch instead of a silent per-example fallback
-            self._n_prefiltered_missing = int((self._n_prefiltered < 0).sum())
+
 
         self.chain_data_cache = None
         if chain_data_cache_path is not None:
@@ -240,6 +220,39 @@ class OpenFoldSingleDataset(torch.utils.data.Dataset):
         self._chain_id_to_idx_dict = {
             chain: i for i, chain in enumerate(self._chain_ids)
         }
+
+        # ⭐⭐ PREFILTERED-HIT COUNTS AS AN INDEX-ALIGNED NUMPY ARRAY, NOT A DICT.
+        # ⛔ Placed HERE, after `self._chain_ids` has been built AND filtered, because the array is
+        # indexed by the dataset index -- aligning it to a pre-filter chain list would silently pair
+        # every chain with another chain's count.
+        # The top-up rule needs the number of hits surviving `_prefilter_hit` (the pool that
+        # `shuffle_top_k_prefiltered` truncates), which the featurizer computes internally and does not
+        # report. It is static given the release-date cutoff, so it is precomputed by
+        # `prune_work/build_prefiltered_counts.py`.
+        # ⭐ An array, not a dict: `__getitem__` already has the index, so the lookup is one array read
+        # and adds NO 88k-entry Python dict for the dataloader workers to copy-on-write (the
+        # [[proteina_dataloader_cow_leak]] pattern).
+        if self._prefiltered_counts_path is not None:
+            _z = np.load(self._prefiltered_counts_path, allow_pickle=False)
+            _stored_cutoff = str(_z["cutoff"])
+            assert _stored_cutoff == str(max_template_date), (
+                f"prefiltered-count table was built for cutoff {_stored_cutoff} but this run uses "
+                f"{max_template_date}. The prefilter applies the date cutoff, so the counts would be "
+                f"wrong -- rebuild it rather than reusing the file."
+            )
+            _tbl = dict(zip((str(c) for c in _z["chains"]),
+                            _z["n_prefiltered"].astype(int).tolist()))
+            self._n_prefiltered = np.array(
+                [_tbl.get(c, -1) for c in self._chain_ids], np.int32)
+            del _tbl
+            # counted ONCE at construction, so a table that does not cover this chain list is a number
+            # visible at launch rather than a silent per-example fallback
+            self._n_prefiltered_missing = int((self._n_prefiltered < 0).sum())
+            logging.info(
+                "prefiltered-count table: %d/%d chains covered, %d without a count (no top-up applied "
+                "to those)", len(self._chain_ids) - self._n_prefiltered_missing,
+                len(self._chain_ids), self._n_prefiltered_missing)
+
 
         # Create template featurizer only if templates are enabled
         template_featurizer = None
