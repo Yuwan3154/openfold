@@ -282,6 +282,8 @@ class AlphaFold(nn.Module):
                     d_pair=self.config.input_embedder.c_z,
                     device=z.device,
                     dtype=z.dtype,
+                    scale=float(getattr(
+                        self.config.recycling_embedder, "gaussian_pair_init_scale", 1.0)),
                 )
             else:
                 z_prev = z.new_zeros(

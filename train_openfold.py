@@ -861,9 +861,11 @@ def main(args):
                        "ESMFold2-inspired contractive recurrence")
         config.model.recycling_embedder.use_contractive = True
     if getattr(args, "gaussian_pair_init", False):
+        _gs = float(getattr(args, "gaussian_pair_init_scale", 1.0))
         rank_zero_info("gaussian_pair_init: sampling the first cycle's pair state from "
-                       "trunc_norm(0, 2/(5*c_z)) instead of zeros")
+                       f"trunc_norm(0, {_gs}^2 * 2/(5*c_z)) instead of zeros")
         config.model.recycling_embedder.use_gaussian_pair_init = True
+        config.model.recycling_embedder.gaussian_pair_init_scale = _gs
 
     # Use AdaptiveOpenFoldWrapper if adaptive_config_path is provided
     adaptive_config_path = getattr(args, 'adaptive_config_path', None)
@@ -1556,6 +1558,14 @@ if __name__ == "__main__":
         help="ESMFold2-inspired: sample the first cycle's recurrent pair state from "
              "trunc_norm(0, 2/(5*c_z)) instead of zeros, giving a seed-varying source of "
              "structural diversity that doesn't depend on MSA masking. Default off."
+    )
+    parser.add_argument(
+        "--gaussian_pair_init_scale", type=float, default=1.0,
+        help="Multiplier on the pair-init std ('temperature'). 1.0 = the ESMFold2 value exactly and "
+             "bit-identical to not passing this flag. ⛔ Only meaningful together with "
+             "--contractive_recycling: on the plain-additive path z_prev is LayerNorm'd and LayerNorm "
+             "is scale-invariant, so a scale there changes the sample only through LayerNorm's eps "
+             "(measured: scale=4 and scale=100 deviate from scale=1 by the same 7.8e-3)."
     )
     parser.add_argument(
         "--validate_without_templates", action="store_true", default=False,

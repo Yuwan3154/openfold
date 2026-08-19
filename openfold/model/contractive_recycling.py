@@ -62,10 +62,24 @@ class ContractivePairUpdate(nn.Module):
         return a_bar * z_t + b_bar * self.layer_norm_u(u_t)
 
 
-def sample_gaussian_pair_init(shape, d_pair: int, device=None, dtype=None, generator=None):
-    """z_0 ~ trunc_norm(0, 2/(5*d_pair)), +/-3 sigma truncation (ESMFold2 Appendix A.2.5).
-    Independent of input features -- the seed-varying source of structural diversity."""
-    std = math.sqrt(2.0 / (5.0 * d_pair))
+def sample_gaussian_pair_init(shape, d_pair: int, device=None, dtype=None, generator=None,
+                             scale: float = 1.0):
+    """z_0 ~ trunc_norm(0, scale^2 * 2/(5*d_pair)), +/-3 sigma truncation (ESMFold2 App. A.2.5).
+    Independent of input features -- the seed-varying source of structural diversity.
+
+    `scale` multiplies sigma (and the truncation with it, so the shape of the distribution is
+    preserved and only its width changes). scale=1.0 is the paper value and is BIT-IDENTICAL to the
+    unscaled call, since 1.0*x == x exactly.
+
+    ⛔⛔ A scale is only meaningful on the CONTRACTIVE path. With use_contractive=False,
+    RecyclingEmbedder.forward feeds z_prev through `layer_norm_z`, and LayerNorm is scale-invariant:
+    LN(scale*z) == LN(z) apart from the eps in its denominator. Measured on this code (c_z=128,
+    2026-08-19): scale=4 and scale=100 both differ from scale=1 by the SAME 7.8e-3 -- the deviation
+    saturates, which is the signature of an eps artifact rather than a real change. With
+    use_contractive=True the update is `a_bar * z_prev + b_bar * LN(u_t)` and z_prev is used RAW, so
+    the scale passes through linearly and does change the sample.
+    """
+    std = scale * math.sqrt(2.0 / (5.0 * d_pair))
     z0 = torch.empty(shape, device=device, dtype=dtype)
     with torch.no_grad():
         nn.init.trunc_normal_(z0, mean=0.0, std=std, a=-3 * std, b=3 * std, generator=generator)

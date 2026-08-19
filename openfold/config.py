@@ -563,6 +563,9 @@ config = mlc.ConfigDict(
                 # openfold/model/contractive_recycling.py.
                 "use_contractive": False,
                 "use_gaussian_pair_init": False,
+                # multiplies the pair-init std (1.0 = the paper value exactly). The
+                # "temperature" of a replica-exchange ladder; see sample_gaussian_pair_init.
+                "gaussian_pair_init_scale": 1.0,
             },
             "template": {
                 "distogram": {
