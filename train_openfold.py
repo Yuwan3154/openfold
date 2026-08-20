@@ -518,6 +518,8 @@ class OpenFoldWrapper(pl.LightningModule):
                             self._t4_writer.submit(
                                 chain=ds.idx_to_chain_id(int(batch["batch_idx"][i])),
                                 epoch=int(self.current_epoch), step=int(self.global_step),
+                                # ⛔ WITHOUT sample=_j all K rungs overwrite one file
+                                sample=_j,
                                 tm_pred=float(_tp[i]), tm_template=float(_tt[i]),
                                 coords37=_crd[i].numpy(),
                                 atom_mask37=batch["atom37_atom_exists"][i].detach().cpu().numpy(),

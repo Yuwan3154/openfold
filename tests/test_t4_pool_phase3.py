@@ -212,3 +212,36 @@ def test_dropped_promotions_are_counted_not_silent(tmp_path):
     w = PromotedTemplateWriter(str(tmp_path), 0, max_queue=1)
     assert w.n_dropped == 0                              # counter exists and starts clean
     w.close()
+
+
+def test_promote_all_samples_do_not_overwrite_one_file(tmp_path):
+    """⛔⛔ THE PROMOTE-ALL COLLISION. All K best-of-K samples share (chain, epoch, step), so a
+    filename built from those three alone makes them overwrite each other: the index gains K rows
+    with K different tm_pred values that all resolve to ONE npz, and the pool serves K copies of a
+    single prediction while reporting K diverse templates. Found in the DDP verification run
+    (4 records -> 1 file). Nothing errors; the recombination signal just silently vanishes."""
+    import json as _json
+
+    w = PromotedTemplateWriter(str(tmp_path), 0)
+    for k in range(4):
+        ridx = np.arange(L)
+        aat = np.array([rc.restype_order[QUERY[i]] for i in ridx], np.int8)
+        msk = np.zeros((L, 37), bool); msk[:, :3] = True
+        crd = np.full((L, 37, 3), float(k + 1), np.float32)      # distinct coords per sample
+        w.submit(chain="9xxx_A", epoch=0, step=7, tm_pred=0.5 + 0.01 * k, tm_template=0.4,
+                 coords37=crd, atom_mask37=msk, aatype=aat, residue_index=ridx, sample=k)
+    w.close()
+
+    recs = [_json.loads(x) for x in (tmp_path / "rank0/index.jsonl").read_text().splitlines() if x]
+    assert len(recs) == 4
+    paths = {r["npz"] for r in recs}
+    assert len(paths) == 4, f"K samples collapsed onto {len(paths)} file(s): {paths}"
+    files = list(tmp_path.rglob("*.npz"))
+    assert len(files) == 4, f"{len(files)} npz on disk for 4 promotions"
+
+    p = PromotedTemplatePool(str(tmp_path))
+    assert p.refresh() == 4
+    f = p.sample_features("9xxx_A", 4, np.random.default_rng(0), query_sequence=QUERY)
+    # the four templates must be four DIFFERENT structures, not one repeated
+    firsts = {float(f["template_all_atom_positions"][j][0][0][0]) for j in range(4)}
+    assert len(firsts) == 4, f"templates are not distinct: {firsts}"

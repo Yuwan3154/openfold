@@ -61,7 +61,13 @@ class PromotedTemplateWriter:
             # the production template run). Sharded because a pool can exceed 1024 files/dir.
             d = self.root / f"shard{zlib.crc32(rec['chain'].encode()) % 1000:04d}"
             d.mkdir(exist_ok=True)
-            path = d / f"{rec['chain']}_e{rec['epoch']}_s{rec['step']}.npz"
+            # ⛔⛔ THE SAMPLE INDEX IS PART OF THE FILENAME, and it is load-bearing under promote-all.
+            # Without it, all K samples of one (chain, epoch, step) write to the SAME path and
+            # overwrite each other: the index gains K rows with K different tm_pred values that all
+            # resolve to ONE file. The pool then serves K copies of a single prediction while
+            # reporting K diverse templates -- silently defeating the recombination the whole design
+            # exists for. Caught by the DDP verification run (4 records -> 1 npz, 2026-08-20).
+            path = d / f"{rec['chain']}_e{rec['epoch']}_s{rec['step']}_k{rec['sample']}.npz"
             np.savez(
                 path, coords=coords, atom_mask=atom_mask,
                 aatype=aatype, residue_index=residue_index,
@@ -72,11 +78,15 @@ class PromotedTemplateWriter:
             self.n_written += 1
 
     def submit(self, chain, epoch, step, tm_pred, tm_template,
-               coords37, atom_mask37, aatype, residue_index):
-        """Queue one promoted prediction. Non-blocking: drops rather than stalling the step."""
+               coords37, atom_mask37, aatype, residue_index, sample=0):
+        """Queue one promoted prediction. Non-blocking: drops rather than stalling the step.
+
+        `sample` distinguishes the K best-of-K samples of the SAME (chain, epoch, step) under
+        --t4_promote_all. It is part of the on-disk filename; see the writer thread.
+        """
         mask = np.asarray(atom_mask37, dtype=bool)
         rec = {
-            "chain": chain, "epoch": int(epoch), "step": int(step),
+            "chain": chain, "epoch": int(epoch), "step": int(step), "sample": int(sample),
             "tm_pred": float(tm_pred), "tm_template": float(tm_template),
             "n_res": int(mask.shape[0]),
         }
@@ -134,7 +144,8 @@ class PromotedTemplatePool:
             # ⚠️ The tiebreak is not cosmetic: (epoch, step) TIES across the DDP ranks, which write
             # independently, and every dataloader worker must agree on what the snapshot contains.
             for c, v in by_chain.items():
-                v.sort(key=lambda r: (-r["epoch"], -r["step"], -r["_rank"], r["npz"]))
+                v.sort(key=lambda r: (-r["epoch"], -r["step"], -r["_rank"],
+                                      r.get("sample", 0), r["npz"]))
                 by_chain[c] = v[: self.max_per_chain]
         self.by_chain = by_chain
         return sum(len(v) for v in by_chain.values())
