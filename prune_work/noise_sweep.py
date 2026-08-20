@@ -94,7 +94,10 @@ def main():
 
     ck = torch.load(args.ema_ckpt, map_location="cpu", weights_only=False)
     assert "ema_params" in ck, f"{args.ema_ckpt} is not a stripped EMA checkpoint"
-    model = AlphaFold(config.model)
+    # ⛔ AlphaFold takes the FULL config, not config.model: its __init__ reads BOTH `config.globals`
+    # (model.py:81) and `config.model`. Passing config.model raises KeyError('globals') -- which is
+    # exactly how the first smoke test died, after 6 minutes of imports.
+    model = AlphaFold(config)
     if args.arch == "ws5":
         # ⛔⛔ --prune_evoformer is NOT a config flag -- it is structural surgery on the built model
         # (train_openfold.py:1046-1048 calls prune_blocks AFTER the weight load), which deletes
