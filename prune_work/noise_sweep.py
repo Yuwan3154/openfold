@@ -58,11 +58,14 @@ def build_config(args):
     config.data.common.max_msa_clusters = 1
     config.data.train.max_extra_msa = 1
     config.data.train.max_msa_clusters = 1
-    # --single_seq_keep_templates for the template arm; --validate_without_templates for the other
-    if args.arm == "pda_templatefree":
-        config.model.template.enabled = False
-        config.data.common.use_templates = False
-        config.data.common.use_template_torsion_angles = False
+    # ⛔⛔ TEMPLATES STAY ENABLED IN THE CONFIG, even for the template-free arm. The checkpoints were
+    # trained with --single_seq_keep_templates, so they CONTAIN template_embedder weights (129
+    # tensors) -- building the model with template.enabled=False omits those modules and the load
+    # fails. Template-free evaluation is a RUNTIME gate, exactly as --validate_without_templates does
+    # it (train_openfold.py:556-558): build with templates, load, THEN flip
+    # model.config.template.enabled=False, which short-circuits the template branch at model.py:345.
+    # ⭐ This mismatch is what the state-dict key assert caught on the first GPU run -- 0 missing,
+    # 129 unexpected -- instead of it silently becoming a differently-architected model.
     # --contractive_recycling --gaussian_pair_init
     config.model.recycling_embedder.use_contractive = True
     config.model.recycling_embedder.use_gaussian_pair_init = True
@@ -115,6 +118,10 @@ def main():
         f"  missing({len(missing)}): {list(missing)[:5]}\n"
         f"  unexpected({len(unexpected)}): {list(unexpected)[:5]}")
     assert config.model.recycling_embedder.use_contractive, "a noise scale is a no-op without contractive"
+    if args.arm == "pda_templatefree":
+        # the runtime gate, applied AFTER the load -- see build_config's note
+        model.config.template.enabled = False
+        print("template-free arm: model.config.template.enabled = False (post-load runtime gate)")
     model = model.to(dev).eval()
     print(f"loaded {args.ema_ckpt} (epoch={ck.get('epoch')}) arch={args.arch} on {dev}, "
           f"{sum(p.numel() for p in model.parameters())/1e6:.1f}M params")
