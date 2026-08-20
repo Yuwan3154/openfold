@@ -383,6 +383,39 @@ class OpenFoldWrapper(pl.LightningModule):
                 self.model.config.recycling_embedder.gaussian_pair_init_scale = _ladder[_pick]
             self._rng_restore(_snaps[_pick])
             outputs = self(batch)
+            # ⭐⭐ REPLAY VERIFICATION (--explore_verify_replay). The whole best-of-K design rests on
+            # one unproven claim: that restoring the RNG state makes the grad-carrying forward
+            # BIT-IDENTICAL to the no_grad forward that selected it. If it does not, the backward runs
+            # through a sample that was never scored -- silent, no error, just a mis-targeted gradient.
+            # Nothing so far has tested it on the real path, where the risks actually live:
+            # nondeterministic CUDA reductions, fused attention kernels carrying their own RNG, and
+            # activation checkpointing (blocks_per_ckpt=1) recomputing dropout during backward.
+            # ⛔ This MEASURES and LOGS the deviation rather than asserting a tolerance -- picking a
+            # threshold here would be inventing a number before knowing the distribution.
+            if getattr(self, "explore_verify_replay", False):
+                with torch.no_grad():
+                    _lv, _ = self.loss(outputs, _scored, _return_breakdown=True)
+                _lv = float(_lv)
+                _dev = abs(_lv - _losses[_pick])
+                _den = max(abs(_losses[_pick]), 1e-8)
+                self.log("explore/replay_abs_dev", _dev, on_step=True, on_epoch=True, logger=True)
+                self.log("explore/replay_rel_dev", _dev / _den,
+                         on_step=True, on_epoch=True, logger=True)
+                # 1.0 = the replay is bit-exact. Anything else means the scored sample and the
+                # backprop'd sample are not the same object.
+                self.log("explore/replay_bitexact", float(_lv == _losses[_pick]),
+                         on_step=True, on_epoch=True, logger=True)
+                # Does the winner still win when re-scored? A rank-preserving-but-not-bit-exact
+                # replay is a much milder problem than one that changes which sample is best.
+                self.log("explore/replay_still_argmin",
+                         float(_lv <= min(_losses) + _dev + 1e-12),
+                         on_step=True, on_epoch=True, logger=True)
+                if self.trainer.global_rank == 0 and self.global_step % 5 == 0:
+                    rank_zero_info(
+                        f"[replay-verify] step={self.global_step} rank_losses="
+                        f"{[round(x, 6) for x in _losses]} pick={_pick} "
+                        f"scored={_losses[_pick]:.8f} replayed={_lv:.8f} abs_dev={_dev:.3e} "
+                        f"rel_dev={_dev/_den:.3e} bitexact={_lv == _losses[_pick]}")
         else:
             outputs = self(batch)
 
@@ -1052,6 +1085,9 @@ def main(args):
             f"then pTM from epoch {args.explore_switch_epoch}")
     model_module.explore_switch_epoch = getattr(args, "explore_switch_epoch", None) or 0
     model_module.explore_after_epoch = getattr(args, "explore_after_epoch", 0)
+    model_module.explore_verify_replay = getattr(args, "explore_verify_replay", False)
+    if model_module.explore_verify_replay:
+        rank_zero_info("explore: REPLAY VERIFICATION ON -- logging explore/replay_* every step")
     # Replica-exchange ladder. Every guard here is a silent-failure mode if left out: a wrong length
     # would index past the end mid-epoch, and without the two tricks the whole ladder is a no-op that
     # would look like a real experiment in the logs.
@@ -1644,6 +1680,15 @@ if __name__ == "__main__":
         help="ESMFold2-inspired: sample the first cycle's recurrent pair state from "
              "trunc_norm(0, 2/(5*c_z)) instead of zeros, giving a seed-varying source of "
              "structural diversity that doesn't depend on MSA masking. Default off."
+    )
+    parser.add_argument(
+        "--explore_verify_replay", action="store_true", default=False,
+        help="Best-of-K correctness check: after replaying the winner, recompute its loss and log the "
+             "deviation from the loss recorded during scoring (explore/replay_{abs_dev,rel_dev,"
+             "bitexact,still_argmin}). The design's core claim is that restoring the RNG makes the "
+             "grad forward bit-identical to the scoring forward; if it does not, the backward runs "
+             "through a sample that was never scored and nothing errors. MEASURES rather than "
+             "asserting a tolerance. Costs one extra loss evaluation per step -- diagnostic use."
     )
     parser.add_argument(
         "--explore_noise_ladder", type=str, default=None,
