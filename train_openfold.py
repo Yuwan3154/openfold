@@ -316,8 +316,18 @@ class OpenFoldWrapper(pl.LightningModule):
             _sel = self._resolve_explore_select()
             _snaps, _confs, _losses = [], [], []
             _scored = tensor_tree_map(lambda t: t[..., -1], batch)
+            # ⭐ REPLICA EXCHANGE (user 2026-08-19): each of the K samples is drawn at its OWN noise
+            # level -- a "temperature" ladder -- instead of K draws at one level. None = the old
+            # behaviour (one level, K seeds), so this is opt-in and Run B's semantics are unchanged.
+            _ladder = getattr(self, "explore_noise_ladder", None)
+            # promote-all needs each sample's own coords, and the scoring outputs are otherwise
+            # discarded at the end of their loop iteration. Stashed on CPU: ~37 KiB per sample.
+            _promote_all = bool(getattr(self, "t4_promote_all", False))
+            _stash = []
             with torch.no_grad():
-                for _ in range(_K):
+                for _j in range(_K):
+                    if _ladder is not None:
+                        self.model.config.recycling_embedder.gaussian_pair_init_scale = _ladder[_j]
                     _snaps.append(self._rng_snapshot())
                     _o = self(batch)
                     _confs.append(self._explore_confidence(_o, _scored, _sel))
@@ -325,6 +335,17 @@ class OpenFoldWrapper(pl.LightningModule):
                     # driving, but it is what makes the proxy's quality measurable from this run alone
                     _l, _ = self.loss(_o, _scored, _return_breakdown=True)
                     _losses.append(float(_l))
+                    if _promote_all:
+                        _gm = template_gate_metrics(
+                            _o, _scored,
+                            delta=getattr(self, "t4_delta", 0.05),
+                            min_tm=getattr(self, "t4_min_tm", 0.0),
+                        )
+                        _stash.append((
+                            _gm["tm_pred"].detach().cpu(),
+                            _gm["tm_template"].detach().cpu(),
+                            _o["final_atom_positions"].detach().float().cpu(),
+                        ))
             _best_loss = int(min(range(_K), key=lambda j: _losses[j]))
             _pick = _best_loss if _sel == "loss" else int(max(range(_K), key=lambda j: _confs[j]))
             # ⭐⭐ THE DIAGNOSTIC THE PROXY CHOICE TURNS ON: how often does the confidence-selected
@@ -346,8 +367,20 @@ class OpenFoldWrapper(pl.LightningModule):
             # Without it, a hybrid run's logs cannot be split into its two phases after the fact.
             self.log("explore/using_true_loss", 1.0 if _sel == "loss" else 0.0,
                      on_step=True, on_epoch=True, logger=True)
+            if _ladder is not None:
+                # ⭐⭐ THE DIAGNOSTIC THE LADDER TURNS ON. If the coldest rung wins almost always, the
+                # ladder buys nothing for the GRADIENT -- but note that under promote-all the hot rungs
+                # are still earning their keep by feeding the pool, which is the design's own rationale.
+                self.log("explore/selected_rung", float(_pick), on_step=True, on_epoch=True, logger=True)
+                self.log("explore/selected_tau", float(_ladder[_pick]),
+                         on_step=True, on_epoch=True, logger=True)
             # ⛔ Replay the winner EXACTLY (pair init + dropout), then take the real, grad-carrying
             # forward. Anything less backprops through a sample that was never scored.
+            # ⛔⛔ With a ladder the noise SCALE is part of what must be replayed: restoring the RNG
+            # alone would redraw z_0 at whatever scale the LAST rung left behind, so the grad forward
+            # would be a different sample than the one that was scored.
+            if _ladder is not None:
+                self.model.config.recycling_embedder.gaussian_pair_init_scale = _ladder[_pick]
             self._rng_restore(_snaps[_pick])
             outputs = self(batch)
         else:
@@ -438,7 +471,30 @@ class OpenFoldWrapper(pl.LightningModule):
                     # its own subtree so no locking or barrier is needed
                     self._t4_writer = PromotedTemplateWriter(
                         self.t4_pool_dir, self.trainer.global_rank)
-                sel = torch.nonzero(m["promote"] > 0, as_tuple=False).flatten().tolist()
+                # ⭐ PROMOTE-ALL (user 2026-08-19): every sample of the ladder enters the pool, not
+                # only the gate-passers, "so the model learns to recombine and improve more upon its
+                # own predictions, good or bad". The gate above still MEASURES (t4/promote_rate stays
+                # interpretable); it just no longer decides what is written.
+                # ⛔ Pairs with FIFO retention. With keep-the-best-by-tm_pred this would have been
+                # self-defeating: K times the candidates makes a top-N-by-TM filter MORE selective and
+                # it would discard exactly the locally-good/globally-bad samples this is for.
+                if _stash:
+                    for _j, (_tp, _tt, _crd) in enumerate(_stash):
+                        for i in range(_crd.shape[0]):
+                            ds = self.trainer.datamodule.train_dataset.datasets[0]
+                            self._t4_writer.submit(
+                                chain=ds.idx_to_chain_id(int(batch["batch_idx"][i])),
+                                epoch=int(self.current_epoch), step=int(self.global_step),
+                                tm_pred=float(_tp[i]), tm_template=float(_tt[i]),
+                                coords37=_crd[i].numpy(),
+                                atom_mask37=batch["atom37_atom_exists"][i].detach().cpu().numpy(),
+                                aatype=batch["aatype"][i].detach().cpu().numpy(),
+                                residue_index=batch["residue_index"][i].detach().cpu().numpy(),
+                            )
+                    self.log("t4/promoted_per_step", float(len(_stash) * _stash[0][2].shape[0]),
+                             on_step=True, on_epoch=True, logger=True)
+                sel = [] if _stash else torch.nonzero(
+                    m["promote"] > 0, as_tuple=False).flatten().tolist()
                 if sel:
                     # ⛔ .datasets[0] is safe only because setup() asserts len(datasets) == 1 when
                     # T4 is active: batch_idx carries the INNER per-dataset index, so with a second
@@ -996,6 +1052,36 @@ def main(args):
             f"then pTM from epoch {args.explore_switch_epoch}")
     model_module.explore_switch_epoch = getattr(args, "explore_switch_epoch", None) or 0
     model_module.explore_after_epoch = getattr(args, "explore_after_epoch", 0)
+    # Replica-exchange ladder. Every guard here is a silent-failure mode if left out: a wrong length
+    # would index past the end mid-epoch, and without the two tricks the whole ladder is a no-op that
+    # would look like a real experiment in the logs.
+    _lad = getattr(args, "explore_noise_ladder", None)
+    if _lad:
+        _lad = [float(x) for x in _lad.split(",")]
+        assert len(_lad) == model_module.explore_k, (
+            f"--explore_noise_ladder has {len(_lad)} entries but --explore_k is "
+            f"{model_module.explore_k}; one noise level per sample is required")
+        assert getattr(args, "gaussian_pair_init", False), (
+            "--explore_noise_ladder needs --gaussian_pair_init: with a zero pair init there is no "
+            "noise for a scale to act on and every rung is identical")
+        assert getattr(args, "contractive_recycling", False), (
+            "--explore_noise_ladder needs --contractive_recycling: on the plain-additive path z_prev "
+            "goes through layer_norm_z and LayerNorm is scale-invariant, so the ladder is a NO-OP "
+            "(measured: scale=4 and scale=100 both differ from scale=1 by the same 7.8e-3, i.e. eps)")
+        assert all(x >= 0 for x in _lad), f"noise scales must be >= 0: {_lad}"
+        rank_zero_info(f"explore: REPLICA-EXCHANGE ladder {_lad} (one noise level per sample)")
+    model_module.explore_noise_ladder = _lad or None
+    model_module.t4_promote_all = getattr(args, "t4_promote_all", False)
+    if model_module.t4_promote_all:
+        assert getattr(args, "t4_self_distill", False), (
+            "--t4_promote_all needs --t4_self_distill: the TM gate is what computes each sample's "
+            "tm_pred, and promote-all still records it")
+        assert getattr(args, "explore_k", 1) > 1, (
+            "--t4_promote_all is about promoting ALL of the best-of-K samples; with --explore_k 1 "
+            "there is nothing extra to promote")
+        rank_zero_info(
+            f"T4: PROMOTE-ALL -- every one of the {args.explore_k} samples enters the pool, not only "
+            f"gate-passers (~{args.explore_k}x inflow; 37 KiB/record)")
     model_module.t4_pool_dir = getattr(args, "t4_pool_dir", None)
     model_module.t4_promote_after_epoch = getattr(args, "t4_promote_after_epoch", 0)
     model_module._t4_writer = None
@@ -1558,6 +1644,26 @@ if __name__ == "__main__":
         help="ESMFold2-inspired: sample the first cycle's recurrent pair state from "
              "trunc_norm(0, 2/(5*c_z)) instead of zeros, giving a seed-varying source of "
              "structural diversity that doesn't depend on MSA masking. Default off."
+    )
+    parser.add_argument(
+        "--explore_noise_ladder", type=str, default=None,
+        help="Replica-exchange best-of-K: comma-separated noise SCALES, one per sample, e.g. "
+             "'0,1,2,4'. Each of the K forwards draws z_0 at its own level (a 'temperature' ladder) "
+             "instead of all K sharing one level. Must have exactly --explore_k entries and requires "
+             "--gaussian_pair_init AND --contractive_recycling (on the plain-additive path z_prev is "
+             "LayerNorm'd, so a scale there is a no-op). Unset = one level, K seeds (Run B's "
+             "behaviour). ⛔ No default: the ladder is an experimental choice, to be picked from the "
+             "diversity sweep (prune_work/noise_sweep.py), not guessed."
+    )
+    parser.add_argument(
+        "--t4_promote_all", action="store_true", default=False,
+        help="T4: write EVERY best-of-K sample to the promoted pool, not only the ones that pass the "
+             "TM gate -- so the model can learn to recombine good local regions from predictions that "
+             "are poor globally. The gate still MEASURES (t4/promote_rate stays meaningful). ⛔ Only "
+             "sane with FIFO retention: with a keep-the-best-by-TM cap, K times the candidates makes "
+             "the cap MORE selective and it discards exactly the samples this flag exists to keep. "
+             "⛔ ~25x the pool inflow: measured 37.0 KiB/record => ~40 GiB over 95 epochs at K=4, and "
+             "nothing prunes the pool on disk."
     )
     parser.add_argument(
         "--gaussian_pair_init_scale", type=float, default=1.0,
