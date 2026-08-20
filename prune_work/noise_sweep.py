@@ -149,9 +149,18 @@ def main():
 
         # one-time feature sanity, on the REAL batch rather than on assumptions
         if t_i == 0:
-            assert batch["msa_feat"].shape[-3] == 1, batch["msa_feat"].shape
+            # ⛔⛔ CHECK THE MASK, NOT THE SHAPE. `make_fixed_size` PADS the MSA axis out to
+            # max_msa_clusters (128 here) with zeros and marks the padding in `msa_mask`, so the
+            # tensor is 128 deep even for a genuinely single-sequence input -- depth is not a bug.
+            # My first version asserted msa_feat.shape[-3] == 1, which is wrong twice over: that axis
+            # is N_RES, not the MSA depth, and the depth would legitimately be 128 anyway. This is the
+            # same padding-blindness that produced 12 phantom "violations" in the Run B feature audit.
+            _mm = batch["msa_mask"][..., -1] if batch["msa_mask"].dim() == 4 else batch["msa_mask"]
+            _depth = float(_mm.sum(dim=-2).max())        # real (unmasked) rows, worst residue
+            assert _depth == 1.0, f"expected a single-sequence MSA, got depth {_depth}"
             if "extra_msa_mask" in batch:
                 assert float(batch["extra_msa_mask"].max()) == 0.0, "extra track is not inert"
+            print(f"  msa depth (unmasked rows) = {_depth}; msa_feat {tuple(batch['msa_feat'].shape)}")
             for k, v in batch.items():
                 if torch.is_tensor(v) and v.dtype.is_floating_point:
                     assert torch.isfinite(v).all(), f"non-finite feature: {k}"
