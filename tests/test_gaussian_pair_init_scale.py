@@ -88,3 +88,17 @@ def test_config_carries_the_default():
 
     cfg = model_config("finetuning_ptm", train=True)
     assert cfg.model.recycling_embedder.gaussian_pair_init_scale == 1.0
+
+
+def test_scale_zero_is_exact_zeros_not_a_crash():
+    """⛔⛔ scale=0 is the deterministic 'T=0' rung of a temperature ladder, not an invalid input.
+    torch's trunc_normal_ computes norm_cdf((a-mean)/std) and raises ZeroDivisionError on std=0, so
+    the sampler must short-circuit. A ladder containing 0 would otherwise kill training at step 1."""
+    z = _draw(0.0)
+    assert torch.equal(z, torch.zeros_like(z))
+    assert z.shape == SHAPE
+
+
+def test_scale_zero_matches_the_stock_all_zero_pair_init():
+    """The point of the rung: it must be bit-identical to what use_gaussian_pair_init=False does."""
+    assert torch.equal(_draw(0.0), torch.zeros(SHAPE))

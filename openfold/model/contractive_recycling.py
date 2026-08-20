@@ -80,6 +80,13 @@ def sample_gaussian_pair_init(shape, d_pair: int, device=None, dtype=None, gener
     the scale passes through linearly and does change the sample.
     """
     std = scale * math.sqrt(2.0 / (5.0 * d_pair))
+    # ⛔⛔ scale=0 is a REAL, WANTED rung -- the deterministic "T=0" replica of a temperature ladder,
+    # identical to stock AF2's all-zero pair init. It must short-circuit: torch's trunc_normal_
+    # computes norm_cdf((a-mean)/std) and raises ZeroDivisionError on std=0. Caught by the sweep smoke
+    # test; the training path would have crashed the same way at the first step of any ladder
+    # containing 0.
+    if std == 0.0:
+        return torch.zeros(shape, device=device, dtype=dtype)
     z0 = torch.empty(shape, device=device, dtype=dtype)
     with torch.no_grad():
         nn.init.trunc_normal_(z0, mean=0.0, std=std, a=-3 * std, b=3 * std, generator=generator)
