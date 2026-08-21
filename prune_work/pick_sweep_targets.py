@@ -7,6 +7,7 @@ where the model currently fails" and not only "what is the average diversity".
 ⭐ The monomer/denovo annotations ride along in the manifest so the ANALYSIS can subset (well-posed
 monomers only, de novo only) without re-running a single forward. Measure broadly, subset later.
 """
+import argparse
 import csv
 import json
 import os
@@ -14,6 +15,15 @@ import shutil
 
 ROOT = "/home/jupyter-chenxi/prune_work"
 PER_CELL = 8
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--source-manifest", default=f"{ROOT}/eval_out/pda_cluster_representatives.json",
+                help="Pass the MODELABLE manifest to exclude chains AF2 cannot represent "
+                     "(D-chirality / nonstandard residues / cyclized backbones). On the full 425 "
+                     "manifest 14 of the 64 picks land in the excluded 119, and 11 of those are "
+                     "<=35 residues, so their TM measures representation and not folding.")
+ap.add_argument("--out-dir", default="/home/jupyter-chenxi/sweep_stage")
+args = ap.parse_args()
 
 ann = {}
 with open(f"{ROOT}/pda_a4_final_table.csv") as fh:
@@ -23,7 +33,7 @@ base = {}
 with open(f"{ROOT}/eval_out/pda_baseline_full/pda_baseline_full.csv") as fh:
     for r in csv.DictReader(fh):
         base[(r["pdb"].lower(), r["chain_id"])] = r
-manifest = json.load(open(f"{ROOT}/eval_out/pda_cluster_representatives.json"))
+manifest = json.load(open(args.source_manifest))
 by_key = {(e["pdb"].lower(), e["chain_id"]): e for e in manifest}
 print(f"manifest {len(manifest)}  annotated {len(ann)}  baseline {len(base)}")
 
@@ -55,7 +65,7 @@ for cell in sorted(cells):
                  stock_lddt=round(float(base[k]["lddt_ca_stock"]), 4))
         sub.append(e)
 
-out = "/home/jupyter-chenxi/sweep_stage"
+out = args.out_dir
 os.makedirs(f"{out}/cif", exist_ok=True)
 json.dump(sub, open(f"{out}/sweep_manifest.json", "w"), indent=1)
 n = 0
