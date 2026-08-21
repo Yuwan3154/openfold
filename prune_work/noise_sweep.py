@@ -89,6 +89,11 @@ def main():
     p.add_argument("--shard", type=int, default=0)
     p.add_argument("--n_shards", type=int, default=1)
     p.add_argument("--out", required=True)
+    p.add_argument("--per_sample_out", default=None,
+                   help="CSV with ONE ROW PER FORWARD (tau, seed, tm, ptm, plddt, pae) so selection "
+                        "strategies can be simulated offline instead of re-running the model. Without "
+                        "this only per-tau aggregates survive, and the oracle-vs-confidence question "
+                        "cannot be answered from the output at all.")
     p.add_argument("--limit", type=int, default=0, help="smoke test: only this many targets")
     args = p.parse_args()
 
@@ -137,6 +142,12 @@ def main():
 
     fh = open(args.out, "w", newline="")
     w = csv.writer(fh)
+    ps_fh = ps_w = None
+    if args.per_sample_out:
+        ps_fh = open(args.per_sample_out, "w", newline="")
+        ps_w = csv.writer(ps_fh)
+        ps_w.writerow(["pdb", "chain", "length", "stock_fail", "tau", "seed",
+                       "tm_native", "ptm", "plddt_mean", "pae_mean"])
     w.writerow(["pdb", "chain", "length", "stock_fail", "tau", "n_samples",
                 "mean_pairwise_tm", "mean_tm_native", "best_tm_native", "oracle_gain",
                 "mean_ptm", "ptm_tm_spearman_within", "sec_per_forward", "peak_mem_gb"])
@@ -174,7 +185,7 @@ def main():
 
         for tau in taus:
             config.model.recycling_embedder.gaussian_pair_init_scale = tau
-            preds, ptms = [], []
+            preds, ptms, confs = [], [], []
             # cost instrumentation: peak ALLOCATED bytes is a function of shapes/dtypes, not of the
             # device, so these numbers transfer to any GPU that can hold them.
             if dev == "cuda":
@@ -189,6 +200,21 @@ def main():
                     out = model(batch)
                     preds.append(out["final_atom_positions"].float())
                     ptms.append(float(out["ptm_score"].mean()) if "ptm_score" in out else float("nan"))
+                    if ps_w is not None:
+                        # ⛔ MASKED reductions: plddt is [*, N_res] and pae [*, N_res, N_res], both
+                        # padded out to the fixed size, so an unmasked mean averages in the padding.
+                        _sm = batch["seq_mask"][..., -1] if batch["seq_mask"].dim() == 3 \
+                            else batch["seq_mask"]
+                        _n = _sm.sum().clamp(min=1)
+                        _pl = float("nan")
+                        if "plddt" in out:
+                            _pl = float((out["plddt"].float() * _sm).sum() / _n)
+                        _pae = float("nan")
+                        if "predicted_aligned_error" in out:
+                            _pm = _sm[..., :, None] * _sm[..., None, :]
+                            _pae = float((out["predicted_aligned_error"].float() * _pm).sum()
+                                         / _pm.sum().clamp(min=1))
+                        confs.append((_pl, _pae))
 
             if dev == "cuda":
                 torch.cuda.synchronize()
@@ -197,6 +223,13 @@ def main():
 
             tm_nat = [float(tm_score_ca(p, native, nat_mask, **REFERENCE_KWARGS).mean())
                       for p in preds]
+            if ps_w is not None:
+                for _s, (_tm, _pt) in enumerate(zip(tm_nat, ptms)):
+                    _pl, _pae = confs[_s] if _s < len(confs) else (float("nan"), float("nan"))
+                    ps_w.writerow([entry["pdb"], entry["chain_id"], L, entry.get("stock_fail"),
+                                   tau, _s, round(_tm, 6), round(_pt, 6),
+                                   round(_pl, 6), round(_pae, 6)])
+                ps_fh.flush()
             # sample-vs-sample: same chain, same numbering, so correspondence is fixed and the
             # normalisation is the shared coverage (there is no "native" in this pair)
             sm = batch["seq_mask"][..., -1] if batch["seq_mask"].dim() == 3 else batch["seq_mask"]

@@ -44,22 +44,43 @@ class ContractivePairUpdate(nn.Module):
         # log-parametrized so the raw learnable params are unconstrained.
         self.log_delta = nn.Parameter(torch.zeros(c_z))
         self.log_a = nn.Parameter(torch.zeros(c_z))
-        self.b = nn.Parameter(torch.ones(c_z))
+        # ⛔⛔ B is a FULL [c_z, c_z] matrix, matching the reference implementation
+        # (esm/models/esmfold2/model.py: `parcae_b_cont = nn.Parameter(torch.eye(d_pair))`,
+        # applied as `F.linear(LN(u), delta[:, None] * B)`). Identity init makes
+        # `delta[:, None] * I == diag(delta)`, so step 0 is BIT-IDENTICAL to the previous
+        # per-channel `b = ones(c_z)`; the two differ only as training moves B off-diagonal.
+        # The paper's A.2.5 text calls B "channel-wise", which is what the vector version followed.
+        self.b = nn.Parameter(torch.eye(c_z))
         self.layer_norm_u = nn.LayerNorm(c_z)
 
     def discretized_params(self):
         delta = F.softplus(self.log_delta)
         a = torch.exp(self.log_a)
         a_bar = torch.exp(-delta * a)
-        b_bar = delta * self.b
+        b_bar = delta[:, None] * self.b
         return a_bar, b_bar
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        """Expand a pre-matrix checkpoint's per-channel `b` into `diag(b)`.
+
+        Every checkpoint written before this change stores `b` with shape [c_z]. `diag(b)` is the
+        exact matrix that reproduces the old elementwise behaviour, so the migration is lossless
+        rather than an approximation. ⛔ It does NOT migrate optimizer state: resuming a run across
+        this change needs a fresh optimizer state for this parameter, since its shape changed.
+        """
+        k = prefix + "b"
+        if k in state_dict and state_dict[k].dim() == 1:
+            print(f"ContractivePairUpdate: migrating {k} from per-channel vector to diag(b) "
+                  f"[{state_dict[k].shape[0]} -> {tuple(self.b.shape)}]")
+            state_dict[k] = torch.diag(state_dict[k].to(self.b.dtype))
+        return super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     def forward(self, z_t: torch.Tensor, u_t: torch.Tensor) -> torch.Tensor:
         """z_t, u_t: [..., c_z] (any leading batch/residue-pair dims). Returns the combined
         signal to feed into the pair-folding stack (triangle mult + transition), NOT the final
         post-pair-folding-layers representation."""
         a_bar, b_bar = self.discretized_params()
-        return a_bar * z_t + b_bar * self.layer_norm_u(u_t)
+        return a_bar * z_t + F.linear(self.layer_norm_u(u_t), b_bar)
 
 
 def sample_gaussian_pair_init(shape, d_pair: int, device=None, dtype=None, generator=None,
