@@ -67,6 +67,13 @@ except ImportError:
     ADAPTIVE_WRAPPER_AVAILABLE = False
 
 
+# Population tags carried per entry by PDASingleSeqDataset(source_tag=...). Order fixes the
+# batch_idx blocks in per_entry_val_history.csv, so it must not be reshuffled once a run has
+# written rows: 0 = the PDA de novo design benchmark, 1/2 = the natural post-cutoff time split
+# partitioned by structural similarity to the training set.
+VAL_SOURCE_NAMES = {0: "pda", 1: "easy", 2: "hard"}
+
+
 class OpenFoldWrapper(pl.LightningModule):
     def __init__(self, config, replace_block_index=None, replacement_hidden_dim=None, learning_rate=1e-3, warmup_no_steps=1000):
         super(OpenFoldWrapper, self).__init__()
@@ -214,6 +221,23 @@ class OpenFoldWrapper(pl.LightningModule):
             for k, v in other_metrics.items():
                 self.log(
                     f"{phase}/{k}_{suffix}",
+                    torch.mean(v),
+                    on_step=False, on_epoch=True, logger=True,
+                    sync_dist=sync_epoch_metrics,
+                )
+
+        # Combined three-population validation: report each population separately ALONGSIDE the
+        # unconditional val/{k} above, which Lightning already reduces over every validation batch
+        # and is therefore the combined mean across all populations -- i.e. the checkpoint monitor
+        # needs no special handling to be "the average over all validation combined".
+        # ⚠️ `sync_dist` is what makes each per-population mean correct under DDP: a rank only sees
+        # its own shard, so without the sync a population's mean would be one rank's slice of it.
+        if (not train) and "val_source" in batch:
+            src = int(batch["val_source"].flatten()[0])
+            name = VAL_SOURCE_NAMES.get(src, str(src))
+            for k, v in other_metrics.items():
+                self.log(
+                    f"{phase}/{k}_src_{name}",
                     torch.mean(v),
                     on_step=False, on_epoch=True, logger=True,
                     sync_dist=sync_epoch_metrics,
@@ -1239,16 +1263,51 @@ def main(args):
         from pda_dataset import PDASingleSeqDataset
 
         def _set_pda_eval_dataset():
-            data_module.eval_dataset = PDASingleSeqDataset(
-                manifest_path=args.pda_val_manifest,
-                cif_cache_dir=args.pda_cif_cache_dir,
-                config=config.data,
-                mode="eval",
-                train_overlap_ids_path=getattr(args, "pda_train_overlap_ids", None),
-            )
+            # Population 0 is always the PDA benchmark, so its batch_idx block stays [0, n_pda) and
+            # every historical per_entry_val_history.csv row keeps its meaning.
+            specs = [("pda", args.pda_val_manifest, args.pda_cif_cache_dir)]
+            if getattr(args, "expanded_val_easy", None):
+                specs.append(("easy", args.expanded_val_easy, args.expanded_val_cif_dir))
+            if getattr(args, "expanded_val_hard", None):
+                specs.append(("hard", args.expanded_val_hard, args.expanded_val_cif_dir))
+
+            tag_of = {v: k for k, v in VAL_SOURCE_NAMES.items()}
+            parts, offset, blocks = [], 0, {}
+            seen = {}
+            for name, manifest, cif_dir in specs:
+                assert cif_dir, f"--expanded_val_cif_dir is required for the {name} population"
+                ds = PDASingleSeqDataset(
+                    manifest_path=manifest,
+                    cif_cache_dir=cif_dir,
+                    config=config.data,
+                    mode="eval",
+                    train_overlap_ids_path=getattr(args, "pda_train_overlap_ids", None),
+                    source_tag=tag_of[name],
+                    index_offset=offset,
+                )
+                # ⛔ A chain present in two populations would be validated TWICE per epoch, biasing
+                # the combined mean, and would occupy two batch_idx keys for one structure. The PDA
+                # entries are themselves PDB depositions, so this genuinely happens -- assert rather
+                # than trust the manifests.
+                for e in ds.manifest:
+                    key = f"{e['pdb'].lower()}_{e['chain_id']}"
+                    assert key not in seen, (
+                        f"{key} appears in BOTH the {seen[key]} and {name} validation manifests; "
+                        f"exclude it from one (split_expanded_val.py --exclude-manifest)")
+                    seen[key] = name
+                blocks[name] = [offset, offset + len(ds)]
+                offset += len(ds)
+                parts.append(ds)
+
+            data_module.eval_dataset = (
+                parts[0] if len(parts) == 1 else torch.utils.data.ConcatDataset(parts))
+            data_module._val_population_blocks = blocks
             rank_zero_info(
-                f"pda_val_manifest: replacing standard eval_dataset with PDA-based single-sequence "
-                f"validation ({len(data_module.eval_dataset)} de novo design entries)")
+                f"pda_val_manifest: replacing standard eval_dataset with single-sequence validation "
+                f"over {len(data_module.eval_dataset)} entries across {len(parts)} population(s): "
+                + ", ".join(f"{n}={b[1]-b[0]} [batch_idx {b[0]}..{b[1]-1}]" for n, b in blocks.items())
+                + ". val/<metric> is the mean over ALL of them (the checkpoint monitor); each "
+                  "population is also logged as val/<metric>_src_<name>.")
 
         # trainer.fit(datamodule=data_module)/trainer.validate(...) call data_module.setup()
         # AGAIN internally (pytorch_lightning/trainer/call.py's _call_setup_hook), and
@@ -1264,6 +1323,14 @@ def main(args):
         data_module.setup = _setup_then_reapply_pda
 
         _set_pda_eval_dataset()
+
+        blocks = getattr(data_module, "_val_population_blocks", None)
+        if blocks and len(blocks) > 1:
+            _bp = os.path.join(args.output_dir, "val_population_index.json")
+            os.makedirs(args.output_dir, exist_ok=True)
+            with open(_bp, "w") as _fh:
+                json.dump({"blocks": blocks, "tags": VAL_SOURCE_NAMES}, _fh, indent=1)
+            rank_zero_info(f"wrote the batch_idx -> population map to {_bp}")
 
     callbacks = []
     
@@ -1892,6 +1959,19 @@ help="How the kept sample is chosen. ⭐ `hybrid` (user-chosen 2026-08-19) = the
              "quality into the template distribution for every later epoch, so a warmup is a real "
              "choice and not a formality. 0 = promote from the very first epoch (default)."
     )
+    parser.add_argument(
+        "--expanded_val_easy", type=str, default=None,
+        help="JSON manifest of the EASY population (a structural homolog of the chain exists in the "
+             "training set at TM > 0.5). Combined with --pda_val_manifest into one validation pass; "
+             "val/<metric> then means the average over ALL populations combined.")
+    parser.add_argument(
+        "--expanded_val_hard", type=str, default=None,
+        help="JSON manifest of the HARD population (structurally novel: best TM to any training "
+             "structure <= 0.5, or no structural hit at all).")
+    parser.add_argument(
+        "--expanded_val_cif_dir", type=str, default=None,
+        help="Directory of {pdb}.cif for the easy/hard populations (the natural PDB mmCIF mirror; "
+             "the PDA population keeps its own --pda_cif_cache_dir).")
     parser.add_argument(
         "--pda_val_manifest", type=str, default=None,
         help="Path to a JSON manifest (list of {pdb, chain_id, seq}) of PDA (Protein Design "

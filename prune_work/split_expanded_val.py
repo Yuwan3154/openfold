@@ -101,6 +101,13 @@ def main():
     ap.add_argument("--n-strata", type=int, required=True)
     ap.add_argument("--seed", type=int, required=True)
     ap.add_argument("--out-prefix", default="v2")
+    ap.add_argument("--exclude-manifest", action="append", default=[],
+                    help="JSON list of {pdb, chain_id} whose chains are removed from the candidate "
+                         "pool BEFORE the draw. Needed because the PDA benchmark entries are also "
+                         "PDB depositions: 5 of them landed in a 300+300 draw, which both "
+                         "double-counts them in a combined validation mean and mislabels a de novo "
+                         "design as a natural time-split chain. Excluding up front keeps the draw at "
+                         "exactly n-per-set instead of patching afterwards.")
     args = ap.parse_args()
 
     W = args.work
@@ -108,6 +115,15 @@ def main():
     os.makedirs(O, exist_ok=True)
 
     chains = [l.strip() for l in open(f"{W}/seqclean.list") if l.strip()]
+    excluded_ids, excluded_hits = set(), []
+    for mp in args.exclude_manifest:
+        for e in json.load(open(mp)):
+            excluded_ids.add(f"{e['pdb'].lower()}_{e['chain_id']}")
+    if excluded_ids:
+        excluded_hits = [c for c in chains if c.lower() in excluded_ids]
+        chains = [c for c in chains if c.lower() not in excluded_ids]
+        print(f"excluded {len(excluded_hits)} candidate chains present in "
+              f"{len(args.exclude_manifest)} exclusion manifest(s): {sorted(excluded_hits)}")
     names, by_pdb = read_lookup(f"{W}/valdb.lookup")
     seqs = read_seqs(f"{W}/combined.fasta", set(chains))
     lens = {c: len(s_) for c, s_ in seqs.items()}
@@ -177,7 +193,9 @@ def main():
               "counts": {"seqclean": len(chains), "resolved": len(key_of), "skipped": len(skipped),
                          "easy": len(easy), "hard": len(hard), "nohit": len(nohit)},
               "eligible": {k: len(v) for k, v in elig.items()},
-              "dropped_by_length": {k: len(v) for k, v in dropped_len.items()}}
+              "dropped_by_length": {k: len(v) for k, v in dropped_len.items()},
+              "excluded_manifests": args.exclude_manifest,
+              "excluded_chains": sorted(excluded_hits)}
 
     for nm in ["easy", "hard"]:
         picked, deficits, short = stratified_sample(elig[nm], edges, args.n_per_set, args.n_strata, rng)

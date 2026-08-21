@@ -25,12 +25,21 @@ class PDASingleSeqDataset(torch.utils.data.Dataset):
     SAME config.data object OpenFoldDataModule/OpenFoldSingleDataset use. mode: "eval" (matches
     OpenFoldSingleDataset's mode argument -- controls cropping/recycling-count sampling)."""
 
-    def __init__(self, manifest_path, cif_cache_dir, config, mode="eval", train_overlap_ids_path=None):
+    def __init__(self, manifest_path, cif_cache_dir, config, mode="eval", train_overlap_ids_path=None,
+                 source_tag=0, index_offset=0):
         with open(manifest_path) as f:
             self.manifest = json.load(f)
         self.cif_cache_dir = cif_cache_dir
         self.config = config
         self.mode = mode
+        # ⛔ `index_offset` exists because per_entry_val_history.csv is keyed on `batch_idx` ALONE.
+        # Under a ConcatDataset each member would otherwise restart its indices at 0 and three
+        # populations would collide on the same key, silently interleaving different chains in one
+        # row group. The offset makes batch_idx globally unique across the combined validation set.
+        # `source_tag` rides along per entry so val metrics can be split by population without the
+        # analysis having to re-derive membership from index arithmetic.
+        self.source_tag = int(source_tag)
+        self.index_offset = int(index_offset)
         # Entries whose pdb_chain is verbatim present in the model's own training set (see
         # ESMFOLD2_RECYCLE_SCALING.md PDA investigation) -- kept IN the validation population as a
         # deliberate "has the model learned its own training data" marker, not filtered out. Empty
@@ -70,7 +79,8 @@ class PDASingleSeqDataset(torch.utils.data.Dataset):
         )
         feats = self.feature_pipeline.process_features(data, self.mode)
         feats["batch_idx"] = torch.tensor(
-            [idx for _ in range(feats["aatype"].shape[-1])], dtype=torch.int64)
+            [idx + self.index_offset for _ in range(feats["aatype"].shape[-1])], dtype=torch.int64)
         is_overlap = int(f"{pdbid}_{chain_id}" in self.train_overlap_ids)
         feats["is_train_overlap"] = torch.full_like(feats["batch_idx"], is_overlap)
+        feats["val_source"] = torch.full_like(feats["batch_idx"], self.source_tag)
         return feats
