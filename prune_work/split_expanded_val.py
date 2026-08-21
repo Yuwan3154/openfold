@@ -116,12 +116,21 @@ def main():
 
     chains = [l.strip() for l in open(f"{W}/seqclean.list") if l.strip()]
     excluded_ids, excluded_hits = set(), []
+
+    def _norm(chain_id_str):
+        # ⛔ Only the 4-character PDB code is case-insensitive; the chain id is CASE-SENSITIVE
+        # (auth ids include both 'A' and 'a' in the same entry -- e.g. 8v2d_y in this very pool).
+        # Lowercasing the whole "pdb_chain" string made the first version of this filter match
+        # NOTHING while reporting success: "excluded 0" against 5 known duplicates.
+        pdb, _, ch = chain_id_str.partition("_")
+        return f"{pdb.lower()}_{ch}"
+
     for mp in args.exclude_manifest:
         for e in json.load(open(mp)):
-            excluded_ids.add(f"{e['pdb'].lower()}_{e['chain_id']}")
+            excluded_ids.add(_norm(f"{e['pdb']}_{e['chain_id']}"))
     if excluded_ids:
-        excluded_hits = [c for c in chains if c.lower() in excluded_ids]
-        chains = [c for c in chains if c.lower() not in excluded_ids]
+        excluded_hits = [c for c in chains if _norm(c) in excluded_ids]
+        chains = [c for c in chains if _norm(c) not in excluded_ids]
         print(f"excluded {len(excluded_hits)} candidate chains present in "
               f"{len(args.exclude_manifest)} exclusion manifest(s): {sorted(excluded_hits)}")
     names, by_pdb = read_lookup(f"{W}/valdb.lookup")
