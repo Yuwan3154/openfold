@@ -30,6 +30,7 @@ import csv
 import json
 import os
 import sys
+import time
 
 import numpy as np
 import torch
@@ -138,7 +139,7 @@ def main():
     w = csv.writer(fh)
     w.writerow(["pdb", "chain", "length", "stock_fail", "tau", "n_samples",
                 "mean_pairwise_tm", "mean_tm_native", "best_tm_native", "oracle_gain",
-                "mean_ptm", "ptm_tm_spearman_within"])
+                "mean_ptm", "ptm_tm_spearman_within", "sec_per_forward", "peak_mem_gb"])
 
     for t_i, i in enumerate(idx):
         entry = manifest[i]
@@ -174,6 +175,12 @@ def main():
         for tau in taus:
             config.model.recycling_embedder.gaussian_pair_init_scale = tau
             preds, ptms = [], []
+            # cost instrumentation: peak ALLOCATED bytes is a function of shapes/dtypes, not of the
+            # device, so these numbers transfer to any GPU that can hold them.
+            if dev == "cuda":
+                torch.cuda.reset_peak_memory_stats()
+                torch.cuda.synchronize()
+            t_start = time.perf_counter()
             with torch.no_grad():
                 for s in range(args.seeds):
                     torch.manual_seed(1000 * s + 7)
@@ -182,6 +189,11 @@ def main():
                     out = model(batch)
                     preds.append(out["final_atom_positions"].float())
                     ptms.append(float(out["ptm_score"].mean()) if "ptm_score" in out else float("nan"))
+
+            if dev == "cuda":
+                torch.cuda.synchronize()
+            sec_fwd = (time.perf_counter() - t_start) / max(1, args.seeds)
+            peak_gb = (torch.cuda.max_memory_allocated() / 2**30) if dev == "cuda" else float("nan")
 
             tm_nat = [float(tm_score_ca(p, native, nat_mask, **REFERENCE_KWARGS).mean())
                       for p in preds]
@@ -202,7 +214,8 @@ def main():
                         len(preds), round(float(np.mean(pw)), 5) if pw else "",
                         round(float(np.mean(tm_nat)), 5), round(float(max(tm_nat)), 5),
                         round(float(max(tm_nat) - np.mean(tm_nat)), 5),
-                        round(float(np.nanmean(ptms)), 5), round(rho, 5)])
+                        round(float(np.nanmean(ptms)), 5), round(rho, 5),
+                        round(sec_fwd, 4), round(peak_gb, 3)])
             fh.flush()
         print(f"  [{t_i+1}/{len(idx)}] {entry['pdb']}_{entry['chain_id']} L={L} done")
     fh.close()
