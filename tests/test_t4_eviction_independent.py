@@ -256,10 +256,30 @@ def test_promote_all_volume_is_not_silently_eaten_across_four_ranks(tmp_path):
     pool = PromotedTemplatePool(str(tmp_path), max_per_chain=64)
     assert pool.refresh() == 64
     recs = pool.by_chain["1abc_A"]
-    assert len({r["npz"] for r in recs}) == 64, "duplicate paths retained"
+    # ⛔ `_path`, NOT `npz`: see test_npz_is_rank_relative_and_not_globally_unique below.
+    assert len({r["_path"] for r in recs}) == 64, "duplicate records retained"
     # newest 4 steps x 4 ranks x 4 samples = 64
     assert sorted({r["step"] for r in recs}) == [6, 7, 8, 9]
     assert sorted({r["_rank"] for r in recs}) == [0, 1, 2, 3]
+
+
+def test_npz_is_rank_relative_and_not_globally_unique(tmp_path):
+    """⛔⛔ A trap this suite walked into: `rec["npz"]` is stored RELATIVE to the rank root, so four
+    DDP ranks promoting the same (chain, epoch, step, sample) all record the SAME string. Anything
+    that deduplicates the merged pool on `npz` would collapse four distinct predictions into one --
+    the same class of silent K-into-1 collapse that hit the writer in production. `_path` is the
+    globally-unique key.
+    """
+    for r in range(4):
+        w = PromotedTemplateWriter(str(tmp_path), rank=r)
+        _promote(w, "1abc_A", epoch=5, step=2, sample=1, seed=r)
+        w.close()
+    pool = PromotedTemplatePool(str(tmp_path), max_per_chain=0)
+    assert pool.refresh() == 4
+    recs = pool.by_chain["1abc_A"]
+    assert len({r["npz"] for r in recs}) == 1, "npz unexpectedly became globally unique"
+    assert len({r["_path"] for r in recs}) == 4
+    assert len({str(p) for p in tmp_path.rglob("*.npz")}) == 4
 
 
 def test_the_served_templates_come_from_the_retained_set_only(tmp_path):
