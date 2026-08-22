@@ -922,6 +922,29 @@ def get_model_state_dict_from_ds_checkpoint(checkpoint_dir):
     state_file = zero_to_fp32.get_model_state_file(ds_checkpoint_dir, _DS_CHECKPOINT_VERSION)
     return torch.load(state_file, weights_only=False)
 
+
+def select_ema_warmstart_weights(ckpt, resume_from_ema, ckpt_path=""):
+    """The EMA weights from `ckpt`, keyed for OpenFoldWrapper, or None if not requested.
+
+    ⛔⛔ `ckpt["state_dict"]` holds the LIVE weights, but validation swaps the EMA in for the
+    duration of every val epoch, so every number this project has ever reported -- including
+    whichever score selected a `best-*` checkpoint -- describes the EMA weights. Warm-starting from
+    `state_dict` therefore starts from a model that was never evaluated.
+
+    Raises rather than falling back when the EMA is missing: a silent fall-back to the live weights
+    is precisely the failure this flag exists to prevent.
+    """
+    if not resume_from_ema:
+        return None
+    params = (ckpt.get("ema") or {}).get("params")
+    if not params:
+        raise ValueError(
+            "--resume_from_ema was set but %r has no ema/params; refusing to fall back to the "
+            "live state_dict silently." % ckpt_path)
+    # EMA params are stored unprefixed; the wrapper holds the model at `model.`
+    return {"model." + k: v for k, v in params.items()}
+
+
 def main(args):
     # Set float32 matmul precision for Tensor Cores
     torch.set_float32_matmul_precision("medium")
@@ -1043,7 +1066,15 @@ def main(args):
                     rank_zero_info(f"Using strict=False for weight loading due to single sequence mode (templates disabled)")
                 elif hasattr(args, 'prune_evoformer') and args.prune_evoformer:
                     rank_zero_info(f"Using strict=False for weight loading due to prune_evoformer (column/triangle attention removed after load)")
-            if 'module' in sd:
+            ema_sd = select_ema_warmstart_weights(
+                sd, args.resume_from_ema, args.resume_from_ckpt)
+            if ema_sd is not None:
+                import_openfold_weights_(
+                    model=model_module, state_dict=ema_sd, strict=strict_loading)
+                rank_zero_info(
+                    "resume_from_ema: loaded the EMA weights (%d tensors), NOT state_dict"
+                    % len(ema_sd))
+            elif 'module' in sd:
                 sd = {k[len('module.'):]: v for k, v in sd['module'].items()}
                 import_openfold_weights_(model=model_module, state_dict=sd, strict=strict_loading)
             elif 'state_dict' in sd:
@@ -1631,6 +1662,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--resume_model_weights_only", type=bool_type, default=False,
         help="Whether to load just model weights as opposed to training state"
+    )
+    parser.add_argument(
+        "--resume_from_ema", type=bool_type, default=False,
+        help="""With --resume_model_weights_only, warm-start from the checkpoint's EMA weights
+        instead of its live state_dict. Validation runs on the EMA, so a best-* checkpoint's score
+        describes the EMA weights; the live state_dict at that step was never evaluated. Errors out
+        rather than falling back if the checkpoint has no EMA."""
     )
     parser.add_argument(
         "--resume_from_jax_params", type=str, default=None,
