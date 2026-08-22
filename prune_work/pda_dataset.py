@@ -26,7 +26,7 @@ class PDASingleSeqDataset(torch.utils.data.Dataset):
     OpenFoldSingleDataset's mode argument -- controls cropping/recycling-count sampling)."""
 
     def __init__(self, manifest_path, cif_cache_dir, config, mode="eval", train_overlap_ids_path=None,
-                 source_tag=0, index_offset=0):
+                 source_tag=0, index_offset=0, nonneural_ids_path=None):
         with open(manifest_path) as f:
             self.manifest = json.load(f)
         self.cif_cache_dir = cif_cache_dir
@@ -48,6 +48,20 @@ class PDASingleSeqDataset(torch.utils.data.Dataset):
         if train_overlap_ids_path is not None:
             with open(train_overlap_ids_path) as f:
                 self.train_overlap_ids = {
+                    f"{e['pdb']}_{e['chain_id']}" for e in json.load(f)
+                }
+        # Entries whose paper names NO neural structure predictor (AF2/ColabFold/RoseTTAFold/
+        # ESMFold/trRosetta) anywhere in its design protocol -- the CIRCULARITY-FREE subset. The PDA
+        # pass rate is inflated where AF2 was itself a design-acceptance gate (42% of passes vs 15%
+        # of failures, p=1.0e-05), which biases the benchmark AGAINST us on exactly the modern
+        # designs; on this subset the reference population was never pre-screened by the model we are
+        # comparing against.
+        # ⚠️ Expected to be HARDER, not easier: it is dominated by pre-DL and rational/manual designs.
+        # A lower number here is the expected outcome, not a regression.
+        self.nonneural_ids = set()
+        if nonneural_ids_path is not None:
+            with open(nonneural_ids_path) as f:
+                self.nonneural_ids = {
                     f"{e['pdb']}_{e['chain_id']}" for e in json.load(f)
                 }
         # template_featurizer=None -> make_template_features always takes the empty-template
@@ -83,4 +97,7 @@ class PDASingleSeqDataset(torch.utils.data.Dataset):
         is_overlap = int(f"{pdbid}_{chain_id}" in self.train_overlap_ids)
         feats["is_train_overlap"] = torch.full_like(feats["batch_idx"], is_overlap)
         feats["val_source"] = torch.full_like(feats["batch_idx"], self.source_tag)
+        if self.nonneural_ids:
+            feats["in_nonneural_subset"] = torch.full_like(
+                feats["batch_idx"], int(f"{pdbid}_{chain_id}" in self.nonneural_ids))
         return feats

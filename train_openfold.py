@@ -232,6 +232,21 @@ class OpenFoldWrapper(pl.LightningModule):
         # needs no special handling to be "the average over all validation combined".
         # ⚠️ `sync_dist` is what makes each per-population mean correct under DDP: a rank only sees
         # its own shard, so without the sync a population's mean would be one rank's slice of it.
+        # The circularity-free subset: entries whose paper names no neural structure predictor, so
+        # the reference population was never pre-screened by the model we are comparing against.
+        # ⚠️ Expected to score LOWER (pre-DL / rational-manual designs dominate it) -- it exists to
+        # remove AF2 circularity from the comparison, not to flatter the model. n is small (51), so
+        # the paired SE there is ~0.008 and differences under ~0.015 are not resolvable.
+        if (not train) and "in_nonneural_subset" in batch:
+            suffix = "nonneural" if bool(batch["in_nonneural_subset"].flatten()[0]) else "neural_gated"
+            for k, v in other_metrics.items():
+                self.log(
+                    f"{phase}/{k}_{suffix}",
+                    torch.mean(v),
+                    on_step=False, on_epoch=True, logger=True,
+                    sync_dist=sync_epoch_metrics,
+                )
+
         if (not train) and "val_source" in batch:
             src = int(batch["val_source"].flatten()[0])
             name = VAL_SOURCE_NAMES.get(src, str(src))
@@ -1284,6 +1299,12 @@ def main(args):
                     train_overlap_ids_path=getattr(args, "pda_train_overlap_ids", None),
                     source_tag=tag_of[name],
                     index_offset=offset,
+                    # ⛔ PDA ONLY. The neural-vs-not axis is a property of a DESIGN PROTOCOL; the
+                    # easy/hard populations are natural PDB chains with no design protocol at all.
+                    # Tagging them would dump 600 natural chains into val/<metric>_neural_gated and
+                    # make that number mean nothing.
+                    nonneural_ids_path=(getattr(args, "pda_nonneural_ids", None)
+                                        if name == "pda" else None),
                 )
                 # ⛔ A chain present in two populations would be validated TWICE per epoch, biasing
                 # the combined mean, and would occupy two batch_idx keys for one structure. The PDA
@@ -1959,6 +1980,12 @@ help="How the kept sample is chosen. ⭐ `hybrid` (user-chosen 2026-08-19) = the
              "quality into the template distribution for every later epoch, so a warmup is a real "
              "choice and not a formality. 0 = promote from the very first epoch (default)."
     )
+    parser.add_argument(
+        "--pda_nonneural_ids", type=str, default=None,
+        help="JSON list of {pdb, chain_id} whose paper names NO neural structure predictor "
+             "(AF2/ColabFold/RoseTTAFold/ESMFold/trRosetta) in its design protocol. Logs "
+             "val/<metric>_nonneural and val/<metric>_neural_gated so the AF2-circularity-free "
+             "subset is reported separately. Expected to be HARDER, not easier.")
     parser.add_argument(
         "--expanded_val_easy", type=str, default=None,
         help="JSON manifest of the EASY population (a structural homolog of the chain exists in the "
