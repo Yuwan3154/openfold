@@ -1152,9 +1152,15 @@ def main(args):
             "--explore_select hybrid requires --explore_switch_epoch: the handover epoch is an "
             "experimental choice, not something to default."
         )
-        rank_zero_info(
-            f"explore: HYBRID selector -- true loss for epochs 0-{args.explore_switch_epoch - 1}, "
-            f"then pTM from epoch {args.explore_switch_epoch}")
+        if args.explore_switch_epoch <= 0:
+            # switch_epoch 0 has no phase 1 at all; the generic message renders it as "epochs 0--1"
+            rank_zero_info(
+                "explore: HYBRID selector -- switch_epoch=0, so there is NO true-loss phase: pTM "
+                "from the very first step")
+        else:
+            rank_zero_info(
+                f"explore: HYBRID selector -- true loss for epochs 0-{args.explore_switch_epoch - 1}, "
+                f"then pTM from epoch {args.explore_switch_epoch}")
     model_module.explore_switch_epoch = getattr(args, "explore_switch_epoch", None) or 0
     model_module.explore_after_epoch = getattr(args, "explore_after_epoch", 0)
     model_module.explore_verify_replay = getattr(args, "explore_verify_replay", False)
