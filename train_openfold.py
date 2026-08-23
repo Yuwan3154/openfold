@@ -1411,8 +1411,17 @@ def main(args):
                       or ('val/loss' if (hasattr(args, 'val_data_dir') and args.val_data_dir) else 'train/loss'))
     # max for structural-quality metrics (val/lddt_ca, val/gdt_ts, val/tm); min for any *_loss (e.g. val/plddt_loss).
     monitor_mode = 'max' if (any(k in monitor_metric for k in ('lddt', 'gdt', 'tm')) and 'loss' not in monitor_metric) else 'min'
+    # ⛔⛔ --checkpoint_save_top_k was DECLARED but never read, so save_top_k was hardcoded to 1 and
+    # every launcher passing it was a silent no-op. With top_k=1 each new best DELETES the previous
+    # one, so a monitor that disagrees with the benchmark can irrecoverably discard the better model
+    # -- which happened on 2026-08-23: best-000 (PDA 0.7619) was replaced by best-001 (PDA 0.7613)
+    # because the monitored 906-entry mean rose while PDA fell.
+    # ⚠️ Default stays None -> 1, so behaviour is byte-identical for every launcher that does NOT
+    # pass the flag.
+    _top_k = getattr(args, "checkpoint_save_top_k", None)
+    _top_k = 1 if _top_k is None else int(_top_k)
     best_ckpt = ModelCheckpoint(
-        monitor=monitor_metric, mode=monitor_mode, save_top_k=1, save_last=False,
+        monitor=monitor_metric, mode=monitor_mode, save_top_k=_top_k, save_last=False,
         filename='best-{epoch:03d}-{step:06d}', auto_insert_metric_name=False,
     )
     callbacks.append(best_ckpt)
@@ -1423,7 +1432,7 @@ def main(args):
         callbacks.append(ModelCheckpoint(
             every_n_train_steps=_periodic_n, save_top_k=0, save_last=True,
         ))
-    rank_zero_info(f"Checkpoint: best by {monitor_metric} ({monitor_mode}) [1] + last.ckpt every {_periodic_n} steps")
+    rank_zero_info(f"Checkpoint: best by {monitor_metric} ({monitor_mode}) [top_k={_top_k}] + last.ckpt every {_periodic_n} steps")
 
     if (args.early_stopping):
         # Use training metric for early stopping if no validation data is available
