@@ -363,6 +363,11 @@ class OpenFoldWrapper(pl.LightningModule):
             # discarded at the end of their loop iteration. Stashed on CPU: ~37 KiB per sample.
             _promote_all = bool(getattr(self, "t4_promote_all", False))
             _stash = []
+            # ⛔⛔ The ladder MUTATES a config field that model.forward reads on EVERY call
+            # (model.py:286), and that config outlives training_step. It must be put back before the
+            # step returns -- see the restore after the replay forward below.
+            _scale0 = getattr(self.model.config.recycling_embedder,
+                              "gaussian_pair_init_scale", 1.0)
             with torch.no_grad():
                 for _j in range(_K):
                     if _ladder is not None:
@@ -422,6 +427,14 @@ class OpenFoldWrapper(pl.LightningModule):
                 self.model.config.recycling_embedder.gaussian_pair_init_scale = _ladder[_pick]
             self._rng_restore(_snaps[_pick])
             outputs = self(batch)
+            # ⛔⛔ RESTORE THE LADDER'S MUTATION. model.forward reads this field on every call, so
+            # leaving it set leaks the winning rung's noise scale out of training_step -- and the
+            # LAST step of an epoch hands it straight to VALIDATION, which then silently measures the
+            # model at tau=0/8/16/32 instead of the configured scale. Measured cost: Run C's epoch-0
+            # val came in 0.047 lDDT low with the damage concentrated on short chains (they have the
+            # fewest pair elements to average the noise over), and it read as a real regression.
+            if _ladder is not None:
+                self.model.config.recycling_embedder.gaussian_pair_init_scale = _scale0
             # ⭐⭐ REPLAY VERIFICATION (--explore_verify_replay). The whole best-of-K design rests on
             # one unproven claim: that restoring the RNG state makes the grad-carrying forward
             # BIT-IDENTICAL to the no_grad forward that selected it. If it does not, the backward runs
