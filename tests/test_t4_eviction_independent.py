@@ -22,9 +22,13 @@ import json
 import numpy as np
 import pytest
 
+from openfold.np import residue_constants as rc
 from openfold.utils.t4_pool import PromotedTemplatePool, PromotedTemplateWriter
 
 L_CROP = 12
+# the query every read-path test in this file serves against; aatype must agree with it, because
+# `sample_features` cross-checks the two since abc6e48 (previously it did not look at the query).
+Q_FULL = ("ACDEFGHIKLMNPQRSTVWY" * 3)[:40]
 
 
 def _promote(w, chain, epoch=0, step=0, tm=0.8, sample=0, start=5, seed=0):
@@ -32,8 +36,10 @@ def _promote(w, chain, epoch=0, step=0, tm=0.8, sample=0, start=5, seed=0):
     mask = np.zeros((L_CROP, 37), bool)
     mask[:, :5] = True
     coords = rng.normal(size=(L_CROP, 37, 3)).astype(np.float32) * mask[..., None]
+    aat = np.array([rc.restype_order[Q_FULL[p]] if p < len(Q_FULL) else 0
+                    for p in range(start, start + L_CROP)], np.int8)
     w.submit(chain, epoch, step, tm, tm - 0.2, coords, mask,
-             rng.integers(0, 20, L_CROP), np.arange(start, start + L_CROP), sample=sample)
+             aat, np.arange(start, start + L_CROP), sample=sample)
 
 
 def _npzs(pool, chain):

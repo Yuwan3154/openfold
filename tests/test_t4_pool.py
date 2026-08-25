@@ -10,13 +10,26 @@ import json
 import numpy as np
 import pytest
 
+from openfold.np import residue_constants as rc
 from openfold.utils.t4_pool import PromotedTemplatePool, PromotedTemplateWriter
 
 L_FULL, L_CROP = 40, 12
-# ⚠️ Only the LENGTH of this matters to the pool: a promoted template's own sequence is built
-# from the aatype STORED with the crop, not from the query -- unlike the synthetic pool, which
-# cross-checks the two. The query is the frame, not the content.
+# ⚠️ The query is the frame AND, since abc6e48, the content check too: `sample_features` now asserts
+# a promoted record's stored aatype equals the query at every position its residue_index claims,
+# mirroring the synthetic pool. This fixture therefore writes query-CONSISTENT aatype. It used to
+# write `rng.integers(0, 20, ...)`, which no real record ever looks like -- every one of the
+# 133,384 records in the live pool agrees with its query (24,303,904 positions, 0 disagreements).
 Q_FULL = ("ACDEFGHIKLMNPQRSTVWY" * 2)[:L_FULL]
+
+
+def _aatype_from_query(start, n):
+    """aatype as a real promotion carries it: the query's own residues over the crop window.
+
+    Positions past the end of the query are unreachable -- the bounds guard drops them before the
+    agreement check -- so anything is fine there; 0 keeps it obvious.
+    """
+    return np.array([rc.restype_order[Q_FULL[p]] if p < L_FULL else 0
+                     for p in range(start, start + n)], np.int8)
 
 
 def _promote(w, chain, epoch=0, step=0, start=5, tm=0.8, seed=0):
@@ -25,7 +38,7 @@ def _promote(w, chain, epoch=0, step=0, start=5, tm=0.8, seed=0):
     mask[:, :5] = True
     coords = rng.normal(size=(L_CROP, 37, 3)).astype(np.float32) * mask[..., None]
     w.submit(chain, epoch, step, tm, tm - 0.2, coords, mask,
-             rng.integers(0, 20, L_CROP), np.arange(start, start + L_CROP))
+             _aatype_from_query(start, L_CROP), np.arange(start, start + L_CROP))
     return coords, mask
 
 
