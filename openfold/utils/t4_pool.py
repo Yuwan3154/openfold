@@ -197,14 +197,40 @@ class PromotedTemplatePool:
             d = np.load(rec["_path"], allow_pickle=False)
             m = d["atom_mask"]                                  # (n_crop, 37) bool
             ridx = d["residue_index"].astype(int)               # (n_crop,) query positions
+            # ⛔⛔ CUT THE PADDING OFF FIRST. `make_fixed_size` pads a shorter-than-crop_size chain up
+            # to crop_size with a strictly TRAILING block of residue_index=0 / aatype=0 / no atoms
+            # (measured: 452/452 padded records, pad rows carry zero atoms and ridx==0). Those rows
+            # PASS a bounds test, so they all scatter onto query position 0 -- and because numpy
+            # fancy-index assignment lets the LAST write win, they then overwrite a real residue 0
+            # with zeros. Measured on the live pool: 841 of 1500 records (56%) silently lost their
+            # first residue this way. The real region is contiguous and strictly increasing, so the
+            # pad begins at the first non-increasing index.
+            _dec = np.flatnonzero(np.diff(ridx) <= 0)
+            n_real = int(_dec[0]) + 1 if len(_dec) else len(ridx)
+            keep = np.zeros(len(ridx), bool)
+            keep[:n_real] = True
             # guard a stale pool entry: a chain re-cropped shorter, or a pool carried across runs
-            keep = (ridx >= 0) & (ridx < n_res)
+            keep &= (ridx >= 0) & (ridx < n_res)
             full = np.zeros((m.shape[0], 37, 3), np.float32)
             full[m] = d["coords"]
             q = ridx[keep]
             pos[j, q] = full[keep]
             msk[j, q] = m[keep].astype(np.float32)
             aat = d["aatype"].astype(int)[keep]
+            # ⭐ Sequence agreement, ported from SyntheticTemplatePool.sample_features. A promoted
+            # record's aatype IS the query's own cropped aatype, so it must match the query at every
+            # position its residue_index claims. An off-by-one stays in bounds and would silently
+            # place every residue's coordinates one slot over; only this compare catches it. Cheap
+            # vector op, so it runs on every sample rather than only in tests.
+            _letters = np.array([rc.restypes[a] if a < len(rc.restypes) else "X" for a in aat])
+            _qchars = np.array(list(query_sequence))[q]
+            _bad = (_letters != _qchars) & (_letters != "X") & (_qchars != "X")
+            assert not _bad.any(), (
+                f"{chain}: promoted record {rec['npz']} (epoch {rec['epoch']} step {rec['step']}) has "
+                f"aatype disagreeing with the query sequence at {int(_bad.sum())}/{len(q)} positions "
+                f"(first at query index {int(q[_bad][0])}: record {_letters[_bad][0]} vs query "
+                f"{_qchars[_bad][0]}) -- residue mapping is wrong"
+            )
             # "-" wherever this crop does not reach, matching templates._extract_template_features
             chars = ["-"] * n_res
             for t, p in enumerate(q):
