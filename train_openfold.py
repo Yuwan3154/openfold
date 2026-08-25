@@ -418,6 +418,21 @@ class OpenFoldWrapper(pl.LightningModule):
                 self.log("explore/selected_rung", float(_pick), on_step=True, on_epoch=True, logger=True)
                 self.log("explore/selected_tau", float(_ladder[_pick]),
                          on_step=True, on_epoch=True, logger=True)
+                # ⛔⛔ The two series above are a rank-0, 1-in-log_every_n_steps SAMPLE (276 points over
+                # 7 epochs), which is too thin to measure the pick DISTRIBUTION -- the SE on a 25%
+                # proportion at n=276 is 2.6pp, so a real ~4pp bias sits at 1.7 sigma.
+                # ⛔ And `sync_dist` on `selected_rung` would NOT fix it: it averages the rung INDEX
+                # across ranks (mean of {0,3,1,2} = 1.5, not a rung), destroying the histogram.
+                # ⭐ K binary indicators do fix it. on_epoch=True + on_step=False accumulates over
+                # EVERY step (not just logged ones) and sync_dist=True reduces across ALL ranks, so
+                # each scalar's epoch value is exactly P(rung r picked) over ~3,000 step-rank pairs.
+                for _r in range(_K):
+                    self.log(f"explore/picked_rung{_r}", float(_pick == _r),
+                             on_step=False, on_epoch=True, logger=True, sync_dist=True)
+                    # the same for the TRUE-loss argmin, so the oracle-by-loss distribution and the
+                    # selector's are measurable at identical n, from one run, without the T4 pool
+                    self.log(f"explore/best_loss_rung{_r}", float(_best_loss == _r),
+                             on_step=False, on_epoch=True, logger=True, sync_dist=True)
             # ⛔ Replay the winner EXACTLY (pair init + dropout), then take the real, grad-carrying
             # forward. Anything less backprops through a sample that was never scored.
             # ⛔⛔ With a ladder the noise SCALE is part of what must be replayed: restoring the RNG
