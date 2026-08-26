@@ -33,8 +33,12 @@ def _emb():
 
 
 def _inputs():
+    """⛔ The coordinate SCALE is load-bearing. randn(N, 3) puts every pairwise distance below
+    min_bin=3.25, so the distance one-hot is all zeros -- and openfold's Linear zero-fills its bias
+    (primitives.py:193) -- leaving the distogram contribution identically 0. Masking it then changes
+    nothing and a masking test passes vacuously. x8 spreads residues over ~10-25 A, inside the bins."""
     torch.manual_seed(1)
-    return (torch.randn(N, C_M), torch.randn(N, N, C_Z), torch.randn(N, 3))
+    return (torch.randn(N, C_M), torch.randn(N, N, C_Z), torch.randn(N, 3) * 8.0)
 
 
 # ------------------------------------------------- THE LIVE RUN IS UNTOUCHED
@@ -58,13 +62,26 @@ def test_omitting_x_mask_is_bit_identical_to_the_all_ones_mask():
 
 
 def test_cli_flag_defaults_to_off():
-    import train_openfold
-    p = train_openfold.add_data_args.__globals__.get("argparse").ArgumentParser()
-    train_openfold.add_data_args(p)
-    d = {a.dest: a for a in p._actions}
-    assert "recycle_seed_source" in d, "the flag was not registered"
-    assert d["recycle_seed_source"].default is None
-    assert set(d["recycle_seed_source"].choices) == {"synthetic", "promoted"}
+    """train_openfold builds its parser inline under __main__, so this reads the source. A default
+    other than None would silently switch the mode on for every existing launcher."""
+    import ast
+    import pathlib
+    tree = ast.parse(pathlib.Path("train_openfold.py").read_text())
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if not (node.args and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value == "--recycle_seed_source"):
+            continue
+        kw = {k.arg: k.value for k in node.keywords}
+        found.append(kw)
+    assert len(found) == 1, f"expected exactly one --recycle_seed_source definition, got {len(found)}"
+    kw = found[0]
+    assert isinstance(kw["default"], ast.Constant) and kw["default"].value is None, \
+        "--recycle_seed_source must default to None (OFF)"
+    choices = {e.value for e in kw["choices"].elts}
+    assert choices == {"synthetic", "promoted"}, choices
 
 
 def test_dataset_defaults_to_no_seed():
