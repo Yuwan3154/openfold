@@ -71,6 +71,7 @@ class OpenFoldSingleDataset(torch.utils.data.Dataset):
                  promoted_template_pool: Optional[Any] = None,
                  n_promoted_templates: int = 0,
                  force_query_only_msa: bool = False,
+                 recycle_seed_source: Optional[str] = None,
                  ):
         """
             Args:
@@ -128,6 +129,11 @@ class OpenFoldSingleDataset(torch.utils.data.Dataset):
         # T4 phase 3: promoted predictions, mixed in beside the synthetic ones (see the hook below)
         self.promoted_template_pool = promoted_template_pool
         self.n_promoted_templates = n_promoted_templates
+        # RECYCLE SEED: which pool supplies the structure that seeds the cycle-0 recycling
+        # distogram track. None = off, and then no feature is emitted at all, so the model takes
+        # its original all-zero path. "synthetic" = T2, "promoted" = T4.
+        assert recycle_seed_source in (None, "synthetic", "promoted"), recycle_seed_source
+        self.recycle_seed_source = recycle_seed_source
         # ⛔ Only stashed here. The prefiltered-count table is index-ALIGNED to `self._chain_ids`, and
         # that list does not exist yet -- it is built and then FILTERED further down (filter_path,
         # chain_data_cache). Building the array here read an attribute that did not exist and killed
@@ -510,6 +516,31 @@ class OpenFoldSingleDataset(torch.utils.data.Dataset):
                     extra = pool.sample_features(name, n_want, rng, query_sequence=qseq)
                     if extra is not None:
                         data = merge_template_features(data, extra)
+
+        # ===================== RECYCLE SEED (cycle-0 distogram track) =====================
+        # Emitted as its own NUM_RES feature rather than being pulled out of the template stack:
+        # provenance (synthetic vs promoted) is only known HERE -- merge_template_features drops it
+        # from the numeric arrays -- and a NUM_RES feature is sliced by random_crop_to_size with the
+        # query's own offset, so the seed stays aligned for free.
+        # ⛔ TRAIN ONLY, and only when explicitly switched on. Validation stays clean (user, and it
+        # also runs --validate_without_templates, so there would be nothing to seed from).
+        if self.recycle_seed_source is not None and self.mode == "train":
+            seed_pool = (self.synthetic_template_pool
+                         if self.recycle_seed_source == "synthetic"
+                         else self.promoted_template_pool)
+            if seed_pool is not None:
+                seed = seed_pool.sample_features(name, 1, rng, query_sequence=qseq)
+                if seed is not None:
+                    seed_pos = np.asarray(seed["template_all_atom_positions"][0], np.float32)
+                    seed_msk = np.asarray(seed["template_all_atom_mask"][0], np.float32)
+                    # pseudo_beta_fn reads CB for every residue except glycine, where it reads CA,
+                    # so coverage is exactly "the atom pseudo_beta will actually read is present".
+                    # Getting this wrong puts an uncovered residue at the origin, which the
+                    # distogram binning would read as contacting everything.
+                    pb_atom = np.where(np.array([c == "G" for c in qseq]), 1, 3)
+                    seed_cov = seed_msk[np.arange(len(qseq)), pb_atom] > 0
+                    data["recycle_seed_positions"] = seed_pos
+                    data["recycle_seed_mask"] = seed_cov.astype(np.float32)
 
         feats = self.feature_pipeline.process_features(
             data, self.mode
@@ -1128,6 +1159,7 @@ class OpenFoldDataModule(pl.LightningDataModule):
                  t2_prefiltered_counts: Optional[str] = None,
                  t4_promoted_pool: Optional[Any] = None,
                  t4_n_promoted: int = 0,
+                 recycle_seed_source: Optional[str] = None,
                  force_query_only_msa: bool = False,
                  enable_recursive_search: bool = True,
                  **kwargs
@@ -1213,6 +1245,8 @@ class OpenFoldDataModule(pl.LightningDataModule):
         )
         self.t4_promoted_pool = t4_promoted_pool
         self.t4_n_promoted = t4_n_promoted
+        # Which pool seeds the cycle-0 recycling distogram. TRAIN split only -- see below.
+        self.recycle_seed_source = recycle_seed_source
         # ⚠️ Applies to EVERY split, not just train: it is a property of the recipe, not of a phase.
         # `dataset_gen` is a partial shared by train/eval/predict, so putting it there guarantees the
         # three cannot drift apart -- a train-only version would validate on a different input
@@ -1285,6 +1319,9 @@ class OpenFoldDataModule(pl.LightningDataModule):
                 prefiltered_counts_path=self.t2_prefiltered_counts,
                 promoted_template_pool=self.t4_promoted_pool,
                 n_promoted_templates=self.t4_n_promoted,
+                # ⛔ TRAIN split only, exactly like the synthetic pool above: validation must stay a
+                # clean measurement, and every val number in this project's history assumes it.
+                recycle_seed_source=self.recycle_seed_source,
             )
 
             distillation_dataset = None

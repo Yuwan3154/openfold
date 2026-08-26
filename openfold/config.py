@@ -370,6 +370,10 @@ config = mlc.ConfigDict(
                     "pseudo_beta": [NUM_RES, None],
                     "pseudo_beta_mask": [NUM_RES],
                     "residue_index": [NUM_RES],
+                    # cycle-0 recycle seed (off unless the dataset emits it). NUM_RES on the residue
+                    # axis is what makes the random crop slice it with the query's own offset.
+                    "recycle_seed_positions": [NUM_RES, None, None],
+                    "recycle_seed_mask": [NUM_RES],
                     "residx_atom14_to_atom37": [NUM_RES, None],
                     "residx_atom37_to_atom14": [NUM_RES, None],
                     "resolution": [],
@@ -435,6 +439,10 @@ config = mlc.ConfigDict(
                     "between_segment_residues",
                     "deletion_matrix",
                     "no_recycling_iters",
+                    # named so the pipeline KEEPS them when present; np_to_tensor_dict filters by
+                    # membership, so naming a feature the dataset never emits is a no-op
+                    "recycle_seed_positions",
+                    "recycle_seed_mask",
                 ],
                 "use_templates": templates_enabled,
                 "use_template_torsion_angles": embed_template_torsion_angles,

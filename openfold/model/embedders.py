@@ -472,6 +472,7 @@ class RecyclingEmbedder(nn.Module):
         z: torch.Tensor,
         x: torch.Tensor,
         inplace_safe: bool = False,
+        x_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -481,6 +482,11 @@ class RecyclingEmbedder(nn.Module):
                 [*, N_res, N_res, C_z] pair embedding (previous cycle's raw output)
             x:
                 [*, N_res, 3] predicted C_beta coordinates
+            x_mask:
+                optional [*, N_res] per-residue coverage of `x`. Only supplied when a partially
+                covering structure has been INJECTED as the cycle-0 seed; pairs touching an
+                uncovered residue then contribute nothing instead of a spurious distance-0 bin.
+                None everywhere else, which leaves the original behaviour bit-identical.
         Returns:
             m:
                 [*, N_res, C_m] MSA embedding update (always: to be ADDED to the fresh cycle's m)
@@ -527,6 +533,17 @@ class RecyclingEmbedder(nn.Module):
 
         # [*, N, N, C_z]
         d = self.linear(d)
+
+        # ⛔ An injected recycle seed (a template, or a promoted self-prediction) covers only PART
+        # of the chain. A residue the seed does not cover sits at the origin, which the binning
+        # above reads as "distance 0 to everything" -- fabricated contacts, and the model has no way
+        # to tell them from real ones. Zero the pair contribution wherever either residue is
+        # uncovered, so those pairs carry NO distance information rather than a false one.
+        # ⭐ x_mask is None on every path except an explicitly seeded cycle 0, so the default
+        # behaviour is untouched to the bit.
+        if x_mask is not None:
+            pair_mask = (x_mask[..., :, None] * x_mask[..., None, :]).to(dtype=d.dtype)
+            d = d * pair_mask[..., None]
 
         if self.use_contractive:
             return m_update, d

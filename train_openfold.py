@@ -1890,6 +1890,16 @@ if __name__ == "__main__":
              "(measured: scale=4 and scale=100 deviate from scale=1 by the same 7.8e-3)."
     )
     parser.add_argument(
+        "--recycle_seed_source", type=str, default=None,
+        choices=["synthetic", "promoted"],
+        help="RECYCLE SEED (default OFF): seed the CYCLE-0 recycling distogram track with a real "
+             "structure instead of the all-zero x_prev -- 'synthetic' takes a T2 partial-diffusion "
+             "template, 'promoted' takes the model's own T4 prediction. Cycle 0 only; later cycles "
+             "recycle the model's own output exactly as before. TRAIN SPLIT ONLY, so validation "
+             "stays comparable to every earlier epoch and run. Unset reproduces the current "
+             "behaviour bit-for-bit: no feature is emitted and the model takes its original path.",
+    )
+    parser.add_argument(
         "--validate_without_templates", action="store_true", default=False,
         help="Disable template usage (model.config.template.enabled) during validation only, "
              "restoring it after -- makes val/lddt_ca (checkpoint selection) reflect TRUE "

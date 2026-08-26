@@ -263,7 +263,11 @@ class AlphaFold(nn.Module):
         # them to be freed further down in this function, saving memory
         m_1_prev, z_prev, x_prev = reversed([prevs.pop() for _ in range(3)])
 
-        # Initialize the recycling embeddings, if needs be 
+        # per-residue coverage of an injected recycle seed; None on every other path, which is what
+        # keeps the un-seeded behaviour bit-identical
+        recycle_seed_mask = None
+
+        # Initialize the recycling embeddings, if needs be
         if None in [m_1_prev, z_prev, x_prev]:
             # [*, N, C_m]
             m_1_prev = m.new_zeros(
@@ -296,6 +300,23 @@ class AlphaFold(nn.Module):
                 (*batch_dims, n, residue_constants.atom_type_num, 3),
                 requires_grad=False,
             )
+            # ⭐ RECYCLE-SEED: replace that all-zero start with a real structure (a synthetic
+            # template or the model's own promoted prediction), so the recycling DISTOGRAM track
+            # opens on a candidate fold instead of the degenerate "every pair at distance 0" bin.
+            # This is the training-time analogue of the inference condition where a candidate
+            # structure seeds the search. Cycle 0 ONLY -- afterwards the model's own prediction
+            # takes over, exactly as before.
+            # ⛔ Gated on the feature being PRESENT, so a run whose dataset does not emit it is
+            # bit-identical to before. `recycle_seed_mask` is per-residue coverage; templates cover
+            # only part of the chain and an uncovered residue left at the origin would fabricate
+            # contacts with everything.
+            if "recycle_seed_positions" in feats:
+                _seed = feats["recycle_seed_positions"].to(dtype=x_prev.dtype)
+                _seed = _seed[..., 0] if _seed.shape[-1] == 1 else _seed
+                x_prev = _seed
+                recycle_seed_mask = feats["recycle_seed_mask"]
+                recycle_seed_mask = (recycle_seed_mask[..., 0]
+                                     if recycle_seed_mask.shape[-1] == 1 else recycle_seed_mask)
 
         pseudo_beta_x_prev = pseudo_beta_fn(
             feats["aatype"], x_prev, None
@@ -313,6 +334,7 @@ class AlphaFold(nn.Module):
             z_prev,
             pseudo_beta_x_prev,
             inplace_safe=inplace_safe,
+            x_mask=recycle_seed_mask,
         )
 
         del pseudo_beta_x_prev
