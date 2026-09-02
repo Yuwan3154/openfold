@@ -15,10 +15,22 @@ import os
 import sys
 from collections import defaultdict
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _REPO)
+# ⛔⛔ data_modules honours `chain_list_path` ONLY when it can import the bare
+# `block_replacement_scripts.enhanced_data_utils`, which needs <repo>/openfold on sys.path -- the
+# live launcher supplies it as PYTHONPATH. Without it the flag flips to False, the chain list is
+# SILENTLY ignored, and the dataset becomes os.listdir(alignment_dir) (133,019 chains) instead of
+# the curated list (87,886). That produces a different permutation and a different training set with
+# no error at all. Replicate it here, then ASSERT it took effect.
+sys.path.insert(0, os.path.join(_REPO, "openfold"))
 
 from openfold.config import model_config
-from openfold.data.data_modules import OpenFoldDataModule
+from openfold.data.data_modules import ENHANCED_UTILS_AVAILABLE, OpenFoldDataModule
+
+assert ENHANCED_UTILS_AVAILABLE, (
+    "ENHANCED_UTILS_AVAILABLE is False, so chain_list_path would be ignored and this harness would "
+    f"silently test the WRONG dataset. Set PYTHONPATH={os.path.join(_REPO, 'openfold')}")
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--pool", required=True, help="parent run's t4_pool dir")
@@ -67,8 +79,15 @@ def chains_after_replaying(n):
     )
     dm.setup()
     ds = dm.train_dataset
-    ds.reroll()                                  # the reroll the first training epoch would do
     inner = ds.datasets[0]
+    # ⛔ Guard against the silent-fallback dataset: the length must match the chain list, or the
+    # permutation is over a different-sized array and every comparison below is meaningless.
+    with open(args.train_chain_list_path) as fh:
+        n_listed = sum(1 for _ in fh)
+    assert len(inner) == n_listed, (
+        f"dataset has {len(inner)} chains but the list has {n_listed}: chain_list_path was not "
+        "applied, so this would test a different training set than the parent run.")
+    ds.reroll()                                  # the reroll the first training epoch would do
     return {inner.idx_to_chain_id(int(i)) for _, i in ds.datapoints}
 
 
