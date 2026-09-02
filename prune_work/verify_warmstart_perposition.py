@@ -79,7 +79,8 @@ err = float((got - want_delta).abs().max())
 print(f"\n[3] delta: ckpt mean {float(want_delta.mean()):.6f} -> loaded mean "
       f"{float(got.mean()):.6f}   max abs err {err:.3e}")
 assert err < 1e-6, "floor migration did not preserve the checkpoint's delta"
-assert float(cpu.delta_floor) == args.delta_floor, float(cpu.delta_floor)
+# float32 buffer widened to float64 is 0.05000000074505806, not the 0.05 literal
+assert abs(float(cpu.delta_floor) - args.delta_floor) < 1e-7, float(cpu.delta_floor)
 print(f"    a_bar mean {float(torch.exp(-got * torch.exp(cpu.log_a.detach())).mean()):.6f}")
 
 # --- gate 4: nothing else moved --------------------------------------------------------
