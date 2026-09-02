@@ -1035,6 +1035,43 @@ def main(args):
         _max_crop = int(os.environ.get("SINGLE_SEQ_MAX_CROP", "256"))
         config.data.train.crop_size = min(config.data.train.crop_size, _max_crop)
 
+    # Dataset-position fork. Derived from the checkpoint rather than hand-counted, so the parent
+    # and child cannot silently disagree about where the parent stopped. Written back onto `args`
+    # because both datamodules receive their settings via **vars(args).
+    if getattr(args, "fastforward_data_from_ckpt", False):
+        assert args.resume_from_ckpt, (
+            "--fastforward_data_from_ckpt needs --resume_from_ckpt: the position is read from that "
+            "checkpoint's epoch/global_step.")
+        assert not (args.fastforward_epochs or args.fastforward_samples), (
+            "--fastforward_data_from_ckpt is mutually exclusive with the explicit "
+            "--fastforward_epochs/--fastforward_samples overrides.")
+        _ck = torch.load(args.resume_from_ckpt, map_location="cpu", weights_only=False)
+        _ck_ep, _ck_gs = int(_ck["epoch"]), int(_ck["global_step"])
+        del _ck
+        # ⛔ global_step counts OPTIMIZER steps, so datapoints consumed depends on the PARENT's world
+        # size and accumulation, not this run's. Defaults to this run's; pass the overrides when they
+        # differ (e.g. a 4xA6000 parent forked onto 2xH200).
+        _sw = int(getattr(args, "fastforward_source_world_size", 0) or 0) or (
+            max(1, int(getattr(args, "gpus", 1) or 1))
+            * max(1, int(getattr(args, "num_nodes", 1) or 1)))
+        _sga = int(getattr(args, "fastforward_source_grad_accum", 0) or 0) or max(
+            1, int(getattr(args, "grad_accum_steps", 1) or 1))
+        _consumed = _ck_gs * _sw * _sga
+        args.fastforward_epochs = _consumed // args.train_epoch_len
+        args.fastforward_samples = _consumed % args.train_epoch_len
+        # Cross-check against the checkpoint's own epoch counter: a boundary checkpoint yields
+        # ck_epoch+1 completed epochs, a mid-epoch one yields ck_epoch. Anything else means the
+        # world-size/accumulation assumption is wrong and the fork lands in the wrong place.
+        assert _ck_ep <= args.fastforward_epochs <= _ck_ep + 1, (
+            f"fastforward derived {args.fastforward_epochs} completed epochs from "
+            f"global_step={_ck_gs} (world={_sw}, grad_accum={_sga}, "
+            f"epoch_len={args.train_epoch_len}) but the checkpoint reports epoch={_ck_ep}. The "
+            f"source world size or accumulation is wrong.")
+        rank_zero_info(
+            f"fastforward_data_from_ckpt: ckpt epoch={_ck_ep} global_step={_ck_gs}; source "
+            f"world={_sw} grad_accum={_sga} -> {_consumed} datapoints consumed -> replaying "
+            f"{args.fastforward_epochs} epochs + skipping {args.fastforward_samples} datapoints")
+
     # ESMFold2-inspired recycling opt-ins (Appendix A.2.5, arXiv:2604.12946) -- must be set
     # before the model is constructed, since RecyclingEmbedder.__init__ reads these at build time.
     if getattr(args, "contractive_recycling", False):
@@ -1854,6 +1891,36 @@ if __name__ == "__main__":
              "z-recycling combination with a contractive linear-SSM-style recurrence, which stays "
              "numerically bounded across arbitrarily many recycle iterations (unlike the plain "
              "additive update). Default off -- no behavior change unless set."
+    )
+    parser.add_argument(
+        "--fastforward_data_from_ckpt", action="store_true", default=False,
+        help="Advance the training sampler so this run starts at the SAME dataset position the "
+             "--resume_from_ckpt checkpoint stopped at, making a fork comparable to its parent. "
+             "⛔ The position is NOT stored in any checkpoint (the only checkpoint hooks carry the "
+             "EMA); it is REPLAYED by rerolling the deterministic sampler, so it requires the same "
+             "--seed and the same train chain list as the parent. Reads epoch and global_step off "
+             "the checkpoint so nothing is hand-counted."
+    )
+    parser.add_argument(
+        "--fastforward_source_world_size", type=int, default=0,
+        help="World size (gpus x num_nodes) of the run that WROTE the checkpoint. global_step counts "
+             "optimizer steps, so datapoints consumed = step x world_size x grad_accum, which "
+             "depends on the PARENT's topology, not this run's. Defaults to this run's; set it when "
+             "they differ (e.g. a 4-GPU parent forked onto 2 GPUs)."
+    )
+    parser.add_argument(
+        "--fastforward_source_grad_accum", type=int, default=0,
+        help="--grad_accum_steps of the run that wrote the checkpoint. Defaults to this run's."
+    )
+    parser.add_argument(
+        "--fastforward_epochs", type=int, default=0,
+        help="Explicit override: replay this many epochs of sampler draws. Prefer "
+             "--fastforward_data_from_ckpt, which derives it from the checkpoint."
+    )
+    parser.add_argument(
+        "--fastforward_samples", type=int, default=0,
+        help="Explicit override: additionally skip this many datapoints of the first epoch "
+             "(mid-epoch fork). Prefer --fastforward_data_from_ckpt."
     )
     parser.add_argument(
         "--per_position_delta", action="store_true", default=False,

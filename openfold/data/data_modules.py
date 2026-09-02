@@ -1142,6 +1142,8 @@ class OpenFoldDataModule(pl.LightningDataModule):
                  template_release_dates_cache_path: Optional[str] = None,
                  batch_seed: Optional[int] = None,
                  train_epoch_len: int = 50000,
+                 fastforward_epochs: int = 0,
+                 fastforward_samples: int = 0,
                  _distillation_structure_index_path: Optional[str] = None,
                  alignment_index_path: Optional[str] = None,
                  distillation_alignment_index_path: Optional[str] = None,
@@ -1190,6 +1192,10 @@ class OpenFoldDataModule(pl.LightningDataModule):
         self.obsolete_pdbs_file_path = obsolete_pdbs_file_path
         self.batch_seed = batch_seed
         self.train_epoch_len = train_epoch_len
+        # Advance the sampler so a forked run starts at the SAME dataset position as its parent.
+        # The position is not in any checkpoint (see _fastforward_train_sampler), so it is replayed.
+        self.fastforward_epochs = fastforward_epochs
+        self._fastforward_samples_pending = fastforward_samples
         self.train_chain_list_path = train_chain_list_path
         self.distillation_chain_list_path = distillation_chain_list_path
         self.val_chain_list_path = val_chain_list_path
@@ -1373,6 +1379,7 @@ class OpenFoldDataModule(pl.LightningDataModule):
                 generator=generator,
                 _roll_at_init=False,
             )
+            self._fastforward_train_sampler()
 
             if self.val_data_dir is not None:
                 self.eval_dataset = dataset_gen(
@@ -1394,6 +1401,34 @@ class OpenFoldDataModule(pl.LightningDataModule):
                 mode="predict",
             )
 
+    def _fastforward_train_sampler(self):
+        """Replay `fastforward_epochs` epochs of sampler draws so a fork resumes mid-stream.
+
+        ⛔⛔ The dataset position is NOT recoverable from a checkpoint. The sampler RNG is this
+        module's plain `torch.Generator` (seeded from `--seed`); the only checkpoint hooks in the
+        codebase are OpenFoldWrapper's on_save/on_load_checkpoint, which carry the EMA and nothing
+        else, and this class defines no state_dict. So even a FULL Lightning resume restarts the
+        permutation. What IS true is that the stream is deterministic: with
+        `--reload_dataloaders_every_n_epochs 1` Lightning calls train_dataloader() once per epoch,
+        each call rerolls, and the generator persists and advances monotonically -- which is why the
+        T4 pool gained exactly +train_epoch_len new chains per epoch. Replaying N rerolls therefore
+        lands on epoch N's draw exactly.
+
+        `_roll_at_init=False` above means there is NO reroll before the first epoch's, so epoch e is
+        served by reroll e+1 and `fastforward_epochs == completed_epochs` with no off-by-one.
+        ⛔ Verified empirically against the parent run's own t4_pool index rather than derived --
+        see prune_work/verify_fastforward_alignment.py.
+        """
+        n = int(self.fastforward_epochs)
+        if n <= 0:
+            return
+        rank_zero_info(
+            f"fastforward: replaying {n} epochs of sampler draws "
+            f"({n * self.train_epoch_len} datapoints) to match the parent run's position"
+        )
+        for _ in range(n):
+            self.train_dataset.reroll()
+
     def _gen_dataloader(self, stage=None):
         generator = None
         if self.batch_seed is not None:
@@ -1404,6 +1439,18 @@ class OpenFoldDataModule(pl.LightningDataModule):
             dataset = self.train_dataset
             # Filter the dataset, if necessary
             dataset.reroll()
+            # Mid-epoch fork: drop the datapoints the parent already consumed in its partial epoch.
+            # Applied to the FIRST training epoch only, so later epochs are full length.
+            if self._fastforward_samples_pending:
+                k = int(self._fastforward_samples_pending)
+                assert 0 < k < len(dataset.datapoints), (
+                    f"fastforward_samples={k} out of range for epoch_len "
+                    f"{len(dataset.datapoints)}")
+                rank_zero_info(
+                    f"fastforward: skipping the first {k} datapoints of this epoch "
+                    f"({len(dataset.datapoints) - k} remain)")
+                dataset.datapoints = dataset.datapoints[k:]
+                self._fastforward_samples_pending = 0
         elif stage == "eval":
             dataset = self.eval_dataset
         elif stage == "predict":
