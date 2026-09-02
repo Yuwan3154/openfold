@@ -202,11 +202,21 @@ def test_migration_is_idempotent_under_the_real_two_attempt_loader():
     want = F.softplus(old.log_delta.detach().clone())
     sd = old.state_dict()
 
+    before = sd["log_delta"].detach().clone()
+
     new = ContractivePairUpdate(C_Z, per_position_delta=True, delta_floor=FLOOR)
     try:                                     # attempt 1, exactly as the real loader does it
         new.load_state_dict(sd, strict=True)
     except RuntimeError:
-        new.load_state_dict(sd, strict=False)   # attempt 2, over the SAME (mutated) dict
+        new.load_state_dict(sd, strict=False)   # attempt 2, over the same dict object
+
+    # This is WHY it is safe, and the invariant the safety rests on: nn.Module.load_state_dict
+    # shallow-copies the incoming dict ("copy state_dict so _load_from_state_dict can modify it",
+    # torch 2.7.1), so each attempt migrates once from a pristine original. If a future torch drops
+    # that copy, this assert fires before the silent delta drift does.
+    assert torch.equal(sd["log_delta"], before), (
+        "load_state_dict mutated the CALLER's dict; the floor migration is no longer "
+        "single-shot under the two-attempt loader")
 
     got = new.per_position_delta_from_state(torch.zeros(1, 2, 2, C_Z))[0, 0, 0]
     assert torch.allclose(got, want, atol=1e-6), (
