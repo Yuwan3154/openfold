@@ -571,6 +571,12 @@ config = mlc.ConfigDict(
                 # openfold/model/contractive_recycling.py.
                 "use_contractive": False,
                 "use_gaussian_pair_init": False,
+                # Data-dependent, PER-RESIDUE-PAIR delta (A and B stay static). Needs
+                # use_contractive. delta_floor bounds the per-position freeze failure mode;
+                # 0.05 is the locked user value (2026-09-02) -- max a_bar 0.950, max memory
+                # horizon 19.3 loops at the measured A=1.034.
+                "per_position_delta": False,
+                "delta_floor": 0.05,
                 # multiplies the pair-init std (1.0 = the paper value exactly). The
                 # "temperature" of a replica-exchange ladder; see sample_gaussian_pair_init.
                 "gaussian_pair_init_scale": 1.0,

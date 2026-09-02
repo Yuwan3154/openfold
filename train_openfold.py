@@ -1047,6 +1047,15 @@ def main(args):
                        f"trunc_norm(0, {_gs}^2 * 2/(5*c_z)) instead of zeros")
         config.model.recycling_embedder.use_gaussian_pair_init = True
         config.model.recycling_embedder.gaussian_pair_init_scale = _gs
+    if getattr(args, "per_position_delta", False):
+        assert getattr(args, "contractive_recycling", False), (
+            "--per_position_delta needs --contractive_recycling: there is no delta to make "
+            "data-dependent on the plain-additive recycling path.")
+        _df = float(getattr(args, "delta_floor", 0.05))
+        rank_zero_info(f"per_position_delta: delta becomes per-residue-pair, floor={_df} "
+                       "(A and B stay static)")
+        config.model.recycling_embedder.per_position_delta = True
+        config.model.recycling_embedder.delta_floor = _df
 
     # Use AdaptiveOpenFoldWrapper if adaptive_config_path is provided
     adaptive_config_path = getattr(args, 'adaptive_config_path', None)
@@ -1845,6 +1854,23 @@ if __name__ == "__main__":
              "z-recycling combination with a contractive linear-SSM-style recurrence, which stays "
              "numerically bounded across arbitrarily many recycle iterations (unlike the plain "
              "additive update). Default off -- no behavior change unless set."
+    )
+    parser.add_argument(
+        "--per_position_delta", action="store_true", default=False,
+        help="Make the contractive update's delta data-dependent and PER RESIDUE PAIR: "
+             "delta[i,j,c] = delta_floor + softplus(log_delta[c] + symmetrize(Linear(z_t))[i,j]). "
+             "A and B stay static -- making A dynamic would decouple retention from admission and "
+             "destroy the contraction guarantee; per-position B is L^2*c_z^2 values. Needs "
+             "--contractive_recycling. Default off -- no behavior change unless set."
+    )
+    parser.add_argument(
+        "--delta_floor", type=float, default=0.05,
+        help="Lower bound on the per-position delta (read only with --per_position_delta). Bounds "
+             "the freeze mode a per-position gate allows: delta -> 0 means a_bar -> 1, so a region "
+             "can retain its state forever. At the measured A=1.034 a floor f caps a_bar at "
+             "exp(-f*A) and the memory horizon at 1/(f*A) loops; 0.05 gives 0.950 and 19.3 loops. "
+             "⛔ Must be BELOW the smallest per-channel delta of any checkpoint warm-started from "
+             "(0.65943 for Run C v2 ep48) or log_delta has no solution."
     )
     parser.add_argument(
         "--gaussian_pair_init", action="store_true", default=False,

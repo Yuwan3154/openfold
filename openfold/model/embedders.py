@@ -420,6 +420,8 @@ class RecyclingEmbedder(nn.Module):
         inf: float = 1e8,
         use_contractive: bool = False,
         use_gaussian_pair_init: bool = False,
+        per_position_delta: bool = False,
+        delta_floor: float = None,
         **kwargs,
     ):
         """
@@ -446,6 +448,13 @@ class RecyclingEmbedder(nn.Module):
                 structural diversity that doesn't depend on MSA masking. Handled in model.py
                 (this flag is read there, not used directly in this module); kept here too so
                 the config block that owns both flags stays together.
+            per_position_delta:
+                Make the contractive update's delta data-dependent and PER RESIDUE PAIR, with a
+                per-channel learned offset, instead of a static [c_z] vector. A and B stay static.
+                Requires use_contractive. Default False -- no behavior change unless enabled.
+            delta_floor:
+                Lower bound on the per-position delta (only read when per_position_delta is set).
+                Bounds the freeze failure mode a per-position gate would otherwise allow.
         """
         super(RecyclingEmbedder, self).__init__()
 
@@ -457,6 +466,7 @@ class RecyclingEmbedder(nn.Module):
         self.inf = inf
         self.use_contractive = use_contractive
         self.use_gaussian_pair_init = use_gaussian_pair_init
+        self.per_position_delta = per_position_delta
 
         self.linear = Linear(self.no_bins, self.c_z)
         self.layer_norm_m = LayerNorm(self.c_m)
@@ -464,7 +474,12 @@ class RecyclingEmbedder(nn.Module):
 
         if self.use_contractive:
             from openfold.model.contractive_recycling import ContractivePairUpdate
-            self.contractive_pair_update = ContractivePairUpdate(self.c_z)
+            self.contractive_pair_update = ContractivePairUpdate(
+                self.c_z, per_position_delta=per_position_delta, delta_floor=delta_floor)
+        else:
+            assert not per_position_delta, (
+                "per_position_delta needs use_contractive: there is no delta on the "
+                "plain-additive recycling path.")
 
     def forward(
         self,

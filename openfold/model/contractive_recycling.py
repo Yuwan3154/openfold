@@ -22,6 +22,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def inv_softplus(y):
+    """The inverse of F.softplus: log(exp(y) - 1). Used to solve for the raw `log_delta` that
+    yields a WANTED delta, which is how a floor is added without moving delta."""
+    return torch.log(torch.expm1(y))
+
+
 class ContractivePairUpdate(nn.Module):
     """z_{t+1}_input = Abar * z_t + Bbar * LayerNorm(u_t), eq. (2) of ESMFold2 Appendix A.2.5.
 
@@ -38,9 +44,11 @@ class ContractivePairUpdate(nn.Module):
     magnitude bounded across arbitrarily many loop iterations.
     """
 
-    def __init__(self, c_z: int):
+    def __init__(self, c_z: int, per_position_delta: bool = False,
+                 delta_floor: float = None):
         super().__init__()
         self.c_z = c_z
+        self.per_position_delta = per_position_delta
         # log-parametrized so the raw learnable params are unconstrained.
         self.log_delta = nn.Parameter(torch.zeros(c_z))
         self.log_a = nn.Parameter(torch.zeros(c_z))
@@ -53,21 +61,85 @@ class ContractivePairUpdate(nn.Module):
         self.b = nn.Parameter(torch.eye(c_z))
         self.layer_norm_u = nn.LayerNorm(c_z)
 
+        if per_position_delta:
+            assert delta_floor is not None, "per_position_delta needs an explicit delta_floor"
+            # ⛔ The floor is a BUFFER, not a constant: it must travel inside the checkpoint so
+            # _load_from_state_dict can tell which parameterization the stored log_delta was
+            # trained under. Registered ONLY in this mode, so a flag-off state_dict keeps its exact
+            # historical key set and still loads strict=True.
+            self.register_buffer("delta_floor", torch.tensor(float(delta_floor)))
+            self.delta_head = nn.Linear(c_z, 1)
+            # Zero weight AND bias => s == 0 at init => delta reduces exactly to the per-channel
+            # value, so flag-on-at-step-0 matches the flag-off path.
+            nn.init.zeros_(self.delta_head.weight)
+            nn.init.zeros_(self.delta_head.bias)
+            # ⛔⛔ Re-solve log_delta for the floor. delta = floor + softplus(log_delta), so leaving
+            # log_delta at 0 would start the run at floor + softplus(0) instead of softplus(0) --
+            # a silent shift away from every previous run's initial delta.
+            with torch.no_grad():
+                self.log_delta.fill_(float(inv_softplus(
+                    F.softplus(torch.zeros((), dtype=torch.float64))
+                    - torch.tensor(delta_floor, dtype=torch.float64))))
+
     def discretized_params(self):
+        """Per-channel (a_bar, b_bar). ⛔ Meaningless in per-position mode, where delta depends on
+        z_t and cannot be reduced to a [c_z] vector -- reading it there would silently report a
+        delta the model never uses."""
+        assert not self.per_position_delta, (
+            "discretized_params() is per-channel only; in per_position_delta mode delta is a "
+            "function of z_t. Call per_position_delta_from_state(z_t) instead.")
         delta = F.softplus(self.log_delta)
         a = torch.exp(self.log_a)
         a_bar = torch.exp(-delta * a)
         b_bar = delta[:, None] * self.b
         return a_bar, b_bar
 
+    def per_position_delta_from_state(self, z_t: torch.Tensor) -> torch.Tensor:
+        """delta[i,j,c] = floor + softplus(log_delta[c] + symmetrize(Linear(z_t))[i,j]).
+
+        Returns [..., L, L, c_z]. The head reads the RECYCLED state z_t, so "how much do I
+        overwrite here" becomes a per-residue-pair decision instead of a constant.
+
+        `s` is symmetrized across the two pair axes because the pair track carries approximate
+        (i,j) <-> (j,i) symmetry -- the distogram head relies on it, doing z + z^T explicitly --
+        and an asymmetric gate would break a symmetry the trunk maintains.
+
+        The floor bounds the freeze failure mode: a per-position gate can otherwise drive delta -> 0
+        somewhere (high confidence -> retain -> state unchanged -> still high confidence) and pin
+        that region for the whole run. Since softplus > 0, delta > floor strictly, so
+        a_bar = exp(-delta*a) < exp(-floor*a) < 1 everywhere.
+        """
+        s = self.delta_head(z_t)                            # [..., L, L, 1]
+        s = 0.5 * (s + s.transpose(-3, -2))                 # the two pair axes, not the channel axis
+        return self.delta_floor + F.softplus(self.log_delta + s)
+
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
-        """Expand a pre-matrix checkpoint's per-channel `b` into `diag(b)`.
+        """Expand a pre-matrix checkpoint's per-channel `b` into `diag(b)`, and re-solve
+        `log_delta` whenever the checkpoint's delta floor differs from this module's.
 
         Every checkpoint written before this change stores `b` with shape [c_z]. `diag(b)` is the
         exact matrix that reproduces the old elementwise behaviour, so the migration is lossless
         rather than an approximation. ⛔ It does NOT migrate optimizer state: resuming a run across
         this change needs a fresh optimizer state for this parameter, since its shape changed.
         """
+        # ⛔⛔ FLOOR MIGRATION. Every pre-floor checkpoint stores log_delta under
+        # delta = softplus(log_delta); loading it verbatim into a floored module would give
+        # delta + floor -- a silent jump (at floor=0.05 on our measured delta=0.714, +7%) that no
+        # loss curve would reveal. Re-solve so the EFFECTIVE delta is preserved exactly. Runs in
+        # both directions, treating a checkpoint with no delta_floor buffer as floor 0.
+        old_floor = float(state_dict[prefix + "delta_floor"]) \
+            if prefix + "delta_floor" in state_dict else 0.0
+        new_floor = float(self.delta_floor) if self.per_position_delta else 0.0
+        lk = prefix + "log_delta"
+        if old_floor != new_floor and lk in state_dict:
+            old_delta = F.softplus(state_dict[lk].double()) + old_floor
+            assert bool((old_delta > new_floor).all()), (
+                f"delta floor {new_floor} is >= the checkpoint's smallest per-channel delta "
+                f"{float(old_delta.min()):.5f}; log_delta has no solution. Pick a floor below it.")
+            print(f"ContractivePairUpdate: re-solving {lk} for delta floor "
+                  f"{old_floor} -> {new_floor} (effective delta preserved)")
+            state_dict[lk] = inv_softplus(old_delta - new_floor).to(state_dict[lk].dtype)
+
         k = prefix + "b"
         if k in state_dict and state_dict[k].dim() == 1:
             print(f"ContractivePairUpdate: migrating {k} from per-channel vector to diag(b) "
@@ -79,8 +151,18 @@ class ContractivePairUpdate(nn.Module):
         """z_t, u_t: [..., c_z] (any leading batch/residue-pair dims). Returns the combined
         signal to feed into the pair-folding stack (triangle mult + transition), NOT the final
         post-pair-folding-layers representation."""
-        a_bar, b_bar = self.discretized_params()
-        return a_bar * z_t + F.linear(self.layer_norm_u(u_t), b_bar)
+        if not self.per_position_delta:
+            a_bar, b_bar = self.discretized_params()
+            return a_bar * z_t + F.linear(self.layer_norm_u(u_t), b_bar)
+
+        delta = self.per_position_delta_from_state(z_t)
+        a_bar = torch.exp(-delta * torch.exp(self.log_a))
+        # ⛔⛔ NEVER form b_bar = delta[..., :, None] * b per position: that is [..., L, L, c_z, c_z],
+        # ~1e12 elements at L=256/c_z=128. Use the row-scaling identity diag(d) @ B @ x == d * (B @ x)
+        # -- apply the STATIC matrix first, then scale elementwise. One extra tensor the shape of z,
+        # no new matmul. (The per-channel branch above keeps its historical delta[:, None] * b form
+        # so that path stays bit-identical; the two orders differ only in float rounding.)
+        return a_bar * z_t + delta * F.linear(self.layer_norm_u(u_t), self.b)
 
 
 def sample_gaussian_pair_init(shape, d_pair: int, device=None, dtype=None, generator=None,
