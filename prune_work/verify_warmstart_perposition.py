@@ -12,9 +12,15 @@ Gates, all of which must hold before any run is launched:
   4. every OTHER contractive parameter is bit-identical to the checkpoint
 """
 import argparse
+import os
+import sys
 
 import torch
 import torch.nn.functional as F
+
+# this script lives in prune_work/, so sys.path[0] is prune_work/, not the repo root where
+# train_openfold.py is -- and site-packages holds a DIFFERENT, older `openfold` that would win.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from openfold.config import model_config
 from openfold.utils.import_weights import import_openfold_weights_
