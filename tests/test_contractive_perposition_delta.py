@@ -186,3 +186,29 @@ def test_the_head_receives_gradient():
     m(z, u).sum().backward()
     assert m.delta_head.weight.grad is not None
     assert float(m.delta_head.weight.grad.abs().max()) > 0
+
+
+# --- the double-load trap in import_openfold_weights_ -------------------------------------------
+def test_migration_is_idempotent_under_the_real_two_attempt_loader():
+    """⛔⛔ import_openfold_weights_ does `load_state_dict(strict=True)` and, on RuntimeError,
+    RETRIES with the converted dict. The per-position head guarantees the first attempt raises
+    (the checkpoint has none of its keys), so the migration runs TWICE over the same dict. It
+    mutates the dict in place, so a non-idempotent migration subtracts the floor twice and the run
+    silently starts at delta - floor. This reproduces that exact call pattern.
+    """
+    old = ContractivePairUpdate(C_Z)
+    with torch.no_grad():
+        old.log_delta.copy_(torch.linspace(-0.3, 0.3, C_Z))
+    want = F.softplus(old.log_delta.detach().clone())
+    sd = old.state_dict()
+
+    new = ContractivePairUpdate(C_Z, per_position_delta=True, delta_floor=FLOOR)
+    try:                                     # attempt 1, exactly as the real loader does it
+        new.load_state_dict(sd, strict=True)
+    except RuntimeError:
+        new.load_state_dict(sd, strict=False)   # attempt 2, over the SAME (mutated) dict
+
+    got = new.per_position_delta_from_state(torch.zeros(1, 2, 2, C_Z))[0, 0, 0]
+    assert torch.allclose(got, want, atol=1e-6), (
+        f"delta drifted by {float((got - want).mean()):+.5f} across a two-attempt load "
+        f"(floor={FLOOR}); the migration is not idempotent")
