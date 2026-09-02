@@ -177,6 +177,23 @@ class OpenFoldSingleDataset(torch.utils.data.Dataset):
                 data_dir, self.supported_exts, chain_list_path
             )
 
+        # ⛔⛔ A chain_list_path is honoured ONLY on the enhanced path below. If it was given but
+        # that path is unavailable, the `else` branch silently discards it and falls back to
+        # `os.listdir(alignment_dir)` -- a DIFFERENT, much larger training set, with no error and
+        # nothing in the run log. Measured 2026-09-02: 133,019 chains instead of the curated 87,886.
+        # The enhanced import needs <repo>/openfold on sys.path, which the launcher supplies as
+        # PYTHONPATH. Fail loudly rather than silently train on the wrong corpus.
+        if chain_list_path is not None and not (
+                ENHANCED_UTILS_AVAILABLE and enable_recursive_search):
+            raise RuntimeError(
+                f"chain_list_path={chain_list_path!r} was given but cannot be applied "
+                f"(ENHANCED_UTILS_AVAILABLE={ENHANCED_UTILS_AVAILABLE}, "
+                f"enable_recursive_search={enable_recursive_search}). It would be SILENTLY IGNORED, "
+                f"falling back to os.listdir(alignment_dir) and a different training set. Fix: set "
+                f"PYTHONPATH to <repo>/openfold so block_replacement_scripts.enhanced_data_utils "
+                f"imports."
+            )
+
         # Build chain IDs using enhanced logic
         if ENHANCED_UTILS_AVAILABLE and enable_recursive_search:
             if alignment_index is not None:
@@ -191,6 +208,16 @@ class OpenFoldSingleDataset(torch.utils.data.Dataset):
                 self._chain_ids = list(alignment_index.keys())
             else:
                 self._chain_ids = list(os.listdir(alignment_dir))
+
+        # Require the resolved size to match what was asked for, so a partial application of the
+        # list cannot pass unnoticed either.
+        if chain_list_path is not None:
+            with open(chain_list_path, "r") as _f:
+                _n_listed = sum(1 for _l in _f if _l.strip())
+            assert len(self._chain_ids) == _n_listed, (
+                f"chain_list_path {chain_list_path!r} lists {_n_listed} chains but the dataset "
+                f"resolved {len(self._chain_ids)}; refusing to train on a different set than asked."
+            )
 
         if filter_path is not None:
             with open(filter_path, "r") as f:
