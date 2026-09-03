@@ -10,7 +10,12 @@ dist
 
 # files from script downloads
 data/
-openfold/resources/
+openfold/resources/*
+# ...but stereo_chemical_props.txt is a 9 KB CONSTANTS file that openfold/__init__.py needs
+# transitively: without it `import openfold` fails outright on a fresh clone, which cost a
+# whole job on a new host (2026-09-02). The exclusion above exists to keep ~10 GB of model
+# params out; it should not take the constants with it.
+!openfold/resources/stereo_chemical_props.txt
 tests/test_data/
 cutlass/
 notebooks/prediction*
