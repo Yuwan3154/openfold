@@ -23,14 +23,6 @@ from deepspeed.utils import zero_to_fp32
 
 from openfold.config import model_config
 
-# ⛔⛔ torch >= 2.6 defaults torch.load to weights_only=True. The weights-only WARM-START path below
-# passes weights_only=False explicitly, but Lightning's FULL resume (ckpt_path -> trainer.fit) does
-# not, and our checkpoints legitimately carry an ml_collections ConfigDict in hyper_parameters. That
-# makes a self-resume die with "Unsupported global: ConfigDict" while a warm start succeeds -- so it
-# only appears once a run resumes from its OWN checkpoint. Allowlist the classes we ourselves wrote.
-import torch.serialization as _torch_ser
-from ml_collections.config_dict import ConfigDict as _ConfigDict, FieldReference as _FieldRef
-_torch_ser.add_safe_globals([_ConfigDict, _FieldRef])
 from openfold.data.data_modules import OpenFoldDataModule, OpenFoldMultimerDataModule
 from openfold.model.model import AlphaFold
 from openfold.model.torchscript import script_preset_
