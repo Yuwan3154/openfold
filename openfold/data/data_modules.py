@@ -845,6 +845,9 @@ class OpenFoldDataset(torch.utils.data.Dataset):
         self.datasets = datasets
         self.probabilities = probabilities
         self.epoch_len = epoch_len
+        # A mid-epoch fastforward shortens ONE epoch (see _gen_dataloader). Keep the configured
+        # length so reroll() can restore it and every later epoch is full length again.
+        self._epoch_len_full = epoch_len
         self.generator = generator
 
         self._samples = [self.looped_samples(i) for i in range(len(self.datasets))]
@@ -950,6 +953,9 @@ class OpenFoldDataset(torch.utils.data.Dataset):
         return self.epoch_len
 
     def reroll(self):
+        # Restore the full epoch length: a previous epoch may have been shortened by a mid-epoch
+        # fastforward, and that shortening must not leak into subsequent epochs.
+        self.epoch_len = self._epoch_len_full
         dataset_choices = torch.multinomial(
             torch.tensor(self.probabilities),
             num_samples=self.epoch_len,
@@ -1477,6 +1483,13 @@ class OpenFoldDataModule(pl.LightningDataModule):
                     f"fastforward: skipping the first {k} datapoints of this epoch "
                     f"({len(dataset.datapoints) - k} remain)")
                 dataset.datapoints = dataset.datapoints[k:]
+                # ⛔⛔ __len__ returns self.epoch_len, NOT len(self.datapoints), and __getitem__
+                # indexes self.datapoints[idx]. Truncating the list alone leaves the sampler
+                # emitting indices past its end -> "IndexError: list index out of range" in a
+                # DataLoader worker (jobs 22055648/22055649). The length MUST be updated with it.
+                dataset.epoch_len = len(dataset.datapoints)
+                assert len(dataset) == len(dataset.datapoints), (
+                    f"epoch_len {len(dataset)} != datapoints {len(dataset.datapoints)}")
                 self._fastforward_samples_pending = 0
         elif stage == "eval":
             dataset = self.eval_dataset
