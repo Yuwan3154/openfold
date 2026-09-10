@@ -29,13 +29,30 @@ print(f"{n} chains, lengths {L.min()}-{L.max()}, {k} rungs/chain\n")
 
 
 def crossings(edge):
-    """Rewind at which each chain's TM curve crosses `edge`, NaN if it never does."""
+    """FIRST rewind at which each chain's TM drops below `edge`, NaN if it never does.
+
+    ⛔⛔ CORRECTED 2026-09-09 (user decision). This used `np.interp(edge, ti, ri)` with `ti` taken
+    as "TM ascending with decreasing rewind" -- but that ordering is an ASSUMPTION, and it does not
+    hold: measured over all 82,733 chains, **zero** have a monotone TM curve and **36.24% pop back
+    above 0.9 after first dropping below it**. np.interp requires an increasing `xp` and silently
+    returns nonsense otherwise, so "the crossing" was undefined for over a third of the set.
+    In aggregate the difference was negligible (in-band 55.1 -> 55.0, skew 0.98 -> 1.05), which is
+    why the published per-chain figures below still stand -- but at the tail the old reading put 16
+    chains' ladder start at 370, leaving a 5-rewind-unit window. First-crossing leaves none
+    (minimum window 66). See prune_work/build_ladder_starts.py for the full comparison.
+    """
     out = np.full(n, np.nan)
     for i in range(n):
         o = np.argsort(rw[i])
-        ti, ri = tm[i][o][::-1], rw[i][o][::-1]        # TM ascending with decreasing rewind
-        if ti[0] <= edge <= ti[-1]:
-            out[i] = np.interp(edge, ti, ri)
+        r, t = rw[i][o], tm[i][o]                      # rewind ASCENDING
+        below = np.flatnonzero(t <= edge)
+        if not len(below):
+            continue
+        k = int(below[0])
+        if k == 0:
+            out[i] = r[0]
+        else:
+            out[i] = r[k - 1] + (t[k - 1] - edge) * (r[k] - r[k - 1]) / max(t[k - 1] - t[k], 1e-9)
     return out
 
 
