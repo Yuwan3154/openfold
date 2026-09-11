@@ -71,9 +71,19 @@ if int(bare_metal_major) >= 13:
 else:
     compute_capabilities.add((7, 0))
 
-compute_capability, _ = get_nvidia_cc()
-if compute_capability is not None:
-    compute_capabilities = set([compute_capability])
+# A single-GPU probe bakes a ONE-arch binary: built on an sm_90 node it cannot run on the sm_120
+# node and vice versa, so an explicit "9.0;12.0" has to be able to win.
+_arch_list = os.environ.get("OPENFOLD_CUDA_ARCH_LIST", "").strip()
+if _arch_list:
+    compute_capabilities = {
+        tuple(int(p) for p in a.split("."))
+        for a in _arch_list.replace(",", ";").split(";") if a.strip()
+    }
+    print(f"OPENFOLD_CUDA_ARCH_LIST={_arch_list} -> {sorted(compute_capabilities)}")
+else:
+    compute_capability, _ = get_nvidia_cc()
+    if compute_capability is not None:
+        compute_capabilities = set([compute_capability])
 
 cc_flag = []
 for major, minor in list(compute_capabilities):
