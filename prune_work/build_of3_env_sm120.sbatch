@@ -64,10 +64,20 @@ echo "network to download.pytorch.org OK"
 [ -f "$REPO/$SO" ] || { echo "ABORT: $REPO/$SO missing -- nothing to preserve for the cu126 path"; exit 1; }
 
 # ---------------------------------------------------------------- 3. inventory the source
+# ⛔ `du -sb` is NOT a completeness measure. It is --apparent-size, which INCLUDES directory inode
+#    sizes, and a freshly created directory is more compact than one that has grown over months.
+#    Gating on it aborted 22590939 with a 303,009-byte (0.004%) delta while all 60,898 entries had
+#    copied. The real measure is the summed size of REGULAR FILES, plus counts per entry type.
+inv() {  # one walk -> "<n_regular> <n_dirs> <n_symlinks> <regular_file_bytes>"
+  # ⛔ The \n is load-bearing: without it `read` hits EOF, returns 1, and `set -e` kills the job
+  #    before a single line of output -- the same silent-abort shape as the pgrep no-match bug.
+  find "$1" -printf '%y %s\n' \
+    | awk '{t[$1]++; if($1=="f") b+=$2} END{printf "%d %d %d %d\n", t["f"]+0, t["d"]+0, t["l"]+0, b+0}'
+}
 "$SRC/bin/pip" freeze > "$S/envs/of3_env.freeze.$STAMP.txt"
-SRC_FILES=$(find "$SRC" | wc -l)
-SRC_BYTES=$(du -sb "$SRC" | awk '{print $1}')
-echo "SRC inventory: files=$SRC_FILES bytes=$SRC_BYTES ($(numfmt --to=iec $SRC_BYTES))"
+read -r SRC_F SRC_D SRC_L SRC_FB < <(inv "$SRC")
+SRC_DU=$(du -sb "$SRC" | awk '{print $1}')
+echo "SRC inventory: regular=$SRC_F dirs=$SRC_D symlinks=$SRC_L file_bytes=$SRC_FB ($(numfmt --to=iec "$SRC_FB"))  du_apparent=$SRC_DU"
 echo "SRC freeze -> $S/envs/of3_env.freeze.$STAMP.txt ($(wc -l < "$S/envs/of3_env.freeze.$STAMP.txt") pkgs)"
 
 # ---------------------------------------------------------------- 4. clone the env
@@ -78,11 +88,15 @@ echo "SRC freeze -> $S/envs/of3_env.freeze.$STAMP.txt ($(wc -l < "$S/envs/of3_en
 echo "cp -a starting $(date -Is)"
 cp -a "$SRC" "$DST"
 echo "cp -a done $(date -Is)"
-DST_FILES=$(find "$DST" | wc -l)
-DST_BYTES=$(du -sb "$DST" | awk '{print $1}')
-echo "DST inventory: files=$DST_FILES bytes=$DST_BYTES"
-[ "$SRC_FILES" -eq "$DST_FILES" ] || { echo "ABORT: file count $SRC_FILES != $DST_FILES -- copy is short (quota?)"; exit 1; }
-[ "$SRC_BYTES" -eq "$DST_BYTES" ] || { echo "ABORT: byte count $SRC_BYTES != $DST_BYTES -- copy is short (quota?)"; exit 1; }
+read -r DST_F DST_D DST_L DST_FB < <(inv "$DST")
+DST_DU=$(du -sb "$DST" | awk '{print $1}')
+echo "DST inventory: regular=$DST_F dirs=$DST_D symlinks=$DST_L file_bytes=$DST_FB  du_apparent=$DST_DU"
+echo "du_apparent delta = $((DST_DU - SRC_DU)) bytes (directory inode sizes; informational, NOT a gate)"
+[ "$SRC_F"  -eq "$DST_F"  ] || { echo "ABORT: regular-file count $SRC_F != $DST_F -- copy is short (quota?)"; exit 1; }
+[ "$SRC_D"  -eq "$DST_D"  ] || { echo "ABORT: directory count $SRC_D != $DST_D -- copy is short"; exit 1; }
+[ "$SRC_L"  -eq "$DST_L"  ] || { echo "ABORT: symlink count $SRC_L != $DST_L -- copy is short"; exit 1; }
+[ "$SRC_FB" -eq "$DST_FB" ] || { echo "ABORT: regular-file bytes $SRC_FB != $DST_FB -- copy is short (quota?)"; exit 1; }
+echo "copy gate PASSED: every entry type and every content byte accounted for"
 
 # venv console-script shebangs are absolute and still point at SRC. We invoke bin/python directly,
 # but leaving them wrong would silently run the OLD env from any entry point.
