@@ -59,7 +59,12 @@ curl -sfI --max-time 30 https://download.pytorch.org/whl/cu128/torch/ >/dev/null
 echo "network to download.pytorch.org OK"
 
 # ---------------------------------------------------------------- gate 2: destination is free
-[ -e "$DST" ] && { echo "ABORT: $DST already exists -- refusing to overwrite an env"; exit 1; }
+# ⛔ Deliberately NOT self-clearing: an env is not something a job should silently delete. To re-run
+#    after a failed attempt, remove it yourself ON A COMPUTE NODE (60k+ files is not login-node work):
+#      srun -p mit_normal -c 2 --mem=4G -t 10 rm -rf /orcd/scratch/orcd/011/chenxiou/envs/of3_env_sm120
+#    ⚠️ A `[ -e ]` check on the LOGIN node right after that srun can still read YES from a stale NFS
+#       attribute cache. Confirm with `stat` in a fresh connection, not in the same shell.
+[ -e "$DST" ] && { echo "ABORT: $DST already exists -- refusing to overwrite an env. See the header comment for how to clear it."; exit 1; }
 [ -x "$SRC/bin/python" ] || { echo "ABORT: $SRC/bin/python missing"; exit 1; }
 [ -f "$REPO/$SO" ] || { echo "ABORT: $REPO/$SO missing -- nothing to preserve for the cu126 path"; exit 1; }
 
@@ -154,7 +159,13 @@ mkdir -p "$BK"
 cp -a "$REPO/$SO" "$BK/$SO"
 cp -a "$REPO/$SO" "$SITE_SRC/$SO"
 echo "cu126 .so backed up to $BK and installed into of3_env site-packages"
-"$SRC/bin/python" -c "import importlib,sys; sys.path=[p for p in sys.path if p not in ('','$REPO')]; m=importlib.import_module('attn_core_inplace_cuda'); print('of3_env imports from', m.__file__)" \
+# ⛔ `import torch` FIRST is mandatory. A torch C++ extension links libc10/libtorch by soname with no
+#    usable rpath; they only become resolvable after torch's __init__ dlopens libtorch_global_deps.so
+#    with RTLD_GLOBAL. Importing the extension standalone fails with
+#    `ImportError: libc10.so: cannot open shared object file` -- which is what aborted 22591895, a
+#    broken TEST rather than a broken extension. Real code always imports torch first.
+#    sys.path still drops '' and the repo so this proves the RELOCATED copy loads, not the repo one.
+"$SRC/bin/python" -c "import torch, importlib, sys; sys.path=[p for p in sys.path if p not in ('','$REPO')]; m=importlib.import_module('attn_core_inplace_cuda'); print('of3_env torch', torch.__version__, 'ext', m.__file__)" \
   || { echo "ABORT: of3_env cannot import the relocated .so -- NOT removing the repo copy"; exit 1; }
 
 # ---------------------------------------------------------------- 10. build the fat extension
@@ -179,7 +190,8 @@ echo "fat .so installed into of3_env_sm120 site-packages"
 mv "$REPO/$SO" "$BK/$SO.was_at_repo_root"
 echo "repo root .so retired -> $BK/$SO.was_at_repo_root"
 for E in "$SRC" "$DST"; do
-  "$E/bin/python" -c "import importlib; m=importlib.import_module('attn_core_inplace_cuda'); print('$E ->', m.__file__)" \
+  # import torch first -- see the note at step 9.
+  "$E/bin/python" -c "import torch, importlib; m=importlib.import_module('attn_core_inplace_cuda'); print('$E -> torch', torch.__version__, 'ext', m.__file__)" \
     || { echo "ABORT: $E cannot import attn_core_inplace_cuda after retiring the repo copy"; exit 1; }
 done
 
