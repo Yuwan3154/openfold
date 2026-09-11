@@ -30,8 +30,14 @@ module load cuda/12.9.1
 cd "$REPO"
 PYTHONPATH="$REPO/openfold" "$ENV/bin/python" - <<'PYGPU' || { echo "VERIFY FAILED"; exit 1; }
 import torch
+# ⛔ This import is GPU-ONLY and belongs here, not in the build job: primitives probes for deepspeed,
+#    whose triton matmul_ext runs @triton.autotune at import time and raises
+#    "0 active drivers" on any node without a GPU (verified: of3_env cu126 does the same).
+import openfold.model.primitives
+import openfold.model.structure_module
 from openfold.utils.kernel.attention_core import attention_core
 
+print("openfold primitives + structure_module import OK (deepspeed/triton path exercised)")
 print("torch", torch.__version__, "cuda", torch.version.cuda)
 print("arch_list", torch.cuda.get_arch_list())
 name = torch.cuda.get_device_name(0)

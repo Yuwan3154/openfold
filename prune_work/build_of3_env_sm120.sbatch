@@ -196,12 +196,18 @@ for E in "$SRC" "$DST"; do
 done
 
 # ---------------------------------------------------------------- 12. does openfold still import
+# ⛔ ONLY the GPU-free part can be checked here. `openfold.model.primitives` probes for deepspeed,
+#    whose triton matmul_ext applies @triton.autotune AT IMPORT TIME; the Autotuner asks for
+#    driver.active, and on a GPU-less node triton raises
+#        RuntimeError: 0 active drivers ([]). There should only be one.
+#    That killed 22596015 here. It is NOT a cu128 regression: verified the same day that of3_env
+#    (cu126, the env Run D has been running) fails IDENTICALLY on a GPU-less node. mit_normal has no
+#    GPU, so the deepspeed/primitives path is checked in verify_sm120_gpu.sbatch instead.
 cd "$REPO"
-PYTHONPATH="$REPO/openfold" "$DST/bin/python" - <<'PYIMP' || { echo "ABORT: openfold import broke under cu128"; exit 1; }
+PYTHONPATH="$REPO/openfold" "$DST/bin/python" - <<'PYIMP' || { echo "ABORT: openfold GPU-free import broke under cu128"; exit 1; }
 import torch
-import openfold.model.structure_module as sm
 import openfold.utils.kernel.attention_core as ac
-print("openfold structure_module + attention_core import OK under", torch.__version__)
+print("openfold attention_core import OK under", torch.__version__, "- ext:", ac.attn_core_inplace_cuda.__file__)
 PYIMP
 
 # ---------------------------------------------------------------- 13. record the recipe
