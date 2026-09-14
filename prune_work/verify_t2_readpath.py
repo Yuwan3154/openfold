@@ -80,14 +80,26 @@ for i in picks:
     back = np.array([rc.MAP_HHBLITS_AATYPE_TO_OUR_AATYPE[x] for x in hh])
     d = np.load(pool.npz_path(chain), allow_pickle=False)
     src = d["aatype"].astype(int)
-    if not (back == src).all():
+    # ⛔⛔ `back` is on the QUERY frame (length len(qseq)); `src` is on the NATIVE frame, which holds
+    #    only resolved residues. They are equal in length ONLY when residue_index is a gapless
+    #    1..N -- a positional compare is a broadcast ERROR otherwise (119 vs 117 killed 5615769).
+    #    Compare at the mapped positions, and require the gap symbol everywhere else, so the check
+    #    still covers the whole frame instead of going vacuous.
+    qpos = d["residue_index"].astype(int) - 1
+    unmapped = np.setdiff1d(np.arange(len(qseq)), qpos)
+    gap = rc.restypes_with_x_and_gap.index("-")
+    if not (back[qpos] == src).all():
         bad += 1
         print(f"  ⛔ {chain}: aatype round-trip mismatch at "
-              f"{int((back != src).sum())}/{len(src)} residues")
-    # the CA of every template must sit where the native's CA does, per-residue present
-    if pos.shape[1] != len(src):
+              f"{int((back[qpos] != src).sum())}/{len(src)} mapped residues")
+    elif unmapped.size and not (back[unmapped] == gap).all():
         bad += 1
-        print(f"  ⛔ {chain}: L={pos.shape[1]} but npz aatype has {len(src)}")
+        print(f"  ⛔ {chain}: {int((back[unmapped] != gap).sum())}/{unmapped.size} unmapped query "
+              f"positions are not the gap symbol -- the scatter wrote outside the mapping")
+    # the features live on the QUERY frame, not the npz's
+    if pos.shape[1] != len(qseq):
+        bad += 1
+        print(f"  ⛔ {chain}: L={pos.shape[1]} but the query frame is {len(qseq)}")
 print(f"\nexercised {len(picks)} chains through sample_features: {bad} failures")
 
 # --- 4. merge onto a realistic natural-template block ------------------------------------------
