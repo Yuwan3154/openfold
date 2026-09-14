@@ -63,7 +63,13 @@ print("conv2d (cuDNN) + bf16 matmul (cuBLAS) fwd+bwd OK")
 #    A kernel that runs but returns garbage is the failure mode a crash-only test cannot see.
 #    Tolerances come from torch.testing's own per-dtype defaults; nothing is hand-picked here.
 torch.manual_seed(0)
-B, H, Q, K, D = 2, 4, 37, 53, 32
+# ⛔⛔ Q MUST EQUAL K. attn_softmax_inplace_grad_ hardcodes `rows_values = cols_output` and locates
+#    the v leaf with `row_offset - row_offset % rows_values`, which is the leaf start ONLY when Q == K.
+#    A rectangular Q=37/K=53 made 233 of 296 rows read the WRONG leaf of v -> 7443/9472 grad_q
+#    elements wrong. That was a TEST bug, not a kernel bug: the same shape fails identically on the
+#    known-good cu126 env on an H200 (22707765). openfold only ever calls this with Q == K.
+B, H, Q, K, D = 2, 4, 53, 53, 32
+assert Q == K, "the backward kernel's v-leaf indexing assumes a square attention matrix"
 for dtype in (torch.float32, torch.bfloat16):
     q = torch.randn(B, H, Q, D, device="cuda", dtype=dtype, requires_grad=True)
     k = torch.randn(B, H, K, D, device="cuda", dtype=dtype, requires_grad=True)
