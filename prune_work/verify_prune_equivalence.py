@@ -28,6 +28,7 @@ p.add_argument("--max-tm", type=float, default=0.9)
 a = p.parse_args()
 
 from openfold.data.synthetic_templates import SyntheticTemplatePool
+from prune_work._t2_verify_common import native_frame_query_sequence
 
 orig = SyntheticTemplatePool(a.index, a.src_root, min_tm=a.min_tm, max_tm=a.max_tm)
 pruned = SyntheticTemplatePool(a.pruned_index, a.dst_root, min_tm=a.min_tm, max_tm=a.max_tm)
@@ -55,8 +56,10 @@ n_bad = 0
 n_tmpl = 0
 for j, chain in enumerate(pick_chains):
     seed = int(np.frombuffer(chain.encode().ljust(4, b"\0")[:4], dtype=np.uint32)[0])
-    fo = orig.sample_features(chain, a.n_sample, np.random.default_rng(seed))
-    fp = pruned.sample_features(chain, a.n_sample, np.random.default_rng(seed))
+    # ⭐ The SAME string to both pools, so it is a fixed input and cannot be what makes them differ.
+    qseq = native_frame_query_sequence(orig, chain)
+    fo = orig.sample_features(chain, a.n_sample, np.random.default_rng(seed), qseq)
+    fp = pruned.sample_features(chain, a.n_sample, np.random.default_rng(seed), qseq)
     assert (fo is None) == (fp is None), chain
     if fo is None:
         continue

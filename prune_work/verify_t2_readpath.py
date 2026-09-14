@@ -24,6 +24,7 @@ a = p.parse_args()
 
 from openfold.data.synthetic_templates import SyntheticTemplatePool, merge_template_features
 from openfold.np import residue_constants as rc
+from prune_work._t2_verify_common import native_frame_query_sequence
 
 pool = SyntheticTemplatePool(a.index, a.templates_root, min_tm=a.min_tm, max_tm=a.max_tm)
 n_chain, n_tmpl = pool.tm.shape
@@ -61,7 +62,8 @@ bad = 0
 for i in picks:
     chain = elig[i]
     row = pool.row_of[chain]
-    f = pool.sample_features(chain, a.n_sample, np.random.default_rng(int(i)))
+    qseq = native_frame_query_sequence(pool, chain)
+    f = pool.sample_features(chain, a.n_sample, np.random.default_rng(int(i)), qseq)
     assert f is not None, chain
     pos = f["template_all_atom_positions"]
     msk = f["template_all_atom_mask"]
@@ -90,7 +92,8 @@ print(f"\nexercised {len(picks)} chains through sample_features: {bad} failures"
 
 # --- 4. merge onto a realistic natural-template block ------------------------------------------
 chain = elig[int(picks[0])]
-f = pool.sample_features(chain, a.n_sample, np.random.default_rng(1))
+f = pool.sample_features(chain, a.n_sample, np.random.default_rng(1),
+                         native_frame_query_sequence(pool, chain))
 L = f["template_all_atom_positions"].shape[1]
 nat = {
     "template_all_atom_positions": np.zeros((4, L, 37, 3), np.float32),
