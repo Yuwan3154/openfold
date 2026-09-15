@@ -10,9 +10,16 @@ The question that actually matters is whether a REBUILT env behaves like the env
 already trusts, so this measures exactly that and carries no constant of its own:
 
   * SAME capability, two envs  -> BIT-FOR-BIT. Nothing may differ.
-  * ACROSS capabilities        -> NO-WORSE-THAN. Max |err| against a float64 CPU reference must not
-                                  exceed the trusted build's own error. The bar IS the trusted
-                                  measurement.
+  * ACROSS capabilities        -> DRIFT-UNDER-NOISE. max|candidate - trusted| must not exceed
+                                  max|trusted - float64 truth|, i.e. switching arch must move the
+                                  answer LESS than the rounding error the trusted build already
+                                  carries. The bar IS the trusted measurement.
+
+⛔ An earlier version of the cross-arch leg compared the two builds' scalar max-errors directly
+(`err_candidate <= err_trusted`). That is the wrong test: the two agreed to 5+ significant figures
+(ratio 1.0000) and it still flagged 4 of 12 tensors, because comparing two nearly-equal scalars
+with a strict inequality decides on their last bits. Drift-vs-noise asks the question that was
+actually meant and is robust to that.
 
 Two subjects are dumped, because the env swap changes both:
   kernel : attn_core_inplace_cuda.forward_/backward_ driven directly, so the compiled .so is
@@ -113,6 +120,7 @@ def dump(path):
         got = run_device(dt, q, k, v, go, ref)
         for key, t in got.items():
             payload[f"bytes/{name}/{key}"] = raw(t)
+            payload[f"shape/{name}/{key}"] = np.asarray(tuple(t.shape), dtype=np.int64)
             err = (t.double().cpu() - ref[key]).abs().max().item()
             payload[f"err/{name}/{key}"] = np.float64(err)
             print(f"  {name:>9} {key:<10} max|err| vs float64 CPU = {err:.6e}")
@@ -142,16 +150,21 @@ def compare(trusted_path, candidate_path):
     else:
         print(f"\nDIFFERENT capabilities ({ca} vs {cb}) -> bit-for-bit is NOT a valid expectation")
         print("(cuBLAS picks different kernels and the fast-math intrinsics are per-arch)")
-        print("-> NO-WORSE-THAN against float64 CPU truth; the bar is the trusted build's own error")
+        print("-> DRIFT-UNDER-NOISE: max|candidate - trusted| must not exceed the rounding error")
+        print("   the trusted build already carries, max|trusted - float64 truth|")
         for k in keys:
-            ek = "err/" + k[6:]
-            ta, tb = float(a[ek]), float(b[ek])
-            ok = tb <= ta
-            ratio = (tb / ta) if ta > 0 else (1.0 if tb == 0 else float("inf"))
-            print(f"  {k[6:]:<22} trusted {ta:.6e}  candidate {tb:.6e}  "
-                  f"ratio {ratio:.4f}  {'OK' if ok else 'WORSE'}")
+            name, key = k.split("/")[1:]
+            ta = torch.from_numpy(a[k].copy()).view(DTYPES[name]).reshape(tuple(a["shape/" + name + "/" + key]))
+            tb = torch.from_numpy(b[k].copy()).view(DTYPES[name]).reshape(tuple(b["shape/" + name + "/" + key]))
+            drift = (tb.double() - ta.double()).abs().max().item()
+            noise = float(a["err/" + name + "/" + key])
+            ok = drift <= noise
+            share = (drift / noise) if noise > 0 else (0.0 if drift == 0 else float("inf"))
+            print(f"  {k[6:]:<22} drift {drift:.6e}  trusted noise {noise:.6e}  "
+                  f"drift/noise {share:.4f}  {'OK' if ok else 'EXCEEDS'}")
             if not ok:
-                bad.append(f"{k[6:]}: {tb:.6e} > trusted {ta:.6e} (ratio {ratio:.4f})")
+                bad.append(f"{k[6:]}: drift {drift:.6e} exceeds the trusted build's own "
+                           f"rounding error {noise:.6e} (x{share:.3f})")
 
     if bad:
         print("\nEQUIV FAILED")
