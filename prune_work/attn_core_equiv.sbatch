@@ -32,14 +32,16 @@ nvidia-smi --query-gpu=index,name,compute_cap,memory.total --format=csv,noheader
 module load cuda/12.9.1
 mkdir -p "$(dirname "$OUT")"
 cd "$REPO"
+# ⛔ $REPO must be on PYTHONPATH: this is run as a FILE, so sys.path[0] is
+#    $REPO/prune_work, not $REPO. The old heredoc-fed gate got `openfold` from the cwd.
 
 if [ -n "$TRUSTED" ]; then
     echo "mode: --check against $TRUSTED"
-    PYTHONPATH="$REPO/openfold" "$ENV/bin/python" prune_work/attn_core_equiv.py \
+    PYTHONPATH="$REPO:$REPO/openfold" "$ENV/bin/python" prune_work/attn_core_equiv.py \
         --check "$TRUSTED" --scratch "$OUT"
 else
     echo "mode: --dump (this run becomes the trusted reference)"
-    PYTHONPATH="$REPO/openfold" "$ENV/bin/python" prune_work/attn_core_equiv.py --dump "$OUT"
+    PYTHONPATH="$REPO:$REPO/openfold" "$ENV/bin/python" prune_work/attn_core_equiv.py --dump "$OUT"
 fi
 
 echo "DONE $(date -Is)"
