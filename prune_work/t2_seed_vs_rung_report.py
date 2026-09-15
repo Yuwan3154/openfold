@@ -7,12 +7,12 @@ per-chain FIRST-CROSSING ladder, so it does not, and the old script said so by d
     AssertionError: 81477 chains have a different rewind ROW than chain 0;
                     the separation axis is not shared
 
-⭐ The assertion was RIGHT and the report was obsolete. Measured on the round-2 sweep, every chain
-descends from a shared rung-0 rewind of 375 to its OWN first-crossing endpoint, and the spread
-across chains widens monotonically with depth:
+⭐ The assertion was RIGHT and the report was obsolete. Measured on the round-2 sweep (all 82,733
+chains, job 5621210), every chain descends from a shared rung-0 rewind of 375 to its OWN
+first-crossing endpoint, and the spread across chains widens monotonically with depth:
 
     rung      0    1    2    3    4    5    6    7
-    spread    0   24   49   73   98  122  147  171     (max-min absolute rewind, across chains)
+    spread    0   29   60   89  119  148  179  208     (max-min absolute rewind, across chains)
 
 ⇒ the RUNG INDEX is the only axis every chain shares, so every comparison here is made on it.
 Absolute rewind is still reported, as a DISTRIBUTION per rung, so a reader can see what index k
@@ -93,7 +93,8 @@ def rung_axes(z: dict, label: str):
         print("  ⛔ Chains do NOT share absolute rewind, so every comparison below is on rung INDEX.")
 
     slot_rung = np.arange(n_slot) // blk
-    return tm, slot_rung[z["pair_i"]], slot_rung[z["pair_j"]], n_rung, blk
+    max_spread = int((depth.max(0) - depth.min(0)).max())
+    return tm, slot_rung[z["pair_i"]], slot_rung[z["pair_j"]], n_rung, blk, max_spread
 
 
 def seed_floor_per_rung(tm, r_i, r_j, n_rung):
@@ -141,7 +142,7 @@ def rung_curve(tm, r_i, r_j, label):
     return xs, np.array(ys)
 
 
-def split_table(sep, tm_curve, floors, budget, n_rung):
+def split_table(sep, tm_curve, floors, budget, n_rung, max_spread):
     """Per split: the mean, AND the near-duplicate share the mean hides. No single winner."""
     span = n_rung - 1
     print(f"\n{'=' * 78}\nCANDIDATE SPLITS of a {budget}-template budget over {n_rung} rung indices")
@@ -150,8 +151,9 @@ def split_table(sep, tm_curve, floors, budget, n_rung):
     print("   `same-rung share` column beside it: that is the fraction of the budget spent on pairs")
     print("   that only differ by a noise draw at ONE difficulty level.")
     print("⛔ Spacing is in RUNG INDEX units. On a per-chain ladder it cannot be quoted in absolute")
+    # ⛔ MEASURED, never a literal: a 3-shard sample said 171 while the full 82,733 chains say 208.
     print("   rewind, because one index step is a different number of rewind units on every chain")
-    print("   (spread reaches 171 units by the deepest rung).\n")
+    print(f"   (measured spread across chains reaches {max_spread} rewind units).\n")
     floor = float(np.mean(list(floors.values()))) if floors else float(tm_curve[0])
     print(f"  seed floor averaged over all {len(floors)} rungs: {floor:.4f}"
           f"   (per-rung: {', '.join(f'{r}:{floors[r]:.3f}' for r in sorted(floors))})")
@@ -190,13 +192,13 @@ def main():
               f"window. Comparisons are on rung INDEX. Drop them from the launcher.")
 
     g = load(a.grouped)
-    tm_g, gi, gj, n_rung, blk = rung_axes(g, f"GROUPED  ({g['rewind'].shape[1]} templates/chain)")
+    tm_g, gi, gj, n_rung, blk, max_spread = rung_axes(g, f"GROUPED  ({g['rewind'].shape[1]} templates/chain)")
     floors = seed_floor_per_rung(tm_g, gi, gj, n_rung)
     sep, curve = rung_curve(tm_g, gi, gj, "rung curve, grouped (delta in rung indices)")
 
     if a.tiered is not None:
         t = load(a.tiered)
-        tm_t, ti, tj, n_rung_t, _ = rung_axes(t, "TIERED")
+        tm_t, ti, tj, n_rung_t, _, max_spread = rung_axes(t, "TIERED")
         sep, curve = rung_curve(tm_t, ti, tj, "rung curve, tiered (delta in rung indices)")
         n_rung = n_rung_t
         print("\n  ⛔ The tiered population may have no same-rung pairs, so its floor cannot be "
@@ -204,7 +206,7 @@ def main():
               "is a DIFFERENT length band and TM rises with L. Treat the split table as indicative "
               "of ORDERING, not as absolute TM.")
 
-    split_table(sep, curve, floors, a.budget, n_rung)
+    split_table(sep, curve, floors, a.budget, n_rung, max_spread)
 
 
 if __name__ == "__main__":
