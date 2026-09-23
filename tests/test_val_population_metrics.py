@@ -103,12 +103,16 @@ def _new_scheme(scenario):
     return fn
 
 
+def _sync_fn(t, group=None, reduce_op=None):
+    return _sync_ddp_if_available(t, group, reduce_op=reduce_op)
+
+
 def _old_log(rc, batch, metrics):
     """The removed train_openfold._log validation branch, verbatim in its key logic."""
+    # ONE sync function object: Lightning compares each key's metadata (incl. the fn) across calls
     def log(name, v):
         rc.log("validation_step", name, torch.mean(v), on_step=False, on_epoch=True, sync_dist=True,
-               sync_dist_fn=lambda t, group=None, reduce_op=None: _sync_ddp_if_available(
-                   t, group, reduce_op=reduce_op), batch_size=1)
+               sync_dist_fn=_sync_fn, batch_size=1)
     for k, v in metrics.items():
         log(f"val/{k}", v)
     if "is_train_overlap" in batch:
