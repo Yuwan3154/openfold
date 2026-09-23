@@ -185,7 +185,7 @@ def test_gloo_4_ranks_issue_the_same_collectives_and_get_the_exact_pooled_means(
 
 def test_known_bad_control_old_per_key_sync_misses_keys_when_a_group_is_absent_from_a_rank():
     """Scenario A under the removed logging: rank 1 meets neither train_overlap nor src_easy, so it would sync
-    12 fewer keys (48 fewer NCCL ops) than the other ranks -> desync.
+    6 fewer keys (24 fewer NCCL ops) than the other ranks -> desync.
 
     Counted, not run: running it would hang or mis-pair the collectives.
     """
@@ -197,7 +197,8 @@ def test_known_bad_control_old_per_key_sync_misses_keys_when_a_group_is_absent_f
         keys.append(len(rc))
     print("synced keys per rank (old scheme):", keys)
     # rank r gets entries r::4 of [0..13, 0, 1]; rank 1 = {1, 5, 9, 13} lacks train_overlap and src_easy
-    assert keys == [7 * len(METRICS), 6 * len(METRICS) - len(METRICS), 7 * len(METRICS), 7 * len(METRICS)], keys
+    # base keys + one metric set per group met: 6 groups -> 7 sets, rank 1's 5 groups -> 6 sets
+    assert keys == [7 * len(METRICS), 6 * len(METRICS), 7 * len(METRICS), 7 * len(METRICS)], keys
 
 
 def test_known_bad_control_old_per_key_sync_cross_pairs_the_groups(tmp_path):
