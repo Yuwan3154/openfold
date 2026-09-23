@@ -39,7 +39,7 @@ def _promote(w, chain, epoch=0, step=0, tm=0.8, sample=0, start=5, seed=0):
     aat = np.array([rc.restype_order[Q_FULL[p]] if p < len(Q_FULL) else 0
                     for p in range(start, start + L_CROP)], np.int8)
     w.submit(chain, epoch, step, tm, tm - 0.2, coords, mask,
-             aat, np.arange(start, start + L_CROP), sample=sample)
+             aat, np.arange(start, start + L_CROP), sample=sample, picked=(sample == 0), has_template=True)
 
 
 def _npzs(pool, chain):

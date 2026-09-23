@@ -41,7 +41,8 @@ def _write(pool_dir, chain, ridx, aat, *, n_atoms=3, epoch=0, step=0, rank=0, sa
     w = PromotedTemplateWriter(str(pool_dir), rank)
     w.submit(chain=chain, epoch=epoch, step=step, tm_pred=0.8, tm_template=0.5,
              coords37=coords, atom_mask37=mask, aatype=np.asarray(aat, np.int8),
-             residue_index=np.asarray(ridx, np.int32), sample=sample)
+             residue_index=np.asarray(ridx, np.int32), sample=sample, picked=(sample == 0),
+             has_template=True)
     w.close()
 
 

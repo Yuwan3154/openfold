@@ -37,7 +37,8 @@ def _write(pool_dir, chain, epoch, step, first, n, tm_pred=0.8, rank=0):
     coords = np.zeros((n, 37, 3), np.float32)
     coords[:, :3] = np.arange(n * 9, dtype=np.float32).reshape(n, 3, 3)
     w.submit(chain=chain, epoch=epoch, step=step, tm_pred=tm_pred, tm_template=0.5,
-             coords37=coords, atom_mask37=mask, aatype=aat, residue_index=ridx)
+             coords37=coords, atom_mask37=mask, aatype=aat, residue_index=ridx, picked=True,
+             has_template=True)
     w.close()
     return w
 
@@ -229,7 +230,8 @@ def test_promote_all_samples_do_not_overwrite_one_file(tmp_path):
         msk = np.zeros((L, 37), bool); msk[:, :3] = True
         crd = np.full((L, 37, 3), float(k + 1), np.float32)      # distinct coords per sample
         w.submit(chain="9xxx_A", epoch=0, step=7, tm_pred=0.5 + 0.01 * k, tm_template=0.4,
-                 coords37=crd, atom_mask37=msk, aatype=aat, residue_index=ridx, sample=k)
+                 coords37=crd, atom_mask37=msk, aatype=aat, residue_index=ridx, sample=k,
+                 picked=(k == 0), has_template=True)
     w.close()
 
     recs = [_json.loads(x) for x in (tmp_path / "rank0/index.jsonl").read_text().splitlines() if x]

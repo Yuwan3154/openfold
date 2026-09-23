@@ -1465,8 +1465,15 @@ class OpenFoldDataModule(pl.LightningDataModule):
     def _gen_dataloader(self, stage=None):
         generator = None
         if self.batch_seed is not None:
+            seed = self.batch_seed
+            if stage == "train":
+                # ⛔ A fixed seed replayed every epoch's per-position worker seeds and recycle counts
+                # (T-3b). Rank-free, so DDP ranks share one recycle schedule; a pure function of
+                # (batch_seed, epoch), so a resumed epoch reseeds exactly as the original did.
+                epoch = self.trainer.current_epoch if self.trainer is not None else 0
+                seed = int(np.random.SeedSequence([self.batch_seed, epoch]).generate_state(1)[0])
             generator = torch.Generator()
-            generator = generator.manual_seed(self.batch_seed)
+            generator = generator.manual_seed(seed)
 
         if stage == "train":
             dataset = self.train_dataset

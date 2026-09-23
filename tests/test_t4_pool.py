@@ -38,7 +38,8 @@ def _promote(w, chain, epoch=0, step=0, start=5, tm=0.8, seed=0):
     mask[:, :5] = True
     coords = rng.normal(size=(L_CROP, 37, 3)).astype(np.float32) * mask[..., None]
     w.submit(chain, epoch, step, tm, tm - 0.2, coords, mask,
-             _aatype_from_query(start, L_CROP), np.arange(start, start + L_CROP))
+             _aatype_from_query(start, L_CROP), np.arange(start, start + L_CROP),
+             picked=True, has_template=True)
     return coords, mask
 
 

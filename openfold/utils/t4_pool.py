@@ -78,17 +78,20 @@ class PromotedTemplateWriter:
             self.n_written += 1
 
     def submit(self, chain, epoch, step, tm_pred, tm_template,
-               coords37, atom_mask37, aatype, residue_index, sample=0):
+               coords37, atom_mask37, aatype, residue_index, sample=0, *, picked, has_template):
         """Queue one promoted prediction. Non-blocking: drops rather than stalling the step.
 
         `sample` distinguishes the K best-of-K samples of the SAME (chain, epoch, step) under
         --t4_promote_all. It is part of the on-disk filename; see the writer thread.
+        `picked` (this sample is the one the gradient step used) and `has_template` (the model was
+        handed a template) make t4/tm_pred, margin and promote_rate exactly recomputable from the index.
         """
         mask = np.asarray(atom_mask37, dtype=bool)
         rec = {
             "chain": chain, "epoch": int(epoch), "step": int(step), "sample": int(sample),
             "tm_pred": float(tm_pred), "tm_template": float(tm_template),
             "n_res": int(mask.shape[0]),
+            "picked": bool(picked), "has_template": bool(has_template),
         }
         item = (
             rec,

@@ -16,8 +16,6 @@ from pytorch_lightning import seed_everything
 from pytorch_lightning.utilities.rank_zero import rank_zero_info
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as _tmp
-_tmp.set_sharing_strategy("file_system")
 import wandb
 from deepspeed.utils import zero_to_fp32 
 
@@ -34,10 +32,18 @@ from openfold.utils.exponential_moving_average import ExponentialMovingAverage
 from openfold.utils.loss import AlphaFoldLoss, lddt_ca
 from openfold.utils.lr_schedulers import AlphaFoldLRScheduler
 from openfold.utils.multi_chain_permutation import multi_chain_permutation_align
+from openfold.utils.allrank_metrics import (
+    TrainEpochSums,
+    gather_records,
+    population_means,
+    population_records,
+    train_epoch_metrics,
+)
 from openfold.utils.superimposition import superimpose
 from openfold.utils.t4_self_distill import template_gate_metrics
 from openfold.utils.t4_pool import PromotedTemplatePool, PromotedTemplateWriter
 from openfold.utils.tensor_utils import tensor_tree_map
+from openfold.utils.worker_sharing import configure_worker_sharing
 from openfold.utils.validation_metrics import (
     drmsd,
     gdt_ts,
@@ -67,12 +73,22 @@ try:
 except ImportError:
     ADAPTIVE_WRAPPER_AVAILABLE = False
 
+# E3 hardening: file_descriptor sharing + soft fd limit raised to hard (openfold/utils/worker_sharing.py)
+_WORKER_SHARING = configure_worker_sharing()
+rank_zero_info(
+    f"worker sharing: {_WORKER_SHARING['strategy']}, RLIMIT_NOFILE soft {_WORKER_SHARING['soft_before']} -> "
+    f"{_WORKER_SHARING['soft_after']} (hard {_WORKER_SHARING['hard']})")
 
 # Population tags carried per entry by PDASingleSeqDataset(source_tag=...). Order fixes the
 # batch_idx blocks in per_entry_val_history.csv, so it must not be reshuffled once a run has
 # written rows: 0 = the PDA de novo design benchmark, 1/2 = the natural post-cutoff time split
 # partitioned by structural similarity to the training set.
 VAL_SOURCE_NAMES = {0: "pda", 1: "easy", 2: "hard"}
+# val_pop/* groups, fixed so every epoch logs one tag set; 'all' = the deduplicated full validation set.
+# train_overlap: entry verbatim in the training set (a diagnostic, kept IN the population). nonneural: PDA
+# entries whose paper names no neural predictor -- circularity-free, expected LOWER, n = 51 (paired SE ~0.008).
+VAL_POP_GROUPS = ("all", "train_overlap", "held_out", "nonneural", "neural_gated") + tuple(
+    f"src_{n}" for n in VAL_SOURCE_NAMES.values())
 
 
 class OpenFoldWrapper(pl.LightningModule):
@@ -107,6 +123,8 @@ class OpenFoldWrapper(pl.LightningModule):
         self._val_per_entry_epoch = 0
         self._val_per_entry_step = 0
         self._per_entry_csv_path = None
+        self._val_pop_records = []  # (entry, groups, metrics) per validated item, this rank, this val epoch
+        self._train_sums = TrainEpochSums()  # this rank's t4/explore sums, this train epoch
         self.save_hyperparameters()
     
     def _apply_block_replacement(self):
@@ -210,54 +228,9 @@ class OpenFoldWrapper(pl.LightningModule):
                 sync_dist=sync_epoch_metrics,  # Sync for epoch-level in distributed
             )
 
-        # Additionally split validation metrics by "is this PDA entry verbatim present in the
-        # model's own training set" (see ESMFOLD2_RECYCLE_SCALING.md PDA investigation) -- these
-        # entries stay IN the validation population (not filtered out), this just reports them
-        # separately as a diagnostic marker for whether the model has actually learned its own
-        # training data. Only active when PDASingleSeqDataset was built with
-        # --pda_train_overlap_ids (batch then carries "is_train_overlap"); the full-population
-        # val/{k} above is logged unconditionally either way.
-        if (not train) and "is_train_overlap" in batch:
-            suffix = "train_overlap" if bool(batch["is_train_overlap"].flatten()[0]) else "held_out"
-            for k, v in other_metrics.items():
-                self.log(
-                    f"{phase}/{k}_{suffix}",
-                    torch.mean(v),
-                    on_step=False, on_epoch=True, logger=True,
-                    sync_dist=sync_epoch_metrics,
-                )
-
-        # Combined three-population validation: report each population separately ALONGSIDE the
-        # unconditional val/{k} above, which Lightning already reduces over every validation batch
-        # and is therefore the combined mean across all populations -- i.e. the checkpoint monitor
-        # needs no special handling to be "the average over all validation combined".
-        # ⚠️ `sync_dist` is what makes each per-population mean correct under DDP: a rank only sees
-        # its own shard, so without the sync a population's mean would be one rank's slice of it.
-        # The circularity-free subset: entries whose paper names no neural structure predictor, so
-        # the reference population was never pre-screened by the model we are comparing against.
-        # ⚠️ Expected to score LOWER (pre-DL / rational-manual designs dominate it) -- it exists to
-        # remove AF2 circularity from the comparison, not to flatter the model. n is small (51), so
-        # the paired SE there is ~0.008 and differences under ~0.015 are not resolvable.
-        if (not train) and "in_nonneural_subset" in batch:
-            suffix = "nonneural" if bool(batch["in_nonneural_subset"].flatten()[0]) else "neural_gated"
-            for k, v in other_metrics.items():
-                self.log(
-                    f"{phase}/{k}_{suffix}",
-                    torch.mean(v),
-                    on_step=False, on_epoch=True, logger=True,
-                    sync_dist=sync_epoch_metrics,
-                )
-
-        if (not train) and "val_source" in batch:
-            src = int(batch["val_source"].flatten()[0])
-            name = VAL_SOURCE_NAMES.get(src, str(src))
-            for k, v in other_metrics.items():
-                self.log(
-                    f"{phase}/{k}_src_{name}",
-                    torch.mean(v),
-                    on_step=False, on_epoch=True, logger=True,
-                    sync_dist=sync_epoch_metrics,
-                )
+        # Per-population means are val_pop/*, exact over all ranks (on_validation_epoch_end). The per-key synced
+        # val/{k}_{group} tags they replace were cross-paired between groups and truncated (RAW Phase M §6(3)).
+        return other_metrics
 
     # ------------------------------------------------------------------------------------------
     # EXPLORATIVE MODELING (best-of-K). Draw K samples, keep one, backprop through only that one.
@@ -412,6 +385,9 @@ class OpenFoldWrapper(pl.LightningModule):
             # Without it, a hybrid run's logs cannot be split into its two phases after the fact.
             self.log("explore/using_true_loss", 1.0 if _sel == "loss" else 0.0,
                      on_step=True, on_epoch=True, logger=True)
+            # the same scalars summed on EVERY rank -> explore_all/* at epoch end (the tags above are rank 0's)
+            self._train_sums.add_explore_step(_pick, _best_loss, _losses, _confs, _sel == "loss",
+                                              _ladder[_pick] if _ladder is not None else None)
             if _ladder is not None:
                 # ⭐⭐ THE DIAGNOSTIC THE LADDER TURNS ON. If the coldest rung wins almost always, the
                 # ladder buys nothing for the GRADIENT -- but note that under promote-all the hot rungs
@@ -561,6 +537,8 @@ class OpenFoldWrapper(pl.LightningModule):
                      on_step=True, on_epoch=True, logger=True)
             self.log("t4/has_template", m["has_template"].mean(), on_step=True, on_epoch=True,
                      logger=True)
+            # the same quantities summed on EVERY rank -> t4_all/* at epoch end (the tags above are rank 0's)
+            self._train_sums.add_t4_step(m["tm_pred"], m["tm_template"], m["has_template"], m["promote"])
 
             # T4 phase 3: PERSIST the promotions. Two independent guards, so the gate keeps working
             # as pure measurement when either is off: a pool dir must be configured, and the warmup
@@ -589,6 +567,9 @@ class OpenFoldWrapper(pl.LightningModule):
                                 # ⛔ WITHOUT sample=_j all K rungs overwrite one file
                                 sample=_j,
                                 tm_pred=float(_tp[i]), tm_template=float(_tt[i]),
+                                # which rung trained (the gradient step's sample) and whether a template was
+                                # given, so tm_pred / margin / promote are exactly recomputable from the index
+                                picked=(_j == _pick), has_template=bool(m["has_template"][i]),
                                 coords37=_crd[i].numpy(),
                                 atom_mask37=batch["atom37_atom_exists"][i].detach().cpu().numpy(),
                                 aatype=batch["aatype"][i].detach().cpu().numpy(),
@@ -596,6 +577,7 @@ class OpenFoldWrapper(pl.LightningModule):
                             )
                     self.log("t4/promoted_per_step", float(len(_stash) * _stash[0][2].shape[0]),
                              on_step=True, on_epoch=True, logger=True)
+                    self._train_sums.add_t4_promoted(len(_stash) * _stash[0][2].shape[0])
                 sel = [] if _stash else torch.nonzero(
                     m["promote"] > 0, as_tuple=False).flatten().tolist()
                 if sel:
@@ -610,6 +592,8 @@ class OpenFoldWrapper(pl.LightningModule):
                             epoch=int(self.current_epoch), step=int(self.global_step),
                             tm_pred=float(m["tm_pred"][i]),
                             tm_template=float(m["tm_template"][i]),
+                            # `outputs` is the gradient step's own forward (the replayed winner under explore)
+                            picked=True, has_template=bool(m["has_template"][i]),
                             # the PREDICTION is what gets promoted; atom37_atom_exists is the
                             # per-residue atom validity for its own sequence, which is what a
                             # template's mask means
@@ -640,6 +624,7 @@ class OpenFoldWrapper(pl.LightningModule):
     def on_validation_epoch_start(self):
         self._val_ptm_calib_pairs = []
         self._val_per_entry_records = []
+        self._val_pop_records = []
 
     def validation_step(self, batch, batch_idx):
         # At the start of validation, load the EMA weights
@@ -678,7 +663,8 @@ class OpenFoldWrapper(pl.LightningModule):
             outputs, batch, _return_breakdown=True
         )
 
-        self._log(loss_breakdown, batch, outputs, train=False)
+        _metrics = self._log(loss_breakdown, batch, outputs, train=False)
+        self._val_pop_records.extend(population_records(batch, _metrics, VAL_SOURCE_NAMES))
         
     def on_validation_epoch_end(self):
         # Restore the model weights to normal
@@ -705,6 +691,13 @@ class OpenFoldWrapper(pl.LightningModule):
             )
             self.log("val/ptm_calibration_spearman", calibration, logger=True, rank_zero_only=True)
 
+        # val_pop/*: exact per-population means over ALL ranks' entries, deduplicated (DistributedSampler pads
+        # with repeats). ONE all_gather_object on every rank whatever it validated, so it cannot desync.
+        _gathered = gather_records(self._val_pop_records, self.trainer.world_size > 1)
+        self._val_pop_records = []
+        for k, v in population_means(_gathered, VAL_POP_GROUPS).items():
+            self.log(f"val_pop/{k}", v, logger=True, rank_zero_only=True)
+
         # Capture epoch/step HERE (still correct for "the epoch that just validated") since the
         # actual gather+write is deferred to on_train_epoch_start, by which point Lightning's own
         # epoch counter has already advanced to the NEXT epoch -- see _flush_per_entry_records.
@@ -722,7 +715,15 @@ class OpenFoldWrapper(pl.LightningModule):
         # fit_loop.py on_advance_end's callback/module-hook ordering) moves it out of that race
         # window. on_fit_end below is the safety-net flush for the final epoch, which has no
         # "next" on_train_epoch_start to defer to.
+        self._train_sums.reset()
         self._flush_per_entry_records()
+
+    def on_train_epoch_end(self):
+        # t4_all/*, explore_all/*: every rank's sums, ONE all_reduce(SUM) on every rank, ratios formed after it.
+        # A mid-epoch resume skips on_train_epoch_start: the sums start at zero and n_steps counts this process's.
+        _totals = self._train_sums.all_reduce(self.trainer.world_size > 1, self.device)
+        for k, v in train_epoch_metrics(_totals).items():
+            self.log(k, v, logger=True, rank_zero_only=True)
 
     def on_fit_end(self):
         self._flush_per_entry_records()
