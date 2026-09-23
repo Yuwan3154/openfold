@@ -112,8 +112,9 @@ class PromotedTemplateWriter:
 class PromotedTemplatePool:
     """Read side: merges every rank's index and serves promoted templates per chain.
 
-    Rebuilt at epoch start (`refresh()`), so an epoch trains on a fixed snapshot rather than a pool
-    mutating underneath it -- otherwise two dataloader workers could disagree about what exists.
+    Rebuilt once per epoch (`refresh()`, called by `OpenFoldDataModule.train_dataloader()` BEFORE the
+    epoch's workers fork), so an epoch trains on a fixed snapshot rather than a pool mutating
+    underneath it -- otherwise two dataloader workers could disagree about what exists.
     """
 
     def __init__(self, pool_dir: str, max_per_chain: int = 0):

@@ -1510,21 +1510,34 @@ class OpenFoldDataModule(pl.LightningDataModule):
             collate_fn=batch_collator,
         )
 
-        # ⛔⛔ The T4 promoted pool is refreshed in the MAIN process at epoch start, and reaches the
-        # workers only because they are re-forked for each epoch's iterator. Turning
-        # persistent_workers on (the [[proteina_dataloader_cow_leak]] fix) would freeze every
-        # worker's pool at the first epoch's snapshot and training would carry on against a stale
+        # ⛔⛔ The T4 promoted pool is refreshed in the MAIN process by train_dataloader() just before
+        # this loader is built, and reaches the workers only because this loader's iterators fork
+        # them afterwards. Turning persistent_workers on (the [[proteina_dataloader_cow_leak]] fix)
+        # would let workers outlive the snapshot they were forked with and train against a stale
         # template set with no error. Assert instead of relying on the default staying False.
         if stage == "train" and self.t4_promoted_pool is not None:
             assert not getattr(dl, "persistent_workers", False), (
                 "T4 promotion requires persistent_workers=False: refresh() runs in the main "
-                "process at epoch start and only reaches workers when they are re-forked. With "
-                "persistent workers the pool silently freezes at the first epoch's contents."
+                "process in train_dataloader() and only reaches workers forked after it. "
+                "Persistent workers would keep serving the snapshot they were forked with."
             )
 
         return dl
 
     def train_dataloader(self):
+        # ⛔⛔ Refresh T4 here: PL forks this loader's first workers in setup_data, BEFORE
+        # on_train_epoch_start, and does not re-fork in a process's first (or restarted) epoch.
+        if self.t4_promoted_pool is not None:
+            assert self.trainer.reload_dataloaders_every_n_epochs == 1, (
+                "T4 promotion needs --reload_dataloaders_every_n_epochs 1: the promoted pool is "
+                "refreshed only when Lightning calls train_dataloader(), so with "
+                f"{self.trainer.reload_dataloaders_every_n_epochs} it would silently stop refreshing."
+            )
+            _n = self.t4_promoted_pool.refresh()
+            rank_zero_info(
+                f"T4 promoted pool @ epoch {self.trainer.current_epoch}: {_n} templates over "
+                f"{len(self.t4_promoted_pool.by_chain)} chains"
+            )
         return self._gen_dataloader("train")
 
     def val_dataloader(self):

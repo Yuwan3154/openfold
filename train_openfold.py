@@ -724,20 +724,6 @@ class OpenFoldWrapper(pl.LightningModule):
         # "next" on_train_epoch_start to defer to.
         self._flush_per_entry_records()
 
-        # T4 phase 3: rebuild the promoted-template snapshot for this epoch. Done at epoch START,
-        # not on every write, so an epoch trains against a FIXED pool -- otherwise two dataloader
-        # workers could disagree about what exists. Whatever the writer thread has not flushed yet
-        # simply appears one epoch later, which costs nothing.
-        _dm = getattr(self.trainer, "datamodule", None)
-        _pool = getattr(_dm, "t4_promoted_pool", None) if _dm is not None else None
-        if _pool is not None:
-            _n = _pool.refresh()
-            rank_zero_info(
-                f"T4 promoted pool @ epoch {self.current_epoch}: {_n} templates over "
-                f"{len(_pool.by_chain)} chains"
-
-            )
-
     def on_fit_end(self):
         self._flush_per_entry_records()
         if getattr(self, "_t4_writer", None) is not None:
@@ -1367,8 +1353,8 @@ def main(args):
             args.force_query_only_msa = False
 
         # T4 phase 3: the read side. Built here so it can be handed to the datamodule; refreshed
-        # at every epoch start by the module's on_train_epoch_start. ⭐ Nothing about this depends on
-        # which run produced the base weights, so T4 stacks on T1 or T2 identically.
+        # by the datamodule's train_dataloader() before each epoch's workers fork. ⭐ Nothing about
+        # this depends on which run produced the base weights, so T4 stacks on T1 or T2 identically.
         _t4_pool = None
         if getattr(args, "t4_n_promoted", 0) > 0:
             assert args.t4_pool_dir is not None, (
