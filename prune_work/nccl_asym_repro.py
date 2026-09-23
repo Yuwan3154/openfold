@@ -42,6 +42,7 @@ def main():
     ap.add_argument("--n_params", type=int, required=True, help="trainable parameter TENSORS (E4: 4471)")
     ap.add_argument("--bucket_bytes", required=True, help="comma-separated fp32 gradient-bucket sizes in bytes")
     ap.add_argument("--pg_timeout_s", type=int, required=True)
+    ap.add_argument("--steps", type=int, default=1, help="training-like steps of bucket all-reduces after the pair")
     args = ap.parse_args()
 
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -75,10 +76,18 @@ def main():
         dist.broadcast(sizes, src=0)
         ok &= check("bucket sizes broadcast", sizes.cpu().tolist() == buckets, rank)
 
-    for i, n in enumerate(buckets):
-        g = torch.full((n,), float(rank + 1), device=device)
-        dist.all_reduce(g)
-        ok &= check(f"bucket {i} all_reduce ({n * 4} B)", bool((g == expected_sum).all()), rank)
+    for step in range(args.steps):
+        bad = 0
+        for i, n in enumerate(buckets):
+            g = torch.full((n,), float(rank + 1), device=device)
+            dist.all_reduce(g)
+            if args.steps == 1:
+                ok &= check(f"bucket {i} all_reduce ({n * 4} B)", bool((g == expected_sum).all()), rank)
+            else:
+                bad += int(not bool((g == expected_sum).all()))
+        if args.steps > 1:
+            print(f"[rank {rank}] step {step}: {bad} of {len(buckets)} bucket all-reduces CORRUPT", flush=True)
+            ok &= bad == 0
 
     dist.barrier()
     print(f"[rank {rank}] COMPLETED asym={args.asym} next={args.next} data={'OK' if ok else 'CORRUPT'}", flush=True)
