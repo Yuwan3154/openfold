@@ -664,7 +664,8 @@ class OpenFoldWrapper(pl.LightningModule):
         )
 
         _metrics = self._log(loss_breakdown, batch, outputs, train=False)
-        self._val_pop_records.extend(population_records(batch, _metrics, VAL_SOURCE_NAMES))
+        if "batch_idx" in batch:  # only PDASingleSeqDataset carries entry identity (as the per-entry CSV)
+            self._val_pop_records.extend(population_records(batch, _metrics, VAL_SOURCE_NAMES))
         
     def on_validation_epoch_end(self):
         # Restore the model weights to normal
