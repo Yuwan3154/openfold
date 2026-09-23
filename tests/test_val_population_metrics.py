@@ -36,7 +36,7 @@ METRICS = ("lddt_ca", "drmsd_ca", "alignment_rmsd", "recall_2A", "gdt_ts", "gdt_
 
 # entry -> (val_source, is_train_overlap, in_nonneural_subset or None for non-PDA entries)
 # A: 14 entries, so DistributedSampler pads 16 with entries 0 and 1 (onto ranks 2 and 3); rank 0 meets
-#    nonneural before train_overlap, rank 2 the reverse, and rank 3 holds no nonneural entry at all.
+#    nonneural before train_overlap, rank 2 the reverse, and rank 1 holds no train_overlap or src_easy entry.
 SCENARIO_A = {0: (0, 0, 1), 1: (0, 0, 0), 2: (0, 1, 0), 3: (1, 0, None), 4: (0, 1, 0), 5: (2, 0, None),
               6: (1, 0, None), 7: (2, 1, None), 8: (0, 0, 1), 9: (0, 0, 1), 10: (0, 0, 1), 11: (1, 0, None),
               12: (2, 0, None), 13: (0, 0, 0)}
@@ -184,7 +184,8 @@ def test_gloo_4_ranks_issue_the_same_collectives_and_get_the_exact_pooled_means(
 
 
 def test_known_bad_control_old_per_key_sync_misses_keys_when_a_group_is_absent_from_a_rank():
-    """Scenario A under the removed logging: rank 3 would sync 6 fewer keys (24 fewer NCCL ops) -> desync.
+    """Scenario A under the removed logging: rank 1 meets neither train_overlap nor src_easy, so it would sync
+    12 fewer keys (48 fewer NCCL ops) than the other ranks -> desync.
 
     Counted, not run: running it would hang or mis-pair the collectives.
     """
@@ -195,7 +196,8 @@ def test_known_bad_control_old_per_key_sync_misses_keys_when_a_group_is_absent_f
             _old_log(rc, *_batch(SCENARIO_A, idx, r))
         keys.append(len(rc))
     print("synced keys per rank (old scheme):", keys)
-    assert keys[3] == keys[0] - len(METRICS)
+    # rank r gets entries r::4 of [0..13, 0, 1]; rank 1 = {1, 5, 9, 13} lacks train_overlap and src_easy
+    assert keys == [7 * len(METRICS), 6 * len(METRICS) - len(METRICS), 7 * len(METRICS), 7 * len(METRICS)], keys
 
 
 def test_known_bad_control_old_per_key_sync_cross_pairs_the_groups(tmp_path):
