@@ -758,10 +758,13 @@ class OpenFoldWrapper(pl.LightningModule):
             dist.all_gather_object(gathered_recs, records)
             records = [r for rank_recs in gathered_recs for r in rank_recs]
         self._val_per_entry_records = []  # consumed; avoids re-flushing the same epoch twice
+        # trainer.log_dir BROADCASTS from rank 0 (Lightning: "call this on all processes"), so every rank
+        # must evaluate it. Rank-0-only, it desynced DDP by 2 collectives: the E4 hang (T-1, 2026-09-22).
+        # `records` is post-gather, hence identical on every rank, so this branch is rank-symmetric.
+        if records and self._per_entry_csv_path is None:
+            log_dir = getattr(self.trainer, "log_dir", None) or "."
+            self._per_entry_csv_path = os.path.join(log_dir, "per_entry_val_history.csv")
         if records and self.trainer.is_global_zero:
-            if self._per_entry_csv_path is None:
-                log_dir = getattr(self.trainer, "log_dir", None) or "."
-                self._per_entry_csv_path = os.path.join(log_dir, "per_entry_val_history.csv")
             write_header = not os.path.exists(self._per_entry_csv_path)
             with open(self._per_entry_csv_path, "a", newline="") as fh:
                 writer = csv.writer(fh)
