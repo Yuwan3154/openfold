@@ -36,7 +36,10 @@ def load(pdb):
     ss = np.array(ss)[prot]
     xyz = t.xyz[0] * 10.0  # nm -> A
     ca = np.array([xyz[r.atom("CA").index] for r in res])
-    cb = np.array([xyz[(r.atom("CB") if r.name != "GLY" else r.atom("CA")).index] for r in res])
+    # CB, or CA for Gly; a non-Gly residue whose CB is unresolved gets NaN and is resolved by the caller
+    cb = np.array([xyz[r.atom("CA" if r.name == "GLY" else "CB").index]
+                   if (r.name == "GLY" or any(x.name == "CB" for x in r.atoms)) else np.full(3, np.nan)
+                   for r in res])
     names = [r.name for r in res]
     return ss, ca, cb, names
 
@@ -98,18 +101,23 @@ def main():
     nat = {}
     for c in sorted(df["chain_id"].unique()):
         ss, ca, cb, names = load(os.path.join(a.natives, f"{c}.pdb"))
+        no_cb = np.isnan(cb).any(1)
+        cb = np.where(no_cb[:, None], ca, cb)  # same CA fallback is applied to every template of this chain
         cm, sep = contacts(cb)
         els = elements(ss)
-        nat[c] = dict(ss=ss, ca=ca, cb=cb, names=names, cmap=cm, sep=sep, els=els,
+        nat[c] = dict(ss=ss, ca=ca, cb=cb, names=names, cmap=cm, sep=sep, els=els, no_cb=no_cb,
                       epairs=element_pairs(cm, els))
         print(f"native {c}: L={len(ss)} H={np.mean(ss == 'H'):.2f} E={np.mean(ss == 'E'):.2f} "
-              f"elements={len(els)} contacts={cm.sum() // 2} element-pairs={len(nat[c]['epairs'])}")
+              f"elements={len(els)} contacts={cm.sum() // 2} element-pairs={len(nat[c]['epairs'])} "
+              f"CA-for-missing-CB={int(no_cb.sum())}")
 
     rows, erows = [], []
     for _, r in df.iterrows():
         n = nat[r["chain_id"]]
         ss, ca, cb, names = load(r["pdb_file"])
         assert names == n["names"], f"{r['pdb_file']}: residue sequence differs from native"
+        cb = np.where(n["no_cb"][:, None], ca, cb)
+        assert not np.isnan(cb).any(), f"{r['pdb_file']}: template lacks a CB the native has"
         cm, _ = contacts(cb)
         glob = superpose(ca, n["ca"])
         rec = dict(model=r["model"], chain=r["chain_id"], rewind=int(r["rewind_steps"]),

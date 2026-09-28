@@ -27,7 +27,10 @@ print(f"band ({lo},{hi}); chains {len(tm)}, with >=1 in-band rung {has.sum()}; "
       f"in-band rungs/chain mean {n_in[has].mean():.1f} median {np.median(n_in[has]):.0f}")
 
 # per-draw distribution: each chain equally likely, each of its in-band rungs equally likely
-edges = np.round(np.arange(lo, hi + 1e-9, 0.1), 2)
+# float32 0.9 is 0.8999999, so arange(lo, hi) silently drops the last bin; build from rounded ends
+lo_r, hi_r = round(lo, 2), round(hi, 2)
+edges = np.round(np.linspace(lo_r, hi_r, int(round((hi_r - lo_r) / 0.1)) + 1), 2)
+edges[0], edges[-1] = lo, hi
 w = np.where(band, 1.0 / np.maximum(n_in, 1)[:, None], 0.0)
 draw_hist, _ = np.histogram(tm[band], bins=edges, weights=w[band])
 draw_hist = draw_hist / draw_hist.sum()
