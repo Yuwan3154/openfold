@@ -149,7 +149,11 @@ def do_promoted(job):
                     and not np.isnan(nat37[j, [0, 1, 2, 4]]).any()):
                 pr.append(i)
                 nr.append(j)
-        pr, nr = np.array(pr), np.array(nr)
+        pr, nr = np.array(pr, dtype=int), np.array(nr, dtype=int)
+        if len(pr) < 3:  # nothing to compare (e.g. a crop over residues whose native backbone is unresolved)
+            rows.append(dict(source="promoted", chain=chain, hit=r["npz"], rank=int(r["epoch"]),
+                             status="too_few_pairs", n_unpaired_real=int(real.sum()) - len(pr)))
+            continue
         assert (aat_p[pr] == aat_n[nr]).all(), (chain, r["npz"], "promoted/native residue types disagree")
         has_cb = mask_n[nr, 3] & am[pr, 3] & ~np.isnan(nat37[nr, 3, 0])
         top = backbone_top(aat_n[nr], has_cb)
@@ -188,6 +192,7 @@ def main():
     p.add_argument("--hits", required=True)
     p.add_argument("--out-dir", required=True)
     p.add_argument("--workers", type=int, default=16)
+    p.add_argument("--only", choices=["natural", "promoted"])
     a = p.parse_args()
     hits = json.load(open(a.hits))
     man = {r["chain"]: r for r in csv.DictReader(open(MANIFEST))}
@@ -217,6 +222,8 @@ def main():
                 for c, v in t4.items() if v and c in man and c in qrow and c not in amb]
     os.makedirs(a.out_dir, exist_ok=True)
     for name, fn, jobs in (("natural", do_natural, nat_jobs), ("promoted", do_promoted, pro_jobs)):
+        if a.only and name != a.only:
+            continue
         rows = []
         with Pool(a.workers) as pool:
             for rr in pool.imap_unordered(fn, jobs):
