@@ -59,16 +59,20 @@ def main():
     print("natural coverage (aligned pairs / native length): median",
           round(float(nat.coverage.median()), 3), "IQR", nat.coverage.quantile([.25, .75]).round(3).tolist())
 
-    fig, ax = plt.subplots(1, 4, figsize=(16, 3.8))
+    share = t.templates / t.groupby(level=0).templates.transform("sum")
+    fig, ax = plt.subplots(1, 5, figsize=(19, 3.8))
+    panels = [(None, "share of the source's templates"), ("q3", "Q3 vs native"), ("E->C", "strand → coil"),
+              ("E->H", "strand → helix"), ("C->H", "coil → helix")]
     for src, g in t.groupby(level=0):
-        x = [iv.left + 0.05 if iv.right <= 1 else 0.95 for iv in g.index.get_level_values(1)]
-        for k, (col, lab) in enumerate([("q3", "Q3 vs native"), ("E->H", "strand → helix"),
-                                        ("C->H", "coil → helix"), ("H->E", "helix → strand")]):
-            ax[k].plot(x, g[col], "o-", color=SRC_C[src], label=src)
+        x = [iv.mid if iv.right <= 1 else (iv.left + 1) / 2 for iv in g.index.get_level_values(1)]
+        for k, (col, lab) in enumerate(panels):
+            y = share.loc[src] if col is None else g[col]
+            ax[k].plot(x, y, "o-", color=SRC_C[src], label=src)
             ax[k].set_title(lab, fontsize=10)
-            ax[k].set_xlabel("TM to native (bin)")
+            ax[k].set_xlabel("TM to native (bin midpoint)")
+            ax[k].set_xlim(0, 1)
     ax[0].legend(frameon=False)
-    for k in (1, 2, 3):
+    for k in (0, 2, 3, 4):
         ax[k].set_ylim(bottom=0)
     fig.suptitle("SSE agreement with the native by template source (same chains)", fontsize=10)
     fig.tight_layout()
