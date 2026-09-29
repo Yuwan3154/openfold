@@ -13,6 +13,7 @@ Run: <proteinebm env>/bin/python pool_sse.py --index index_band.npz --templates-
 import argparse
 import csv
 import gzip
+import json
 import os
 import sys
 import zlib
@@ -128,9 +129,19 @@ def do_chain(job):
     d = np.load(npz, allow_pickle=False)
     mask, aat, resi = d["atom_mask"], d["aatype"], d["residue_index"]
     assert d["coords"].shape[0] == len(tms), (chain, d["coords"].shape, len(tms))
-    has_cb = mask[:, 3].copy()
-    nat, _ = native_xyz37(pdb, resi, aat)
-    assert not np.isnan(nat[:, [0, 1, 2, 4]][mask[:, [0, 1, 2, 4]]]).any(), chain
+    nat, n_oxt = native_xyz37(pdb, resi, aat)
+    bb = [0, 1, 2, 4]
+    # 3.3% of chains (precheck 2026-09-28): the generator's mask claims backbone atoms the native PDB lacks.
+    # Those residues are dropped from BOTH sides of every comparison and counted in n_dropped.
+    keep = mask[:, bb].all(1) & ~np.isnan(nat[:, bb]).any((1, 2))
+    n_drop = int((~keep).sum())
+    if keep.sum() < 3:
+        return [dict(chain=chain, status="too_few_backbone", L=len(aat), n_dropped=n_drop)]
+    x_all = np.zeros((len(tms), len(aat), 37, 3), np.float32)
+    for k in range(len(tms)):
+        x_all[k][mask] = d["coords"][k]
+    mask, aat, nat, x_all = mask[keep], aat[keep], nat[keep], x_all[:, keep]
+    has_cb = mask[:, 3] & ~np.isnan(nat[:, 3, 0])
     top = backbone_top(aat, has_cb)
     ss_n = ss_of(top, pack(nat, has_cb))
     ca_n = nat[:, 1]
@@ -141,12 +152,12 @@ def do_chain(job):
     model = "cc91" if span > cutoff else "cc89"
     rows = []
     for k in range(len(tms)):
-        x = np.zeros((len(aat), 37, 3), np.float32)
-        x[mask] = d["coords"][k]
+        x = x_all[k]
         ss = ss_of(top, pack(x, has_cb))
         ca = x[:, 1]
         cb = np.where(has_cb[:, None], x[:, 3], ca)
-        rec = dict(chain=chain, model=model, rewind=int(rewinds[k]), tm=float(tms[k]), L=len(aat),
+        rec = dict(chain=chain, status="ok", model=model, rewind=int(rewinds[k]), tm=float(tms[k]), L=len(aat),
+                   n_dropped=n_drop, n_oxt_as_o=n_oxt,
                    fH_native=float(np.mean(ss_n == "H")), fE_native=float(np.mean(ss_n == "E")),
                    n_elements=len(els))
         rec.update(metrics(ss_n, ca_n, cb_n, cm_n, sep, els, ep_n, ss, ca, cb))
@@ -232,11 +243,16 @@ def main():
     os.makedirs(a.out_dir, exist_ok=True)
     fields = None
     outs = {}
+    skipped = []
     done = 0
     with Pool(a.workers) as pool:
         for rows in pool.imap_unordered(do_chain, jobs, chunksize=8):
-            if fields is None:
+            if fields is None and rows[0]["status"] == "ok":
                 fields = list(rows[0].keys())
+            if rows[0]["status"] != "ok":
+                skipped.append(rows[0])
+                done += 1
+                continue
             w = done % a.workers
             if w not in outs:
                 fh = gzip.open(os.path.join(a.out_dir, f"pool_sse_{w:02d}.csv.gz"), "wt")
@@ -249,7 +265,10 @@ def main():
                 print(f"{done}/{len(jobs)} chains", flush=True)
     for fh, _ in outs.values():
         fh.close()
-    print(f"DONE {done} chains", flush=True)
+    with open(os.path.join(a.out_dir, "pool_sse_skipped.json"), "w") as fh:
+        json.dump(skipped, fh)
+    print(f"DONE {done} chains; skipped {len(skipped)} (too few backbone residues), listed in pool_sse_skipped.json",
+          flush=True)
 
 
 if __name__ == "__main__":
