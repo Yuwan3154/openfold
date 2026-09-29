@@ -144,7 +144,9 @@ def do_promoted(job):
         pr, nr = [], []
         for i in np.flatnonzero(real):
             j = q_to_row.get(int(ri[i]))
-            if j is not None and mask_n[j, [0, 1, 2, 4]].all():
+            # backbone must exist on BOTH sides: 3.3% of natives lack an atom the npz mask claims (pool precheck)
+            if (j is not None and mask_n[j, [0, 1, 2, 4]].all() and am[i, [0, 1, 2, 4]].all()
+                    and not np.isnan(nat37[j, [0, 1, 2, 4]]).any()):
                 pr.append(i)
                 nr.append(j)
         pr, nr = np.array(pr), np.array(nr)
@@ -161,6 +163,7 @@ def do_promoted(job):
             tm, _, _, _ = usalign_pairs(fa, fb, ("-TMscore", "5"))
         pairs = [(k, k, True) for k in range(len(pr))]
         rec = dict(source="promoted", chain=chain, hit=r["npz"], rank=int(r["epoch"]), status="ok", tm=tm,
+                   n_unpaired_real=int(real.sum()) - len(pr),
                    L_native=len(resi), L_template=int(real.sum()), coverage=len(pr) / len(resi),
                    fH_native=float(np.mean(ss_n == "H")), fE_native=float(np.mean(ss_n == "E")),
                    tm_pred=r["tm_pred"])
