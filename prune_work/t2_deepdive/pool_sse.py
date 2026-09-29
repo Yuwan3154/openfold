@@ -85,16 +85,42 @@ def metrics(ss_n, ca_n, cb_n, cm_n, sep, els, ep_n, ss, ca, cb):
 
 
 def native_xyz37(pdb, residue_index, aatype):
+    """Native N/CA/C/CB/O by residue number; returns (xyz, n_oxt_as_o).
+
+    A C-terminal residue deposited with OXT but no O has its O slot set in the generator's mask (1vol_A),
+    so that residue's template O is compared against the native's OXT: the same carboxyl oxygen position.
+    """
     t = md.load_pdb(pdb)
     by_num = {r.resSeq: r for r in t.topology.residues if r.is_protein}
     xyz = np.full((len(residue_index), 37, 3), np.nan, np.float32)
+    n_oxt = 0
     for i, n in enumerate(residue_index):
         r = by_num[int(n)]
         assert RESTYPES3[min(int(aatype[i]), 20)] == r.name or r.name not in RESTYPES3, (pdb, n, r.name)
-        for a in r.atoms:
-            if a.name in IDX:
-                xyz[i, IDX[a.name]] = t.xyz[0, a.index] * 10.0
-    return xyz
+        names = {a.name: a for a in r.atoms}
+        for nm in IDX:
+            if nm in names:
+                xyz[i, IDX[nm]] = t.xyz[0, names[nm].index] * 10.0
+        if "O" not in names and "OXT" in names:
+            xyz[i, IDX["O"]] = t.xyz[0, names["OXT"].index] * 10.0
+            n_oxt += 1
+    return xyz, n_oxt
+
+
+def precheck_chain(job):
+    """Everything do_chain asserts about native-vs-mask agreement, counted instead of asserted."""
+    chain, npz, pdb, *_ = job
+    d = np.load(npz, allow_pickle=False)
+    mask, aat, resi = d["atom_mask"], d["aatype"], d["residue_index"]
+    t = md.load_pdb(pdb)
+    nums = {r.resSeq for r in t.topology.residues if r.is_protein}
+    absent = [int(n) for n in resi if int(n) not in nums]
+    if absent:
+        return dict(chain=chain, kind="residue_absent", n=len(absent), oxt=0)
+    nat, n_oxt = native_xyz37(pdb, resi, aat)
+    bb = [0, 1, 2, 4]
+    miss = int(np.isnan(nat[:, bb][mask[:, bb]]).any(-1).sum())
+    return dict(chain=chain, kind="backbone_missing" if miss else "ok", n=miss, oxt=n_oxt)
 
 
 def do_chain(job):
@@ -103,7 +129,7 @@ def do_chain(job):
     mask, aat, resi = d["atom_mask"], d["aatype"], d["residue_index"]
     assert d["coords"].shape[0] == len(tms), (chain, d["coords"].shape, len(tms))
     has_cb = mask[:, 3].copy()
-    nat = native_xyz37(pdb, resi, aat)
+    nat, _ = native_xyz37(pdb, resi, aat)
     assert not np.isnan(nat[:, [0, 1, 2, 4]][mask[:, [0, 1, 2, 4]]]).any(), chain
     top = backbone_top(aat, has_cb)
     ss_n = ss_of(top, pack(nat, has_cb))
@@ -163,6 +189,7 @@ def main():
     p.add_argument("--limit", type=int, default=0, help="first N chains only (smoke test)")
     p.add_argument("--validate-tm-csv")
     p.add_argument("--validate-natives")
+    p.add_argument("--precheck", action="store_true", help="count native-vs-mask mismatches over every chain")
     a = p.parse_args()
     if a.validate_tm_csv:
         validate(a.validate_tm_csv, a.validate_natives)
@@ -191,6 +218,17 @@ def main():
     if a.limit:
         jobs = jobs[: a.limit]
     print(f"{len(jobs)} chains, {sum(len(j[5]) for j in jobs)} templates", flush=True)
+    if a.precheck:
+        from collections import Counter
+        with Pool(a.workers) as pool:
+            res = list(pool.imap_unordered(precheck_chain, jobs, chunksize=64))
+        kinds = Counter(r["kind"] for r in res)
+        print(f"precheck {len(res)} of {len(jobs)} chains: {dict(kinds)}; chains using OXT as O: "
+              f"{sum(r['oxt'] > 0 for r in res)} ({sum(r['oxt'] for r in res)} residues)")
+        for r in res:
+            if r["kind"] != "ok":
+                print("  ", r)
+        return
     os.makedirs(a.out_dir, exist_ok=True)
     fields = None
     outs = {}
