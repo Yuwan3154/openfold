@@ -55,6 +55,10 @@ def main(mode):
     out = {"mode": mode, "worker_sharing": worker_sharing.__file__, "data_modules": data_modules.__file__}
     print("probe imports:", json.dumps(out), flush=True)
     if mode in ("configure", "new"):
+        # start from the A6000's default soft limit whatever the calling shell set (a launcher's `ulimit -n`
+        # would otherwise make the raise a no-op and these modes pass without testing it)
+        _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (OLD_SOFT_LIMIT, hard))
         out["configured"] = worker_sharing.configure_worker_sharing()
     elif mode == "old_fd1024":
         _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)

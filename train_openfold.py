@@ -325,6 +325,8 @@ class OpenFoldWrapper(pl.LightningModule):
         # Run the model
         _K = int(getattr(self, "explore_k", 1) or 1)
         _explore = _K > 1 and self.current_epoch >= int(getattr(self, "explore_after_epoch", 0))
+        # the T4 block below reads _stash on EVERY step, explore or not (--explore_k 1, or before explore_after_epoch)
+        _stash = []
         if _explore:
             _sel = self._resolve_explore_select()
             _snaps, _confs, _losses = [], [], []
@@ -336,7 +338,6 @@ class OpenFoldWrapper(pl.LightningModule):
             # promote-all needs each sample's own coords, and the scoring outputs are otherwise
             # discarded at the end of their loop iteration. Stashed on CPU: ~37 KiB per sample.
             _promote_all = bool(getattr(self, "t4_promote_all", False))
-            _stash = []
             # ⛔⛔ The ladder MUTATES a config field that model.forward reads on EVERY call
             # (model.py:286), and that config outlives training_step. It must be put back before the
             # step returns -- see the restore after the replay forward below.
@@ -568,7 +569,7 @@ class OpenFoldWrapper(pl.LightningModule):
                                 sample=_j,
                                 tm_pred=float(_tp[i]), tm_template=float(_tt[i]),
                                 # which rung trained (the gradient step's sample) and whether a template was
-                                # given, so tm_pred / margin / promote are exactly recomputable from the index
+                                # given; the step-level t4/* scalars stay only partly reconstructible from the index
                                 picked=(_j == _pick), has_template=bool(m["has_template"][i]),
                                 coords37=_crd[i].numpy(),
                                 atom_mask37=batch["atom37_atom_exists"][i].detach().cpu().numpy(),
@@ -706,16 +707,12 @@ class OpenFoldWrapper(pl.LightningModule):
         self._val_per_entry_step = self.global_step
 
     def on_train_epoch_start(self):
-        # T1 per-entry tracking, deferred flush. A/B-tested 2026-08-11 (see
-        # ESMFOLD2_RECYCLE_SCALING.md T1): calling dist.all_gather_object for this from
-        # on_validation_epoch_end -- immediately before Lightning's own ModelCheckpoint
-        # _monitor_candidates DDP-metric-sync (a known-fragile, unresolved-upstream race,
-        # github.com/Lightning-AI/pytorch-lightning#19045) -- reliably deadlocked the run.
-        # Deferring the gather to here (on_train_epoch_start of the NEXT epoch, which Lightning
-        # only reaches after the previous epoch's checkpoint decision has fully completed, see
-        # fit_loop.py on_advance_end's callback/module-hook ordering) moves it out of that race
-        # window. on_fit_end below is the safety-net flush for the final epoch, which has no
-        # "next" on_train_epoch_start to defer to.
+        # T1 per-entry tracking, deferred flush. ⛔ The 2026-08-11 A/B blamed a gather in
+        # on_validation_epoch_end racing ModelCheckpoint's metric sync (Lightning #19045). The later
+        # root cause (T-1, 2026-09-22) was a rank-0-only trainer.log_dir -- 2 extra NCCL broadcasts --
+        # inside that flush; the pTM gather has run in on_validation_epoch_end since 2026-07-07 without a
+        # hang, and val_pop's gather now does too. Deferral is kept; the placement itself is no longer the
+        # suspected cause (still to be exercised by the 4-GPU smoke test). on_fit_end flushes the last epoch.
         self._train_sums.reset()
         self._flush_per_entry_records()
 

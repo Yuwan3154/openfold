@@ -84,7 +84,9 @@ class PromotedTemplateWriter:
         `sample` distinguishes the K best-of-K samples of the SAME (chain, epoch, step) under
         --t4_promote_all. It is part of the on-disk filename; see the writer thread.
         `picked` (this sample is the one the gradient step used) and `has_template` (the model was
-        handed a template) make t4/tm_pred, margin and promote_rate exactly recomputable from the index.
+        handed a template) are recorded per row. They do NOT make the step-level t4/* scalars recomputable:
+        without promote-all only gate-passers are written, nothing is written before
+        t4_promote_after_epoch, and writer drops leave holes.
         """
         mask = np.asarray(atom_mask37, dtype=bool)
         rec = {

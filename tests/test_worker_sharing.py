@@ -45,6 +45,7 @@ def test_configure_selects_file_descriptor_and_raises_soft_to_hard():
     out = json.loads(p.stdout.splitlines()[-1])
     soft, hard = out["rlimit_nofile"]
     assert out["strategy"] == "file_descriptor"
+    assert out["configured"]["soft_before"] == OLD_SOFT_LIMIT < hard, out
     assert soft == hard == out["configured"]["hard"] == out["configured"]["soft_after"]
 
 
@@ -53,6 +54,7 @@ def test_openfold_loader_completes_with_more_live_shared_tensors_than_the_old_so
     assert p.returncode == 0, "file_descriptor after configure_worker_sharing() must serve the whole epoch"
     out = json.loads(p.stdout.splitlines()[-1])
     assert out["strategy"] == "file_descriptor"
+    assert out["configured"]["soft_before"] == OLD_SOFT_LIMIT, out  # the raise is what made it complete
     assert out["live_shared_tensors"] > OLD_SOFT_LIMIT, out
 
 
