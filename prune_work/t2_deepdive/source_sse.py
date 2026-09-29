@@ -107,6 +107,9 @@ def do_natural(job):
     rows = []
     with tempfile.TemporaryDirectory() as td:
         for rank, h in enumerate(hits):
+            if not h:  # the featurizer's empty placeholder template (chain with no usable hit)
+                rows.append(dict(source="natural", chain=chain, hit=h, rank=rank, status="empty_placeholder"))
+                continue
             pdb_id, ch = h.split("_", 1)
             tpl = os.path.join(td, f"{h}.pdb")
             n_res = write_chain_pdb(os.path.join(MMCIF, f"{pdb_id.lower()}.cif"), ch, tpl)
