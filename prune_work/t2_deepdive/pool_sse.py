@@ -169,9 +169,11 @@ def main():
         return
 
     z = np.load(a.index, allow_pickle=False)
+    # an NpzFile re-reads an array on EVERY z[key] access, so pull each out once
     chains = [str(c) for c in z["chains"]]
+    tm_all, rw_all, slot = z["tm"], z["rewind"], z["slot"]
     lo, hi = float(z["min_tm"]), float(z["max_tm"])
-    band = (z["tm"] > lo) & (z["tm"] < hi)
+    band = (tm_all > lo) & (tm_all < hi)
     man = {}
     with open(a.manifest) as fh:
         for r in csv.DictReader(fh):
@@ -182,10 +184,10 @@ def main():
         keep = np.flatnonzero(band[i])
         if len(keep) == 0:
             continue
-        assert (z["slot"][i, keep] == np.arange(len(keep))).all(), c  # npz rows = in-band rungs in order
+        assert (slot[i, keep] == np.arange(len(keep))).all(), c  # npz rows = in-band rungs in order
         m = man[c]
         jobs.append((c, os.path.join(root, f"shard{zlib.crc32(c.encode()) % 1000:04d}", f"{c}.npz"), m["pdb"],
-                     int(m["resid_span"]), a.span_cutoff, z["tm"][i, keep], z["rewind"][i, keep]))
+                     int(m["resid_span"]), a.span_cutoff, tm_all[i, keep], rw_all[i, keep]))
     if a.limit:
         jobs = jobs[: a.limit]
     print(f"{len(jobs)} chains, {sum(len(j[5]) for j in jobs)} templates", flush=True)
