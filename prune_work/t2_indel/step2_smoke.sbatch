@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH -J t2indel_step2
-#SBATCH -p debug-gpu
+#SBATCH -p xeon-g6-volta
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:volta:1
 #SBATCH --cpus-per-task=10
-#SBATCH --time=02:00:00
+#SBATCH --time=4-00:00:00
 #SBATCH --output=/home/gridsan/cou/logs/t2indel_step2-%j.out
 #SBATCH --error=/home/gridsan/cou/logs/t2indel_step2-%j.err
 # Step 2: ONE chain, ONE draw, cc89, tiered AND grouped, indel + control. Shakedown only.
