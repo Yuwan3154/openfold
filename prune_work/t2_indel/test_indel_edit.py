@@ -67,9 +67,25 @@ def test_terminal_deletion_then_terminal_insertion():
 
 def test_validation_rejects_bad_ops():
     for ops in ([("del", 2, 4), ("del", 4, 6)], [("ins", 3, 1), ("ins", 3, 2)],
-                [("del", 3, 6), ("ins", 4, 2)], [("del", 0, 9)], [("ins", 3, 0)], [("foo", 1, 2)]):
+                [("del", 3, 6), ("ins", 2, 1), ("ins", 6, 1)],  # both sites are the same seam
+                [("del", 0, 9)], [("ins", 3, 0)], [("foo", 1, 2)]):
         with pytest.raises((AssertionError, ValueError)):
             validate(10, ops)
+
+
+def test_site_inside_deleted_stretch_maps_to_the_seam():
+    c = chain(10)
+    x, orig, _ = edit(c, [("del", 3, 6), ("ins", 4, 2)])
+    assert orig.tolist() == [0, 1, 2, -1, -1, 7, 8, 9]
+    for j in (1, 2):
+        assert np.allclose(x[2 + j], c[2] + j / 3 * (c[7] - c[2]), atol=1e-9)
+
+
+def test_insertion_site_inside_a_leading_deleted_stretch_is_terminal():
+    c = chain(8)
+    x, orig, _ = edit(c, [("del", 0, 3), ("ins", 3, 2)])
+    assert orig.tolist() == [-1, -1, 4, 5, 6, 7]
+    assert np.allclose(x[1], c[4] - (c[5] - c[4]), atol=1e-9)
 
 
 def test_pdb_write_roundtrip(tmp_path):

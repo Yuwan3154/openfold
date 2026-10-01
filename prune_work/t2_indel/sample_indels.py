@@ -5,8 +5,8 @@ Per operation (insertion, deletion) independently:
   k ~ U{1..5} segments; T is split into k positive integers uniformly (stars and bars);
   if T < k the plan degenerates to T segments of length 1.
 Deletion segments are placed uniformly at random, non-overlapping, separated by >= 1 retained residue
-(terminal deletions allowed). Insertion sites are drawn uniformly without replacement from the sites
-(-1 .. L-1) that are not inside a deleted stretch. Segment lengths are assigned to the sorted
+(terminal deletions allowed). Insertion spots are drawn uniformly without replacement from the S+1 effective locations
+(before the first survivor .. after the last survivor), S = retained residues, so no two coincide. Segment lengths are assigned to the sorted
 placements in order, so the joint law over (lengths, positions) is uniform.
 Seeding: default_rng([global_seed, crc32(chain), draw]) -- stable across processes (no builtin hash()).
 """
@@ -56,10 +56,10 @@ def draw_plan(L, chain, draw, global_seed=0):
     dele = np.zeros(L, bool)
     for _, s, e in dels:
         dele[s:e + 1] = True
-    sites = [s for s in range(-1, L) if not (0 <= s < L - 1 and dele[s] and dele[s + 1])]
+    surv = np.flatnonzero(~dele)
     n_ins = len(rec["ins"]["segments"])
-    chosen = sorted(rng.choice(sites, size=n_ins, replace=False).tolist())
-    ins = [("ins", int(s), int(k)) for s, k in zip(chosen, rec["ins"]["segments"])]
+    locs = sorted(rng.choice(len(surv) + 1, size=n_ins, replace=False).tolist())   # 0..S, uniform, distinct
+    ins = [("ins", -1 if loc == 0 else int(surv[loc - 1]), int(k)) for loc, k in zip(locs, rec["ins"]["segments"])]
     rec["ops"] = [list(o) for o in dels + ins]
     rec["chain"], rec["draw"], rec["L"], rec["global_seed"] = chain, draw, L, global_seed
     return rec
