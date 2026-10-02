@@ -1,7 +1,8 @@
 """Seam-geometry and secondary-structure diagnostics for generated indel templates (non-gating; user 10-02).
 
 Per output item and t* rung, against the chain's NATIVE and the edit sidecar (plans.json: orig_idx, -1 = inserted):
-  geometry  peptide-bond C(i)-N(i+1) and CA(i)-CA(i+1) at SEAM pairs (consecutive template residues where either is
+  geometry  (v2: medians + counts of broken links added; the percentile band is kept but is uninformative on its
+            own) peptide-bond C(i)-N(i+1) and CA(i)-CA(i+1) at SEAM pairs (consecutive template residues where either is
             inserted, or both survive but are not consecutive in the native = a deletion seam) vs at BACKGROUND pairs;
             'out of band' = outside the native chain's own 1st-99th percentile of the same quantity (derived from the
             same chain, not typed in); plus non-local CA clashes (|i-j| >= 3, closer than the native's minimum).
@@ -75,6 +76,13 @@ def diag_item(bb, orig, ss_nat, band, nat_min_nl):
         for nm, v, (lo, hi) in (("cn", cn, band["cn"]), ("caca", caca, band["caca"])):
             rec[f"{tag}_{nm}_out"] = int(((v[sel] < lo) | (v[sel] > hi)).sum())
             rec[f"{tag}_{nm}_mean"] = float(v[sel].mean()) if sel.any() else np.nan
+            rec[f"{tag}_{nm}_med"] = float(np.median(v[sel])) if sel.any() else np.nan
+        # clearly broken links, robust to the model's looser bond precision (the native-percentile band above is
+        # far narrower than generated-bond scatter and flags ~80% of C-N bonds even in controls: read it only
+        # against the control). 4.5 A CA-CA is the chain-break cut already used for panel eligibility; 2.0 A C-N
+        # is a peptide bond stretched ~1.5x.
+        rec[f"{tag}_caca_gt45"] = int((caca[sel] > 4.5).sum())
+        rec[f"{tag}_cn_gt2"] = int((cn[sel] > 2.0).sum())
     d, iu = nonlocal_min(bb[:, 1])
     rec["n_clash"] = int((d[iu] < nat_min_nl).sum())
     ss = dssp(bb)

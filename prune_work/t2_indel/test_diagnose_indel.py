@@ -43,3 +43,4 @@ def test_band_flags_a_stretched_seam():
     new, orig, _ = edit(bb, [("del", 10, 19)])   # 10 deleted residues -> a long gap
     rec = diag_item(new, orig, dssp(bb), band, 0.0)
     assert rec["seam_caca_out"] == 1 and rec["bg_caca_out"] == 0 and rec["seam_cn_out"] == 1
+    assert rec["seam_caca_gt45"] == 1 and rec["bg_caca_gt45"] == 0 and rec["seam_cn_gt2"] == 1
