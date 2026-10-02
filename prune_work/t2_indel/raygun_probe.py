@@ -87,8 +87,8 @@ def main():
                         rec = compare(al, seq, out)
                         rec.update(chain=key, target=tag, L=len(seq), L_target=tl, noise=nz, rep=rep, seq=out)
                         rows.append(rec)
-        sub = [r for r in rows if r["chain"] == key and r["target"] == "same" and r["noise"] == 0]
-        print(f"{key}: L={len(seq)} identity at same length, noise 0: {sub[0]['identity']:.3f}", flush=True)
+        sub = [r for r in rows if r["chain"] == key and r["target"] == "same" and r["noise"] == a.noise[0]]
+        print(f"{key}: L={len(seq)} identity at same length, noise {a.noise[0]}: {sub[0]['identity']:.3f}", flush=True)
         json.dump({"rows": rows}, open(a.out, "w"))
     json.dump({"rows": rows}, open(a.out, "w"))
     print(f"wrote {len(rows)} rows to {a.out}", flush=True)
