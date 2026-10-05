@@ -15,8 +15,11 @@ from protpardelle.data.pdb_io import load_feats_from_pdb
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--inputs-dir", required=True)
+    p.add_argument("--ca-tol", type=float, default=2e-3, help="max survivor CA deviation from the native (A)")
+    p.add_argument("--backbone-only", action="store_true")
     a = p.parse_args()
     n = n_res = 0
+    max_dev = 0.0
     for key in sorted(os.listdir(a.inputs_dir)):
         d = os.path.join(a.inputs_dir, key)
         plans = json.load(open(os.path.join(d, "plans.json")))
@@ -30,10 +33,13 @@ def main():
             assert np.array_equal(f["aatype"].numpy(), [rc.restype_order[c] for c in rec["raygun_seq"]])
             orig = np.array(rec["orig_idx"])
             ca = f["atom_positions"].numpy()[:, 1]
-            assert np.allclose(ca[orig >= 0], ca_nat[orig[orig >= 0]], atol=2e-3)
+            dev = np.abs(ca[orig >= 0] - ca_nat[orig[orig >= 0]]).max()
+            max_dev = max(max_dev, dev)
+            assert dev <= a.ca_tol, (key, rec["draw"], dev)
+            assert f["atom_mask"].numpy().sum() > 4 * Lp or a.backbone_only, "expected sidechain atoms"
             n += 1
             n_res += Lp
-    print(f"verified {n} Raygun-arm inputs through the real reader ({n_res} residues)")
+    print(f"verified {n} Raygun-arm inputs through the real reader ({n_res} residues); max survivor CA deviation {max_dev:.4f} A")
 
 
 if __name__ == "__main__":
