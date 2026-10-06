@@ -53,9 +53,11 @@ def parse_fa(path, n_expected):
             cur[1] += ln
     assert len(recs) == n_expected + 1, (path, len(recs))
     native, designs = recs[0], recs[1:]
-    f = lambda h, k: float(re.search(rf"{k}=([-0-9.eE]+)", h).group(1))
+    # MPNN prints nan for a few degenerate backbones; keep them as NaN (audited below), never drop silently
+    f = lambda h, k: float(re.search(rf"(?<![_a-z]){k}=(nan|inf|-inf|[-0-9.eE]+)", h).group(1))
     return (native[1], [d[1] for d in designs], np.array([f(d[0], "score") for d in designs]),
-            np.array([f(d[0], "global_score") for d in designs]), np.array([f(d[0], "seq_recovery") for d in designs]))
+            np.array([f(d[0], "global_score") for d in designs]), np.array([f(d[0], "seq_recovery") for d in designs]),
+            f(native[0], "score"))
 
 
 def main():
@@ -91,20 +93,23 @@ def main():
         R = int(z["res_offsets"][-1])
         design = np.zeros((NSEQ, R), np.int8)
         score, gscore, rec = np.zeros((N, NSEQ)), np.zeros((N, NSEQ)), np.zeros((N, NSEQ))
+        native_score = np.zeros(N)
         for i in range(N):
             r0, r1 = int(z["res_offsets"][i]), int(z["res_offsets"][i + 1])
-            nat, seqs, s, g, rc = parse_fa(os.path.join(wd, "seqs", f"t{i:03d}.fa"), NSEQ)
+            nat, seqs, s, g, rc, nscore = parse_fa(os.path.join(wd, "seqs", f"t{i:03d}.fa"), NSEQ)
             assert nat == "".join(ip.AA_ORDER[int(x)] for x in z["aatype"][r0:r1]), f"{chain} t{i}: MPNN native != template sequence"
             for j, sq in enumerate(seqs):
                 assert len(sq) == r1 - r0 and "X" not in sq
                 design[j, r0:r1] = [ip.AA_ORDER.index(c) for c in sq]
-            score[i], gscore[i], rec[i] = s, g, rc
+            score[i], gscore[i], rec[i], native_score[i] = s, g, rc, nscore
         z.update(design_aatype=design, design_score=score.astype(np.float32), design_global_score=gscore.astype(np.float32),
-                 design_recovery=rec.astype(np.float32),
+                 design_recovery=rec.astype(np.float32), design_native_score=native_score.astype(np.float32),
+                 design_ok=np.isfinite(score).all(1) & np.isfinite(native_score),
                  design_meta_json=np.array(json.dumps(dict(model=MODEL, sampling_temp=float(TEMP), seed=SEED, n_seq=NSEQ,
                                                            omit_AAs="X", backbone_noise=0.0, weights="vanilla"))))
         np.savez(path, **z)
-        print(f"{chain}: designed {N} backbones x {NSEQ} sequences", flush=True)
+        print(f"{chain}: designed {N} backbones x {NSEQ} sequences; {int((~z['design_ok']).sum())} with non-finite MPNN scores: "
+              f"{[int(i) for i in np.flatnonzero(~z['design_ok'])]}", flush=True)
 
 
 if __name__ == "__main__":

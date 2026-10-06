@@ -47,7 +47,7 @@ def main():
                 L = len(t["aatype"])
                 assert d.shape == (32, L) and d.min() >= 0 and d.max() <= 19
                 direct = (d == t["aatype"][None]).mean(1)
-                assert np.abs(direct - t["design_recovery"]).max() < 0.02, (chain, r.i, "recovery", np.abs(direct - t["design_recovery"]).max())
+                assert np.nanmax(np.abs(direct - t["design_recovery"])) < 0.02, (chain, r.i, "recovery", np.abs(direct - t["design_recovery"]).max())
                 n_design += 1
     assert n_ok > 0 and n_ok == len(idx), (n_ok, len(idx))
     print(f"verified {n_ok} templates against their sources through the reader; {n_design} with design arrays")
