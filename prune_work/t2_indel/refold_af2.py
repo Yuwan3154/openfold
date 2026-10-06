@@ -30,7 +30,10 @@ def main():
     from colabdesign import mk_afdesign_model
     os.makedirs(a.out, exist_ok=True)
     os.makedirs(a.tmp_dir, exist_ok=True)
-    model = mk_afdesign_model(protocol="fixbb", use_templates=False, data_dir=a.data_dir, model_names=["model_1_ptm"])
+    # V100 (sm_70) has no bfloat16 units and the default use_bfloat16=True segfaulted the first shakedown (rc 139): run fp32
+    model = mk_afdesign_model(protocol="fixbb", use_templates=False, data_dir=a.data_dir, model_names=["model_1_ptm"],
+                              use_bfloat16=False)
+    print("model built", flush=True)
     for sel in a.select:
         chain, i = sel.split(":")
         i = int(i)
@@ -42,6 +45,7 @@ def main():
         pdb = os.path.join(a.tmp_dir, f"{chain}_t{i:03d}.pdb")
         write_backbone_pdb(pdb, t["coords"], t["atom_mask"], t["aatype"])
         model.prep_inputs(pdb_filename=pdb, chain="A")
+        print(f"{chain} t{i}: inputs prepared, L={len(t['aatype'])}", flush=True)
         seqs = ["".join(ip.AA_ORDER[int(x)] for x in t["aatype"])]
         seqs += ["".join(ip.AA_ORDER[int(x)] for x in row) for row in t["design_aatype"][: a.max_seqs]]
         pos, pl, pt = [], [], []

@@ -15,7 +15,7 @@ export PYTHONNOUSERSITE=1 PYTHONUNBUFFERED=1
 cd /home/gridsan/cou/of_t2indel/prune_work/t2_indel
 D=/home/gridsan/cou/t2_indel_data
 python -c "import jax; print('jax', jax.__version__, jax.devices())"
-python refold_af2.py --pool-root $D/pool_smoke --select 7du7_A:0 --max-seqs 2 --out $D/af2_smoke --tmp-dir $D/af2_smoke_tmp
+python -X faulthandler refold_af2.py --pool-root $D/pool_smoke --select 7du7_A:0 --max-seqs 2 --out $D/af2_smoke --tmp-dir $D/af2_smoke_tmp
 rc=$?
 echo "rc_final=$rc"
 exit $rc
