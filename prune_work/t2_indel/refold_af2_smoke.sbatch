@@ -9,7 +9,7 @@
 #SBATCH --error=/home/gridsan/cou/logs/t2indel_af2_smoke-%j.err
 # SHAKEDOWN of the AF2 refold path on ONE template x 3 sequences; ColabDesign/jax on V100 has NEVER run on SuperCloud before
 source /etc/profile
-module load conda/Python-ML-2025b-pytorch cuda/12.6
+module load conda/Python-ML-2025b-pytorch   # NOT cuda/12.6: loading the system CUDA module makes jax segfault in XLA compile (probe 5842037, variant A works without it)
 source activate colabdesign
 export PYTHONNOUSERSITE=1 PYTHONUNBUFFERED=1
 cd /home/gridsan/cou/of_t2indel/prune_work/t2_indel
