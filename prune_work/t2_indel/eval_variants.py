@@ -43,8 +43,9 @@ def main():
             sc = pd.concat([pd.read_csv(f) for c in a.chains for f in glob.glob(f"{a.baseline_score}/cc89_cc91_{c}.csv")])
             sc = sc[(sc.model == "cc89") & (sc.kind == "indel")]
         else:
-            dg = load(a.diag_root, tag, "{tag}_*.csv")
-            sc = load(a.score_root, tag, "{tag}_*.csv")
+            dg = load(a.diag_root, tag, "{tag}_*.csv")  # diag files are per model: <tag>_<chain>.csv
+            sc = load(a.score_root, "", "*.csv")  # files are named by the JOINED model list; filter on the model column
+            sc = sc[sc.model == tag] if sc is not None else None
             if dg is None:
                 continue
         dg = dg[(dg.draw < a.draws) & dg.rewind.isin([250, 300])]
