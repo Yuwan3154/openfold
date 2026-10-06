@@ -75,7 +75,7 @@ def main():
     for path in files[a.shard::a.num_shards]:
         chain = os.path.basename(path)[:-4]
         z = dict(np.load(path))
-        if "design_aatype" in z:
+        if "design_ok" in z:  # chains designed by the first version lack design_ok/design_native_score: redo them
             print(f"{chain}: already designed, skipped", flush=True)
             continue
         N = int(z["n_templates"])
