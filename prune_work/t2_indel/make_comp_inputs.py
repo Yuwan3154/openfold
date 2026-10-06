@@ -24,7 +24,7 @@ def atom_lines_by_res(path):
     out = {}
     for ln in open(path):
         if ln.startswith("ATOM"):
-            out.setdefault(int(ln[22:26]), []).append(ln)
+            out.setdefault(int(ln[22:26]), []).append(ln.rstrip("\n"))
     return out
 
 

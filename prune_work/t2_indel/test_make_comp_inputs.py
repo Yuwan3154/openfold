@@ -29,6 +29,7 @@ def test_bb_stage_types_and_merge_keeps_native_atoms(tmp_path):
     run("--stage", "bb", "--inputs-dir", str(tmp_path / "in"), "--out-dir", str(tmp_path / "bb"), "--chains", "x_A", "--draws", "0")
     bb = [ln for ln in open(tmp_path / "bb" / "x_A" / "d00.pdb") if ln.startswith("ATOM")]
     assert all(ln[12:16].strip() in ("N", "CA", "C", "O") for ln in bb)
+    assert all(ln.strip() for ln in open(tmp_path / "bb" / "x_A" / "d00.pdb")), "blank line in a written PDB"
     res = {}
     for ln in bb:
         res.setdefault(int(ln[22:26]), ln[17:20])
