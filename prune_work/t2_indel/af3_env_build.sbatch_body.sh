@@ -8,6 +8,11 @@ export PATH=$HOME/.local/bin:$PATH
 cd /home/gridsan/cou/alphafold3_sc || exit 1
 git log --oneline | head -1
 export UV_CACHE_DIR=/home/gridsan/cou/.cache/uv
+# the download node has no zlib dev package (CMake: "Could NOT find ZLIB (missing: ZLIB_LIBRARY)"): use the module conda's own
+P=$(python -c 'import sys; print(sys.prefix)')
+ls $P/lib/libz.so* $P/include/zlib.h
+export CMAKE_PREFIX_PATH=$P ZLIB_ROOT=$P
+export CMAKE_ARGS="-DZLIB_LIBRARY=$P/lib/libz.so -DZLIB_INCLUDE_DIR=$P/include"
 uv venv --python 3.12 .venv || rc=$?
 uv sync || rc=$?
 uv run build_data || rc=$?
