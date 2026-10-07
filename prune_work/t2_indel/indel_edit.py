@@ -6,9 +6,10 @@ Coordinates are (L, 4, 3) backbone atoms in N, CA, C, O order. Operations are gi
                       deleted stretch lands at that stretch's seam
   ("del", start, end) delete native residues start..end inclusive
 Interior insertion j=1..k sits at r_left + j/(k+1) * (r_right - r_left) for every backbone atom, where
-left/right are the nearest SURVIVING residues. A terminal insertion extrapolates linearly outward from the
-two nearest surviving residues: r_0 - j*d (N end) / r_last + j*d (C end), d = (r_1 - r_0) rescaled so the CA-CA step is
-exactly CA_STEP (user 10-07: fixed 3.8 A; the survivors may be many residues apart when a deletion lies between them).
+left/right are the nearest SURVIVING residues. A terminal insertion extends the chain outward (only the CA direction is extrapolated; the other atoms copy the end residue) from the
+two nearest surviving residues: the end survivor is RIGIDLY translated by j * CA_STEP along the unit CA(r_1) - CA(r_0) direction
+(N end: outward from r_0; C end: outward from r_last), so inserted residues copy its internal geometry and the CA-CA step is exactly
+CA_STEP (user 10-07: fixed 3.8 A; compare_terminal_methods.py showed per-atom stepping, the earlier rule, explodes the inserted bonds).
 Output residue numbering is contiguous 1..L'.
 """
 import numpy as np
@@ -65,7 +66,7 @@ def edit(coords, ops):
     def step(r0, r1):
         n = np.linalg.norm(r1[1] - r0[1])
         assert n > 0, "coincident CA atoms in the two terminal survivors"
-        return (r1 - r0) * CA_STEP / n
+        return (r1[1] - r0[1]) * CA_STEP / n
 
     def block(loc):
         k = locs[loc]
@@ -73,7 +74,7 @@ def edit(coords, ops):
             assert S >= 2, "terminal extrapolation needs at least 2 surviving residues"
         if loc == 0:          # outward from the first two survivors; nearest-to-chain is j=1
             r0, r1 = coords[surv[0]], coords[surv[1]]
-            xyz = [r0 - j * step(r0, r1) for j in range(k, 0, -1)]
+            xyz = [r0 - j * step(r0, r1) for j in range(k, 0, -1)]  # step is (3,): translates all atoms
         elif loc == S:
             r0, r1 = coords[surv[-2]], coords[surv[-1]]
             xyz = [r1 + j * step(r0, r1) for j in range(1, k + 1)]

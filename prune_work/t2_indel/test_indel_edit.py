@@ -37,8 +37,8 @@ def test_terminal_insertions_extrapolate():
     c = chain(6)
     x, orig, _ = edit(c, [("ins", -1, 3), ("ins", 5, 2)])
     assert orig.tolist() == [-1, -1, -1, 0, 1, 2, 3, 4, 5, -1, -1]
-    d0 = (c[1] - c[0]) * 3.8 / np.linalg.norm(c[1, 1] - c[0, 1])
-    d1 = (c[5] - c[4]) * 3.8 / np.linalg.norm(c[5, 1] - c[4, 1])
+    d0 = (c[1, 1] - c[0, 1]) * 3.8 / np.linalg.norm(c[1, 1] - c[0, 1])
+    d1 = (c[5, 1] - c[4, 1]) * 3.8 / np.linalg.norm(c[5, 1] - c[4, 1])
     for j in (1, 2, 3):  # residue nearest the chain is j=1
         assert np.allclose(x[3 - j], c[0] - j * d0, atol=1e-9)
     for j in (1, 2):
@@ -65,6 +65,15 @@ def test_c_end_straddle_extends_outward_and_one_survivor_asserts():
         edit(chain(8), [("del", 0, 6), ("ins", 7, 2)])
 
 
+def test_inserted_terminal_residues_copy_the_end_residues_internal_geometry():
+    c = chain(30)
+    x, orig, _ = edit(c, [("del", 1, 8), ("ins", -1, 3), ("ins", 29, 2)])
+    for r in (0, 1, 2):
+        assert np.allclose(x[r] - x[r, 1], x[3] - x[3, 1], atol=1e-9)
+    for r in (-1, -2):
+        assert np.allclose(x[r] - x[r, 1], x[-3] - x[-3, 1], atol=1e-9)
+
+
 def test_terminal_insertion_with_one_survivor_asserts():
     with pytest.raises(AssertionError):
         edit(chain(8), [("del", 1, 7), ("ins", -1, 2)])
@@ -89,7 +98,7 @@ def test_terminal_deletion_then_terminal_insertion():
     c = chain(8)
     x, orig, _ = edit(c, [("del", 0, 1), ("ins", -1, 2)])
     assert orig.tolist() == [-1, -1, 2, 3, 4, 5, 6, 7]
-    assert np.allclose(x[1], c[2] - (c[3] - c[2]) * 3.8 / np.linalg.norm(c[3, 1] - c[2, 1]), atol=1e-9)
+    assert np.allclose(x[1], c[2] - (c[3, 1] - c[2, 1]) * 3.8 / np.linalg.norm(c[3, 1] - c[2, 1]), atol=1e-9)
 
 
 def test_validation_rejects_bad_ops():
@@ -112,7 +121,7 @@ def test_insertion_site_inside_a_leading_deleted_stretch_is_terminal():
     c = chain(8)
     x, orig, _ = edit(c, [("del", 0, 3), ("ins", 3, 2)])
     assert orig.tolist() == [-1, -1, 4, 5, 6, 7]
-    assert np.allclose(x[1], c[4] - (c[5] - c[4]) * 3.8 / np.linalg.norm(c[5, 1] - c[4, 1]), atol=1e-9)
+    assert np.allclose(x[1], c[4] - (c[5, 1] - c[4, 1]) * 3.8 / np.linalg.norm(c[5, 1] - c[4, 1]), atol=1e-9)
 
 
 def test_pdb_write_roundtrip(tmp_path):

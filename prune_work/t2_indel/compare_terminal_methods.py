@@ -1,7 +1,8 @@
 """Terminal-insertion step: current per-atom rescaling (indel_edit.edit) vs a rigid translation of the end residue.
 
-Both give a CA-CA step of exactly 3.8 A. Current: every backbone atom steps by (r1 - r0) * 3.8/|dCA| (survivors may straddle a
-deletion, so atoms can drift relative to CA). Rigid (proposed, user 10-07): the end survivor is translated along the CA direction,
+NOTE: 'current' needs the PRE-switch indel_edit.edit (per-atom stepping, commits <= e917060); after the switch to rigid translation both columns coincide.
+Both give a CA-CA step of exactly 3.8 A. Old rule: every backbone atom steps by (r1 - r0) * 3.8/|dCA| (survivors may straddle a
+deletion, so atoms can drift relative to CA). Rigid (ADOPTED, user 10-07): the end survivor is translated along the CA direction,
 so inserted residues copy its internal geometry exactly. Measured on the REAL plans (plans.json ops) of every chain/draw:
 deviations of the inserted terminal residues' N-CA/CA-C/C-O lengths and N-CA-C angle from the chain's own native medians, and peptide C-N lengths
 (1.33 A) across the terminal block and its junction with the end survivor, split by whether the two end
