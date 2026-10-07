@@ -1,10 +1,11 @@
 """Similarity + validity of the AF2-completed templates (af2_complete.py) vs the partial-diffusion templates of the same chains (user 10-07).
 
 Per structure (set = af2fix:<arm> or pool_t250:<arm>): geometry panel (geom_metrics.metrics, Ramachandran histogram from the native panel),
-sequence-independent TM to the native in BOTH forms (tm_native = normalised by the NATIVE length, as every earlier table; tm_sym_native = mean of the two
-USalign normalisations; do not mix the two columns), mean pLDDT/pTM for AF2 sets, and for AF2 sets the
+sequence-independent TM to the native normalised by the NATIVE length (tm_native, as every earlier table; user 10-07), mean pLDDT/pTM for AF2 sets, and for AF2 sets the
 CA RMSD of the SURVIVORS to the native (Kabsch; does AF2 keep the template). Pairs: within each (set, chain) a seeded random subsample of
---n-div draws (user: 20 per target; fewer if fewer exist), all pairwise TM (mean of the two USalign normalisations); across sets the TM between
+--n-div draws, all pairwise TM (mean of the two USalign normalisations, there is no native in a pair). AF2 sets have the pilot's draws only; the
+partial-diffusion sets are subsampled (20 per target, user 10-07) from the FULL pool (all draws in the index) into pair CAs only (the structures table's pool_t250 rows are just the AF2-matched pilot draws, a different subset; both pool arms
+draw the same 20 draw ids per chain, i.e. paired subsamples). Across sets the TM between
 the AF2 and the partial-diffusion template of the SAME draw. Env: protebm (pandas, mdtraj via diagnose_indel) + USalign at ~/.local/bin/USalign.
 Run: python af2fix_analyze.py --inputs-dir D/inputs --af2-root D --arms gly comp raygun --pool-root D/pool_t250 --chains .. --out-prefix P
 """
@@ -89,15 +90,26 @@ def main():
     rows = [dict(set=s, chain=c, draw=k, **{m: v for m, v in d.items() if m != "bb"}, **metrics(d["bb"], rama_nll)) for (s, c, k), d in structs.items()]
     tasks = [(d["bb"][:, 1], panel[c][:, 1].astype(np.float64)) for (s, c, k), d in structs.items()]
     with Pool(a.procs) as pool:
-        for r, (tm1, tm2) in zip(rows, pool.map(tm_pair, tasks)):
-            r["tm_native"], r["tm_sym_native"] = tm2, (tm1 + tm2) / 2
+        for r, (_, tm2) in zip(rows, pool.map(tm_pair, tasks)):
+            r["tm_native"] = tm2
         pairs = []
         for (s, c), grp in pd.DataFrame(rows).groupby(["set", "chain"]):
-            draws = sorted(grp.draw)
-            rng = np.random.default_rng([zlib.crc32(c.encode()), 20])
-            sub = sorted(rng.choice(draws, size=min(a.n_div, len(draws)), replace=False).tolist())
-            for k1, k2 in itertools.combinations(sub, 2):
-                pairs.append(dict(kind="within", set=s, chain=c, d1=k1, d2=k2, ca=(structs[(s, c, k1)]["bb"][:, 1], structs[(s, c, k2)]["bb"][:, 1])))
+            if s.startswith("af2fix"):  # AF2 sets: the pilot's draws only
+                draws = sorted(grp.draw)
+                rng = np.random.default_rng([zlib.crc32(c.encode()), 20])
+                sub = sorted(rng.choice(draws, size=min(a.n_div, len(draws)), replace=False).tolist())
+                for k1, k2 in itertools.combinations(sub, 2):
+                    pairs.append(dict(kind="within", set=s, chain=c, d1=k1, d2=k2, ca=(structs[(s, c, k1)]["bb"][:, 1], structs[(s, c, k2)]["bb"][:, 1])))
+        for c in a.chains:  # partial-diffusion sets: a seeded random n_div of the FULL pool per target (user 10-07)
+            for pa in POOL_ARM.values():
+                sel = idx[(idx.chain == c) & (idx.arm == pa)].sort_values("draw")
+                assert len(sel) > 0 and sel.draw.is_unique, (c, pa)
+                rng = np.random.default_rng([zlib.crc32(c.encode()), 20])
+                pick = sel.iloc[sorted(rng.choice(len(sel), size=min(a.n_div, len(sel)), replace=False).tolist())]
+                cas = {int(r.draw): ip.atom37_coords(ip.read_template(os.path.join(a.pool_root, r.file), int(r.i)))[:, 1].astype(np.float64)
+                       for r in pick.itertuples()}
+                for k1, k2 in itertools.combinations(sorted(cas), 2):
+                    pairs.append(dict(kind="within", set=f"pool_t250:{pa}", chain=c, d1=k1, d2=k2, ca=(cas[k1], cas[k2])))
         for arm, pa in POOL_ARM.items():
             for (s, c, k) in [key for key in structs if key[0] == f"af2fix:{arm}"]:
                 pairs.append(dict(kind="cross", set=f"af2fix:{arm}|pool:{pa}", chain=c, d1=k, d2=k,
@@ -108,7 +120,7 @@ def main():
     st, pr = pd.DataFrame(rows), pd.DataFrame(pairs)
     st.to_csv(a.out_prefix + "_structures.csv", index=False)
     pr.to_csv(a.out_prefix + "_pairs.csv", index=False)
-    cols = ["tm_native", "tm_sym_native", "plddt", "surv_rmsd", "cn_med", "nca_med", "cac_med", "omega_dev_gt30", "phi_pos_frac", "rama_nll_mean", "clash_per100"]
+    cols = ["tm_native", "plddt", "surv_rmsd", "cn_med", "nca_med", "cac_med", "omega_dev_gt30", "phi_pos_frac", "rama_nll_mean", "clash_per100"]
     print(f"{len(st)} structures, {len(pr)} pairs")
     print(st.groupby("set")[cols].median().round(3).to_string())
     print(pr.groupby(["kind", "set"]).tm_sym.agg(["count", "median", "mean", "min"]).round(3).to_string())
