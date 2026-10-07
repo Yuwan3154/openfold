@@ -1,21 +1,21 @@
+# RECORDED RECIPE v2 (the repo HEAD changed: python >= 3.12, jax 0.10.2, uv.lock; docs/installation.md: uv venv --python 3.12; uv sync; uv run build_data).
 source /etc/profile
 module load conda/Python-ML-2025b-pytorch
 rc=0
-conda create -y -n af3 python=3.11 pip || rc=$?
-source activate af3 || rc=$?
-python --version
-cd /home/gridsan/cou
-[ -d alphafold3_sc ] || git clone --depth 1 https://github.com/google-deepmind/alphafold3.git alphafold3_sc || rc=$?
-cd alphafold3_sc
+conda env remove -y -n af3 >/dev/null 2>&1
+python -m pip install --user --no-cache-dir uv || rc=$?
+export PATH=$HOME/.local/bin:$PATH
+cd /home/gridsan/cou/alphafold3_sc || exit 1
 git log --oneline | head -1
-python -m pip install --no-cache-dir -r dev-requirements.txt || rc=$?
-python -m pip install --no-cache-dir --no-deps . || rc=$?
-build_data || rc=$?
-python -m pip list 2>/dev/null | grep -i -E "^(jax|jaxlib|jax-triton|triton|dm-haiku|alphafold3|numpy|rdkit|tensorflow) " || true
-python - <<'PY' || rc=$?
+export UV_CACHE_DIR=/home/gridsan/cou/.cache/uv
+uv venv --python 3.12 .venv || rc=$?
+uv sync || rc=$?
+uv run build_data || rc=$?
+.venv/bin/python - <<'PY' || rc=$?
 import jax, alphafold3
-print("jax", jax.__version__, "alphafold3", getattr(alphafold3, "__file__", "?"))
+print("jax", jax.__version__, "devices:", jax.devices())
 from alphafold3.model import model
 print("alphafold3.model import ok")
 PY
 echo "rc_install=$rc"
+exit $rc
