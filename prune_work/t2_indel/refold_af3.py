@@ -65,17 +65,51 @@ def collect(a):
         print(f"{chain} t{i}: collected {len(pos)} predictions")
 
 
+def make_ctl(a):
+    from refold_native_control import native
+    os.makedirs(a.json_dir, exist_ok=True)
+    for chain in a.chains:
+        seq, _, _ = native(a.inputs_dir, chain)
+        js = {"name": f"ctl_{chain}", "modelSeeds": [1], "dialect": "alphafold3", "version": 4,
+              "sequences": [{"protein": {"id": "A", "sequence": seq, "unpairedMsa": "", "pairedMsa": "", "templates": []}}]}
+        json.dump(js, open(os.path.join(a.json_dir, f"ctl_{chain}.json"), "w"))
+    print(f"wrote {len(a.chains)} control JSONs")
+
+
+def collect_ctl(a):
+    from Bio.PDB import MMCIFParser
+    from refold_native_control import native
+    parser = MMCIFParser(QUIET=True)
+    os.makedirs(a.out2, exist_ok=True)
+    for chain in a.chains:
+        seq, ca, _ = native(a.inputs_dir, chain)
+        name = f"ctl_{chain}"
+        res = [r for r in parser.get_structure(name, os.path.join(a.out, name, f"{name}_model.cif"))[0]["A"]]
+        assert len(res) == len(seq)
+        arr = np.zeros((1, len(seq), 37, 3), np.float16)
+        for j, r in enumerate(res):
+            for slot, an in ((0, "N"), (1, "CA"), (2, "C")):
+                arr[0, j, slot] = r[an].coord
+        pl = np.array([[np.mean([at.get_bfactor() for at in r]) / 100.0 for r in res]], np.float32)
+        pt = float(json.load(open(os.path.join(a.out, name, f"{name}_summary_confidences.json")))["ptm"])
+        np.savez(os.path.join(a.out2, f"{chain}_t000.npz"), pred_atom37=arr, plddt=pl, ptm=np.array([pt], np.float32),
+                 template_ca=ca.astype(np.float32), seqs=np.array([seq]), seed=np.int32(1))
+        print(f"{chain}: native pLDDT {pl.mean():.3f}")
+
+
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("cmd", choices=["make", "collect"])
-    p.add_argument("--pool-root", required=True)
-    p.add_argument("--select", nargs="+", required=True)
+    p.add_argument("cmd", choices=["make", "collect", "make_ctl", "collect_ctl"])
+    p.add_argument("--pool-root", default=None)
+    p.add_argument("--select", nargs="+", default=None)
+    p.add_argument("--inputs-dir", default=None)
+    p.add_argument("--chains", nargs="+", default=None)
     p.add_argument("--json-dir", required=True)
     p.add_argument("--max-seqs", type=int, default=32)
     p.add_argument("--out", default=None, help="AF3 output dir (collect)")
     p.add_argument("--out2", default=None, help="refold npz dir (collect)")
     a = p.parse_args()
-    make(a) if a.cmd == "make" else collect(a)
+    {"make": make, "collect": collect, "make_ctl": make_ctl, "collect_ctl": collect_ctl}[a.cmd](a)
 
 
 if __name__ == "__main__":
