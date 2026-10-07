@@ -7,12 +7,14 @@ Coordinates are (L, 4, 3) backbone atoms in N, CA, C, O order. Operations are gi
   ("del", start, end) delete native residues start..end inclusive
 Interior insertion j=1..k sits at r_left + j/(k+1) * (r_right - r_left) for every backbone atom, where
 left/right are the nearest SURVIVING residues. A terminal insertion extrapolates linearly outward from the
-two nearest surviving residues: r_0 - j*(r_1 - r_0) (N end) / r_last + j*(r_last - r_prev) (C end).
+two nearest surviving residues: r_0 - j*d (N end) / r_last + j*d (C end), d = (r_1 - r_0) rescaled so the CA-CA step is
+exactly CA_STEP (user 10-07: fixed 3.8 A; the survivors may be many residues apart when a deletion lies between them).
 Output residue numbering is contiguous 1..L'.
 """
 import numpy as np
 
 BB = ("N", "CA", "C", "O")
+CA_STEP = 3.8
 
 
 def deleted_mask(L, ops):
@@ -60,14 +62,21 @@ def edit(coords, ops):
     S = len(surv)
     new_xyz, orig = [], []
 
+    def step(r0, r1):
+        n = np.linalg.norm(r1[1] - r0[1])
+        assert n > 0, "coincident CA atoms in the two terminal survivors"
+        return (r1 - r0) * CA_STEP / n
+
     def block(loc):
         k = locs[loc]
+        if loc in (0, S):
+            assert S >= 2, "terminal extrapolation needs at least 2 surviving residues"
         if loc == 0:          # outward from the first two survivors; nearest-to-chain is j=1
             r0, r1 = coords[surv[0]], coords[surv[1]]
-            xyz = [r0 - j * (r1 - r0) for j in range(k, 0, -1)]
+            xyz = [r0 - j * step(r0, r1) for j in range(k, 0, -1)]
         elif loc == S:
             r0, r1 = coords[surv[-2]], coords[surv[-1]]
-            xyz = [r1 + j * (r1 - r0) for j in range(1, k + 1)]
+            xyz = [r1 + j * step(r0, r1) for j in range(1, k + 1)]
         else:
             rl, rr = coords[surv[loc - 1]], coords[surv[loc]]
             xyz = [rl + j / (k + 1) * (rr - rl) for j in range(1, k + 1)]
