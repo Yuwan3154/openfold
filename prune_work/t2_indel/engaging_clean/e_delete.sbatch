@@ -9,9 +9,9 @@
 #  1. the path is the exact real directory (not a symlink);
 #  2. the A6000 verification passed (sha256 of 3 tars, member counts, 33/33 ckpt sha256): recorded by the caller as the
 #     existence of /home/chenxiou/e_clean/A6000_VERIFIED (written by me only after rc 0);
-#  3. file count == the inventory total (1,934,519 regular files); any NEW file => abort, nothing deleted.
+#  3. file count == the inventory total (1,934,578 regular files = 1,934,519 data + 59 empty markers); any NEW file => abort, nothing deleted.
 R=/orcd/compute/so3/002/chenxi/of_run
-EXPECT=1934519
+EXPECT=1934578   # 1,934,519 inventoried data files + 59 EMPTY top-level .done_* migration markers (Sep 2-4; checked: 59 names, size 0)
 [ -d "$R" ] && [ ! -L "$R" ] && [ "$(readlink -f "$R")" = "$R" ] || { echo "ABORT path check"; echo rc_final=1; exit 1; }
 [ -f /home/chenxiou/e_clean/A6000_VERIFIED ] || { echo "ABORT: no A6000_VERIFIED marker"; echo rc_final=1; exit 1; }
 n=$(find "$R" -type f | wc -l)
