@@ -40,13 +40,14 @@ def main():
     p.add_argument("--in-dir", required=True)
     p.add_argument("--method", required=True)
     p.add_argument("--out", required=True)
+    p.add_argument("--control", action="store_true", help="native-sequence control files: no pool lookup, seq_kind 0 only")
     a = p.parse_args()
     rows = []
     for f in sorted(glob.glob(os.path.join(a.in_dir, "*.npz"))):
         chain, ti = os.path.basename(f)[:-4].rsplit("_t", 1)
         ti = int(ti)
         z = np.load(f)
-        t = ip.read_template(ip.shard_path(a.pool_root, chain), ti)
+        t = None if a.control else ip.read_template(ip.shard_path(a.pool_root, chain), ti)
         S = len(z["seqs"])
         with tempfile.TemporaryDirectory() as td:
             tpl = os.path.join(td, "t.pdb")
@@ -58,11 +59,11 @@ def main():
                 tm_s, _ = run(pred, tpl)
                 n, c = z["pred_atom37"][s][:, 0].astype(np.float32), z["pred_atom37"][s][:, 2].astype(np.float32)
                 cn = np.linalg.norm(n[1:] - c[:-1], axis=1)
-                rows.append(dict(method=a.method, chain=chain, i=ti, arm=t["arm"], L=len(z["seqs"][0]), seq_kind=s,
+                rows.append(dict(method=a.method, chain=chain, i=ti, arm=("control" if a.control else t["arm"]), L=len(z["seqs"][0]), seq_kind=s,
                                  tm_paired=tm_p, rmsd_paired=rm_p, tm_seqind=tm_s, plddt=float(z["plddt"][s].mean()),
                                  ptm=float(z["ptm"][s]), cn_median=float(np.median(cn)), cn_broken=float((cn > 2.0).mean()),
-                                 mpnn_score=float(t["design_score"][s - 1]) if s > 0 else np.nan,
-                                 recovery=float(t["design_recovery"][s - 1]) if s > 0 else np.nan))
+                                 mpnn_score=float(t["design_score"][s - 1]) if (s > 0 and not a.control) else np.nan,
+                                 recovery=float(t["design_recovery"][s - 1]) if (s > 0 and not a.control) else np.nan))
     pd.DataFrame(rows).to_csv(a.out, index=False)
     print(f"{len(rows)} predictions -> {a.out}")
 
