@@ -15,8 +15,11 @@ cd /home/gridsan/cou/of_t2indel/prune_work/t2_indel
 D=/home/gridsan/cou/t2_indel_data
 rc=0
 python build_ctl_pool.py --sweep $D/sweep_gly --inputs-dir $D/inputs --scores $D/scores_gly --out-root $D/pool_ctl --draws 2 || rc=$?
+# geom_metrics imports diagnose_indel -> pool_sse -> mdtraj, which only the protebm env has (the first run died here)
+source activate protebm
 python geom_metrics.py --inputs-dir $D/inputs --sweep $D/sweep_gly --pool-roots $D/pool_t250 $D/pool_ctl --out $D/geom.csv || rc=$?
 echo "rc_geom_pool=$rc"
+source activate protpardelle
 python mpnn_design_pool.py --pool-root $D/pool_ctl --mpnn-dir /home/gridsan/cou/ProteinMPNN --work-dir $D/pool_ctl_work || rc=$?
 echo "rc_final=$rc"
 exit $rc
