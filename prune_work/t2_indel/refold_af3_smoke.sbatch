@@ -12,6 +12,7 @@
 source /etc/profile
 module load conda/Python-ML-2025b-pytorch
 export PYTHONUNBUFFERED=1 XLA_PYTHON_CLIENT_PREALLOCATE=false
+export XLA_FLAGS="--xla_disable_hlo_passes=custom-kernel-fusion-rewriter"   # AF3's own requirement for compute capability 7.x (run_alphafold.py:975)
 cd /home/gridsan/cou/of_t2indel/prune_work/t2_indel
 D=/home/gridsan/cou/t2_indel_data
 source activate protpardelle
