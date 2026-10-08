@@ -7,12 +7,14 @@ import numpy as np
 
 
 def atomic_savez(path, **arrays):
+    path = os.fspath(path)
     tmp = path + ".tmp.npz"
     np.savez(tmp, **arrays)
     os.replace(tmp, path)
 
 
 def atomic_csv(path, fieldnames, rows):
+    path = os.fspath(path)
     tmp = path + ".tmp"
     with open(tmp, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames)
