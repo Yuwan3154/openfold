@@ -22,6 +22,8 @@ from multiprocessing import Pool
 
 import numpy as np
 
+from atomic_io import atomic_csv
+
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "t2_deepdive"))
 from pool_sse import backbone_top, ss_of  # noqa: E402
 
@@ -118,7 +120,7 @@ def do_chain(job):
     dn, iu = nonlocal_min(nat[:, 1])
     nat_min_nl = float(dn[iu].min())
     rows = []
-    for fn in sorted(os.listdir(os.path.join(out_root, model, key))):
+    for fn in sorted(f for f in os.listdir(os.path.join(out_root, model, key)) if f.endswith(".npz") and ".tmp" not in f):
         kind = "indel" if fn.startswith("d") else "control"
         if kind not in kinds:
             continue
@@ -145,14 +147,18 @@ def main():
     a = p.parse_args()
     os.makedirs(a.diag_dir, exist_ok=True)
     keys = a.chains if a.chains else sorted(os.listdir(a.inputs_dir))
+    def covers_kinds(path):
+        """Resume only when the existing csv already holds every requested kind (a kinds=indel run must not make a later control run a no-op)."""
+        if not os.path.isfile(path):
+            return False
+        with open(path) as f:
+            return set(a.kinds) <= {r["kind"] for r in csv.DictReader(f)}
+
     jobs = [(a.inputs_dir, a.out_root, m, k, a.kinds, None) for m in a.models for k in keys
-            if not os.path.isfile(os.path.join(a.diag_dir, f"{m}_{k}.csv"))]
+            if not covers_kinds(os.path.join(a.diag_dir, f"{m}_{k}.csv"))]
     with Pool(a.workers) as pool:
         for key, model, rows in pool.imap_unordered(do_chain, jobs):
-            with open(os.path.join(a.diag_dir, f"{model}_{key}.csv"), "w", newline="") as f:
-                w = csv.DictWriter(f, list(rows[0]))
-                w.writeheader()
-                w.writerows(rows)
+            atomic_csv(os.path.join(a.diag_dir, f"{model}_{key}.csv"), list(rows[0]), rows)
             print(f"{model} {key}: {len(rows)} rows", flush=True)
 
 

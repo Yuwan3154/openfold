@@ -11,12 +11,14 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 
 import numpy as np
 
 import indel_pool as ip
+from atomic_io import atomic_savez
 
 TEMP, SEED, NSEQ, MODEL = "0.1", 37, 32, "v_48_020"
 
@@ -69,7 +71,7 @@ def main():
     p.add_argument("--num-shards", type=int, default=1)
     p.add_argument("--chains", nargs="*", default=None)
     a = p.parse_args()
-    files = sorted(os.path.join(r, f) for r, _, fs in os.walk(a.pool_root) for f in fs if f.endswith(".npz"))
+    files = sorted(os.path.join(r, f) for r, _, fs in os.walk(a.pool_root) for f in fs if f.endswith(".npz") and ".tmp" not in f)
     if a.chains:
         files = [f for f in files if os.path.basename(f)[:-4] in a.chains]
     for path in files[a.shard::a.num_shards]:
@@ -80,13 +82,20 @@ def main():
             continue
         N = int(z["n_templates"])
         wd = os.path.join(a.work_dir, chain)
-        os.makedirs(os.path.join(wd, "pdb"), exist_ok=True)
+        if os.path.isdir(wd):
+            shutil.rmtree(wd)  # stale t<i>.pdb / seqs of an earlier run would change the RNG stream and the .fa files read back
+        os.makedirs(os.path.join(wd, "pdb"))
         for i in range(N):
             t = ip.read_template(path, i)
             write_backbone_pdb(os.path.join(wd, "pdb", f"t{i:03d}.pdb"), t["coords"], t["atom_mask"], t["aatype"])
         jsonl = os.path.join(wd, "parsed.jsonl")
         subprocess.run([sys.executable, os.path.join(a.mpnn_dir, "helper_scripts", "parse_multiple_chains.py"),
                         "--input_path", os.path.join(wd, "pdb"), "--output_path", jsonl], check=True)
+        with open(jsonl) as f:  # parse_multiple_chains lists the directory unsorted; one seed over the whole file makes designs order-dependent
+            recs = sorted((json.loads(ln) for ln in f if ln.strip()), key=lambda r: int(r["name"][1:]))
+        assert [r["name"] for r in recs] == [f"t{i:03d}" for i in range(N)], (chain, "parsed jsonl does not hold exactly the written templates")
+        with open(jsonl, "w") as f:
+            f.write("\n".join(json.dumps(r) for r in recs) + "\n")
         subprocess.run([sys.executable, os.path.join(a.mpnn_dir, "protein_mpnn_run.py"), "--jsonl_path", jsonl,
                         "--out_folder", wd, "--num_seq_per_target", str(NSEQ), "--sampling_temp", TEMP, "--seed", str(SEED),
                         "--batch_size", str(NSEQ), "--model_name", MODEL], check=True)
@@ -107,7 +116,7 @@ def main():
                  design_ok=np.isfinite(score).all(1) & np.isfinite(native_score),
                  design_meta_json=np.array(json.dumps(dict(model=MODEL, sampling_temp=float(TEMP), seed=SEED, n_seq=NSEQ,
                                                            omit_AAs="X", backbone_noise=0.0, weights="vanilla"))))
-        np.savez(path, **z)
+        atomic_savez(path, **z)
         print(f"{chain}: designed {N} backbones x {NSEQ} sequences; {int((~z['design_ok']).sum())} with non-finite MPNN scores: "
               f"{[int(i) for i in np.flatnonzero(~z['design_ok'])]}", flush=True)
 

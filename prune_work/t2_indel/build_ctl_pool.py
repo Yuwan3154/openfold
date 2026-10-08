@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 
 import indel_pool as ip
+from atomic_io import atomic_savez
 
 
 def main():
@@ -38,7 +39,7 @@ def main():
                                   L_native=L))
         path = ip.shard_path(a.out_root, chain)
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        np.savez(path, **ip.pack_chain(chain, items))
+        atomic_savez(path, **ip.pack_chain(chain, items))
         for i, it in enumerate(items):
             rows.append(dict(chain=chain, file=os.path.relpath(path, a.out_root), i=i, arm="control", draw=it["draw"], rewind=it["rewind"],
                              L=L, tm_native=it["tm_native"]))

@@ -19,6 +19,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from atomic_io import atomic_savez
+
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from generate_templates import MODEL_EPOCH, sampling_kwargs  # noqa: E402
 from protpardelle.core.models import load_model  # noqa: E402
@@ -108,7 +110,7 @@ def main():
                     continue
                 res, L = run_item(model, str(pdb), a.rewinds, a.schedule, seed)
                 assert L == span, (key, name, L, span)
-                np.savez(out, model=a.model, schedule=a.schedule, seed=np.int64(seed), L_new=np.int32(L), **res)
+                atomic_savez(out, model=a.model, schedule=a.schedule, seed=np.int64(seed), L_new=np.int32(L), **res)
                 done += 1
                 print(f"{a.model} {key} {name} L={L} {float(res['seconds']):.1f}s ({a.schedule}) "
                       f"done={done} skipped={skipped}", flush=True)

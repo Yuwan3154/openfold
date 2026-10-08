@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 
 import indel_pool as ip
+from atomic_io import atomic_savez
 
 
 def main():
@@ -37,7 +38,7 @@ def main():
         items = []
         for name, sweep, inputs, sc in arms:
             plans = json.load(open(os.path.join(inputs, chain, "plans.json")))
-            files = sorted(f for f in os.listdir(os.path.join(sweep, a.model, chain)) if f.startswith("d"))
+            files = sorted(f for f in os.listdir(os.path.join(sweep, a.model, chain)) if f.startswith("d") and f.endswith(".npz") and ".tmp" not in f)
             if a.draws is not None:
                 want = [f"d{k:02d}.npz" for k in a.draws]
                 assert all(f in files for f in want), (chain, name, "missing draws", sorted(set(want) - set(files)))
@@ -57,7 +58,7 @@ def main():
         pack = ip.pack_chain(chain, items)
         path = ip.shard_path(a.out_root, chain)
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        np.savez(path, **pack)
+        atomic_savez(path, **pack)
         for i, it in enumerate(items):
             index_rows.append(dict(chain=chain, file=os.path.relpath(path, a.out_root), i=i, arm=it["arm"], draw=it["draw"],
                                    rewind=it["rewind"], L=len(it["aatype"]), tm_native=it["tm_native"]))

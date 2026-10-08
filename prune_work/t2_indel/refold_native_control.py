@@ -10,6 +10,8 @@ import os
 
 import numpy as np
 
+from atomic_io import atomic_savez
+
 AA3 = {"ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C", "GLN": "Q", "GLU": "E", "GLY": "G", "HIS": "H", "ILE": "I",
        "LEU": "L", "LYS": "K", "MET": "M", "PHE": "F", "PRO": "P", "SER": "S", "THR": "T", "TRP": "W", "TYR": "Y", "VAL": "V"}
 
@@ -52,7 +54,7 @@ def main():
                 res = builder.fold(model, StructurePredictionInput(sequences=[ProteinInput(id="A", sequence=seq)]), seed=0)
             pos = np.asarray(res.complex.to_protein_complex().atom37_positions, np.float16)
             pl, pt = np.asarray(res.plddt.float().cpu() if torch.is_tensor(res.plddt) else res.plddt, np.float32).reshape(-1), float(res.ptm)
-        np.savez(os.path.join(a.out, f"{chain}_t000.npz"), pred_atom37=pos[None], plddt=pl[None], ptm=np.array([pt], np.float32),
+        atomic_savez(os.path.join(a.out, f"{chain}_t000.npz"), pred_atom37=pos[None], plddt=pl[None], ptm=np.array([pt], np.float32),
                  template_ca=ca.astype(np.float32), seqs=np.array([seq]), seed=np.int32(0))
         print(f"{chain}: native L={len(seq)} mean pLDDT {pl.mean():.3f}", flush=True)
 

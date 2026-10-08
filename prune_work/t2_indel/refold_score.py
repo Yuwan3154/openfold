@@ -43,11 +43,12 @@ def main():
     p.add_argument("--control", action="store_true", help="native-sequence control files: no pool lookup, seq_kind 0 only")
     a = p.parse_args()
     rows = []
-    for f in sorted(glob.glob(os.path.join(a.in_dir, "*.npz"))):
+    for f in sorted(f for f in glob.glob(os.path.join(a.in_dir, "*.npz")) if ".tmp" not in os.path.basename(f)):
         chain, ti = os.path.basename(f)[:-4].rsplit("_t", 1)
         temp = float(ti.split("_T")[1]) if "_T" in ti else np.nan   # lower-temperature test files: <chain>_t<i>_T<T>.npz
         ti = int(ti.split("_T")[0])
         z = np.load(f)
+        assert a.control or np.isnan(temp), f"{f}: lower-temperature files hold only designs (no generation sequence), score them with --control"
         t = None if a.control else ip.read_template(ip.shard_path(a.pool_root, chain), ti)
         S = len(z["seqs"])
         with tempfile.TemporaryDirectory() as td:
@@ -60,7 +61,7 @@ def main():
                 tm_s, _ = run(pred, tpl)
                 n, c = z["pred_atom37"][s][:, 0].astype(np.float32), z["pred_atom37"][s][:, 2].astype(np.float32)
                 cn = np.linalg.norm(n[1:] - c[:-1], axis=1)
-                rows.append(dict(method=a.method, chain=chain, i=ti, temp=temp, arm=("control" if a.control else t["arm"]), L=len(z["seqs"][0]), seq_kind=s,
+                rows.append(dict(method=a.method, chain=chain, i=ti, temp=temp, arm=("control" if a.control else t["arm"]), L=len(z["seqs"][0]), seq_kind=(s + 1 if np.isfinite(temp) else s),
                                  tm_paired=tm_p, rmsd_paired=rm_p, tm_seqind=tm_s, plddt=float(z["plddt"][s].mean()),
                                  ptm=float(z["ptm"][s]), cn_median=float(np.median(cn)), cn_broken=float((cn > 2.0).mean()),
                                  mpnn_score=float(t["design_score"][s - 1]) if (s > 0 and not a.control) else np.nan,

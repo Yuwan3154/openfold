@@ -10,13 +10,14 @@ Run: python score_indel.py --inputs-dir <inputs> --out-root <gen out> --score-di
      python score_indel.py --inputs-dir <inputs> --score-dir <dir> --edited-only [--chains ...]
 """
 import argparse
-import csv
 import os
 import subprocess
 import tempfile
 from multiprocessing import Pool
 
 import numpy as np
+
+from atomic_io import atomic_csv
 
 USALIGN = os.path.expanduser("~/.local/bin/USalign")
 COLS = ["model", "chain", "kind", "draw", "rewind", "L_native", "L_template", "tm_native", "tm_template",
@@ -75,7 +76,7 @@ def tasks_for_chain(inputs_dir, out_root, key, models, edited_only):
             tasks.append(("none", key, "edited", k, 0, ca_from_pdb(os.path.join(d, f"d{k:02d}.pdb")), nat_pdb, L_nat))
         return tasks
     for m in models:
-        for fn in sorted(os.listdir(os.path.join(out_root, m, key))):
+        for fn in sorted(f for f in os.listdir(os.path.join(out_root, m, key)) if f.endswith(".npz") and ".tmp" not in f):
             z = np.load(os.path.join(out_root, m, key, fn))
             kind = "indel" if fn.startswith("d") else "control"
             cas = unpack_ca(z)
@@ -105,10 +106,7 @@ def main():
                 continue
             rows = pool.map(score_one, tasks_for_chain(a.inputs_dir, a.out_root, key, a.models, a.edited_only),
                             chunksize=8)
-            with open(out, "w", newline="") as f:
-                w = csv.DictWriter(f, COLS)
-                w.writeheader()
-                w.writerows(rows)
+            atomic_csv(out, COLS, rows)
             print(f"{key}: {len(rows)} rows, median tm_native {np.median([r['tm_native'] for r in rows]):.3f}",
                   flush=True)
 

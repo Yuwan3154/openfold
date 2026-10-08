@@ -34,6 +34,7 @@ def pack_chain(chain, items):
     for it in items:
         assert int(it["atom_mask"].sum()) == len(it["coords"]), "atom_mask does not match the packed coords"
         assert len(it["orig_idx"]) == len(it["aatype"])
+        assert np.isfinite(it["coords"]).all(), "non-finite template coordinates (MPNN would silently featurize them as 0)"
     return dict(
         n_templates=np.int32(len(items)),
         res_offsets=np.concatenate([[0], np.cumsum(L)]),
@@ -66,6 +67,7 @@ def read_template(path, i):
         out["design_aatype"] = z["design_aatype"][:, r0:r1]
         out["design_score"], out["design_global_score"] = z["design_score"][i], z["design_global_score"][i]
         out["design_recovery"] = z["design_recovery"][i]
+        out["design_ok"] = bool(z["design_ok"][i]) if "design_ok" in z.files else True
     return out
 
 

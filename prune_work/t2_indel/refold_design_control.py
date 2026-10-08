@@ -8,6 +8,7 @@ import os
 import numpy as np
 import torch
 
+from atomic_io import atomic_savez
 from refold_native_control import native
 
 
@@ -46,7 +47,7 @@ def main():
             pos.append(np.asarray(res.complex.to_protein_complex().atom37_positions, np.float16))
             pl.append(np.asarray(res.plddt.float().cpu() if torch.is_tensor(res.plddt) else res.plddt, np.float32).reshape(-1))
             pt.append(float(res.ptm))
-        np.savez(os.path.join(a.out, f"{chain}_t000.npz"), pred_atom37=np.stack(pos), plddt=np.stack(pl), ptm=np.array(pt, np.float32),
+        atomic_savez(os.path.join(a.out, f"{chain}_t000.npz"), pred_atom37=np.stack(pos), plddt=np.stack(pl), ptm=np.array(pt, np.float32),
                  template_ca=ca.astype(np.float32), seqs=np.array(seqs), seed=np.int32(0))
         print(f"{chain}: {len(seqs)} predictions, native pLDDT {pl[0].mean():.3f}, designs {np.mean([x.mean() for x in pl[1:]]):.3f}", flush=True)
 

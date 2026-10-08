@@ -30,7 +30,7 @@ def main():
     p.add_argument("--out", required=True)
     a = p.parse_args()
     rows = []
-    for f in sorted(glob.glob(os.path.join(a.in_dir, "*.npz"))):
+    for f in sorted(f for f in glob.glob(os.path.join(a.in_dir, "*.npz")) if ".tmp" not in os.path.basename(f)):
         chain, ti = os.path.basename(f)[:-4].rsplit("_t", 1)
         ti = int(ti)
         z = np.load(f)

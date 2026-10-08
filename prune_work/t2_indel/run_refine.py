@@ -19,6 +19,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from atomic_io import atomic_savez
+
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from generate_templates import MODEL_EPOCH, sampling_kwargs  # noqa: E402
 from make_indel_inputs import ATOM37, write_pdb  # noqa: E402
@@ -105,7 +107,7 @@ def main():
                     c, am, aa, ri = sample_once(model, tmp, par["r"])
                     os.remove(tmp)
             coords_all.append(c.reshape(-1, 3)[am.reshape(-1)])
-        np.savez(out, coords=np.stack(coords_all), atom_mask=am, aatype=aa, residue_index=ri,
+        atomic_savez(out, coords=np.stack(coords_all), atom_mask=am, aatype=aa, residue_index=ri,
                  rewind_steps=np.asarray(a.rungs, np.int16), L_new=np.int32(am.shape[0]), model=tag)
         done += 1
         print(f"{tag} {key} d{k:02d} done={done}/{len(jobs)} {time.perf_counter() - t0:.0f}s", flush=True)

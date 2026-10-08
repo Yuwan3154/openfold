@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 import indel_pool as ip
+from atomic_io import atomic_savez
 
 
 def main():
@@ -49,7 +50,7 @@ def main():
             pos.append(np.asarray(pc.atom37_positions, np.float16))
             pl.append(np.asarray(res.plddt.float().cpu() if torch.is_tensor(res.plddt) else res.plddt, np.float32).reshape(-1))
             pt.append(float(res.ptm))
-        np.savez(out, pred_atom37=np.stack(pos), plddt=np.stack(pl), ptm=np.array(pt, np.float32),
+        atomic_savez(out, pred_atom37=np.stack(pos), plddt=np.stack(pl), ptm=np.array(pt, np.float32),
                  template_ca=ip.atom37_coords(t)[:, 1], seqs=np.array(seqs), seed=np.int32(0))
         print(f"{chain} t{i}: {len(seqs)} predictions, L={len(seqs[0])}, {time.perf_counter() - t0:.0f}s, "
               f"mean pLDDT first={pl[0].mean():.3f} designs={np.mean([x.mean() for x in pl[1:]]):.3f}", flush=True)

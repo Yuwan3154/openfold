@@ -14,6 +14,7 @@ import time
 import numpy as np
 
 import indel_pool as ip
+from atomic_io import atomic_savez
 from mpnn_design_pool import write_backbone_pdb
 
 
@@ -56,7 +57,7 @@ def main():
             pos.append(np.asarray(aux["atom_positions"], np.float16))
             pl.append(np.asarray(aux["plddt"], np.float32))
             pt.append(float(aux["log"]["ptm"]))
-        np.savez(out, pred_atom37=np.stack(pos), plddt=np.stack(pl), ptm=np.array(pt, np.float32),
+        atomic_savez(out, pred_atom37=np.stack(pos), plddt=np.stack(pl), ptm=np.array(pt, np.float32),
                  template_ca=ip.atom37_coords(t)[:, 1], seqs=np.array(seqs), seed=np.int32(0), num_recycles=np.int32(a.num_recycles))
         print(f"{chain} t{i}: {len(seqs)} predictions, L={len(seqs[0])}, {time.perf_counter() - t0:.0f}s, "
               f"mean pLDDT first={pl[0].mean():.1f} designs={np.mean([x.mean() for x in pl[1:]]):.1f}", flush=True)

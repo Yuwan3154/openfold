@@ -35,10 +35,10 @@ def main():
             aa = f["aatype"].numpy()
             assert (aa[orig < 0] == gly).all()
             assert np.array_equal(aa[orig >= 0], nat_aa[orig[orig >= 0]])
-            ca_new = f["atom_positions"].numpy()[:, 1] if "atom_positions" in f else None
-            if ca_new is not None:
-                ca_nat = nat["atom_positions"].numpy()[:, 1]
-                assert np.allclose(ca_new[orig >= 0], ca_nat[orig[orig >= 0]], atol=2e-3)
+            assert "atom_positions" in f, (key, k, "reader returned no coordinates: the survivor CA check cannot run")
+            ca_new = f["atom_positions"].numpy()[:, 1]
+            ca_nat = nat["atom_positions"].numpy()[:, 1]
+            assert np.allclose(ca_new[orig >= 0], ca_nat[orig[orig >= 0]], atol=2e-3)
             n_files += 1
             n_ins += int((orig < 0).sum())
             n_surv += int((orig >= 0).sum())

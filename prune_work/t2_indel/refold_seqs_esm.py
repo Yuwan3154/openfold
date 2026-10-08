@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 import indel_pool as ip
+from atomic_io import atomic_savez
 
 
 def main():
@@ -34,7 +35,7 @@ def main():
             pos.append(np.asarray(r.complex.to_protein_complex().atom37_positions, np.float16))
             pl.append(np.asarray(r.plddt.float().cpu() if torch.is_tensor(r.plddt) else r.plddt, np.float32).reshape(-1))
             pt.append(float(r.ptm))
-        np.savez(out, pred_atom37=np.stack(pos), plddt=np.stack(pl), ptm=np.array(pt, np.float32),
+        atomic_savez(out, pred_atom37=np.stack(pos), plddt=np.stack(pl), ptm=np.array(pt, np.float32),
                  template_ca=ip.atom37_coords(t)[:, 1], seqs=np.array(rec["seqs"]), seed=np.int32(0),
                  temp=np.float32(rec["T"]), n_unique=np.int32(rec["n_unique"]))
         print(f"{name}: {len(pos)} folds, {time.perf_counter() - t0:.0f}s, mean pLDDT {np.mean([x.mean() for x in pl]):.3f}", flush=True)
