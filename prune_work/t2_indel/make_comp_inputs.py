@@ -34,9 +34,16 @@ def main():
     p.add_argument("--inputs-dir", required=True)
     p.add_argument("--out-dir", required=True)
     p.add_argument("--cg-dir", default=None)
+    p.add_argument("--fills", default=None, help="fills.json of esmc_fill_pilot.py: take the inserted types from it instead of the composition draw")
+    p.add_argument("--fill-arm", default=None, help="arm name inside --fills (e.g. esmc_T0.7_p1.0)")
     p.add_argument("--chains", nargs="+", required=True)
     p.add_argument("--draws", type=int, nargs="+", required=True)
     a = p.parse_args()
+    fill_of = {}
+    if a.fills:
+        assert a.fill_arm, "--fills needs --fill-arm"
+        fill_of = {(r["chain"], r["draw"]): r["fill"] for r in json.load(open(a.fills)) if r["arm"] == a.fill_arm}
+        assert fill_of, f"arm {a.fill_arm} not in {a.fills}"
     for key in a.chains:
         src, dst = os.path.join(a.inputs_dir, key), os.path.join(a.out_dir, key)
         os.makedirs(dst, exist_ok=True)
@@ -46,6 +53,9 @@ def main():
             orig = np.array(plans["plans"][k]["orig_idx"])
             rng = np.random.default_rng([zlib.crc32(key.encode()), k, 77])
             ins_types = rng.choice(nat, size=int((orig < 0).sum()))
+            if a.fills:
+                ins_types = list(fill_of[(key, k)])
+                assert len(ins_types) == int((orig < 0).sum()), (key, k, len(ins_types))
             seq, it = [], iter(ins_types)
             for o in orig:
                 seq.append(nat[o] if o >= 0 else next(it))

@@ -23,6 +23,7 @@ def main():
     p.add_argument("--model", default="cc89")
     p.add_argument("--arm", nargs=4, action="append", metavar=("NAME", "SWEEP", "INPUTS", "SCORES"), required=True)
     p.add_argument("--chains", nargs="*", default=None)
+    p.add_argument("--draws", type=int, nargs="*", default=None, help="pilot subsets: only these draws (all must exist); default: every plan")
     a = p.parse_args()
     arms = []
     for name, sweep, inputs, scores in a.arm:
@@ -37,7 +38,12 @@ def main():
         for name, sweep, inputs, sc in arms:
             plans = json.load(open(os.path.join(inputs, chain, "plans.json")))
             files = sorted(f for f in os.listdir(os.path.join(sweep, a.model, chain)) if f.startswith("d"))
-            assert len(files) == len(plans["plans"]), (chain, name, len(files), len(plans["plans"]))
+            if a.draws is not None:
+                want = [f"d{k:02d}.npz" for k in a.draws]
+                assert all(f in files for f in want), (chain, name, "missing draws", sorted(set(want) - set(files)))
+                files = want
+            else:
+                assert len(files) == len(plans["plans"]), (chain, name, len(files), len(plans["plans"]))
             for fn in files:
                 k = int(fn[1:3])
                 z = np.load(os.path.join(sweep, a.model, chain, fn))
