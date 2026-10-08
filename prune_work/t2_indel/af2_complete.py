@@ -75,6 +75,7 @@ def main():
     p.add_argument("--out", required=True)
     p.add_argument("--data-dir", default=os.path.expanduser("~"))
     p.add_argument("--num-recycles", type=int, default=3)
+    p.add_argument("--control", action="store_true", help="KNOWN-GOOD control: the unedited native.pdb as template AND query (nothing removed); --draws is ignored")
     a = p.parse_args()
     os.makedirs(a.out, exist_ok=True)
     # V100 (sm_70) has no bfloat16 units: the default use_bfloat16=True segfaulted (refold_af2.py shakedown)
@@ -82,16 +83,16 @@ def main():
     print("model built", flush=True)
     for c in a.chains:
         plans = json.load(open(os.path.join(a.inputs_dir, c, "plans.json")))["plans"]
-        for k in a.draws:
-            out = os.path.join(a.out, f"{c}_d{k:02d}.npz")
+        for k in ([-1] if a.control else a.draws):
+            out = os.path.join(a.out, f"{c}_native.npz" if a.control else f"{c}_d{k:02d}.npz")
             if os.path.isfile(out):
                 continue
-            raw = os.path.join(a.inputs_dir, c, f"d{k:02d}.pdb")
+            raw = os.path.join(a.inputs_dir, c, "native.pdb" if a.control else f"d{k:02d}.pdb")
             td = tempfile.TemporaryDirectory()
             pdb = os.path.join(td.name, "t.pdb")
             clean_pdb(raw, pdb)
             seq = pdb_sequence(pdb)
-            orig = np.array(plans[k]["orig_idx"])
+            orig = np.arange(len(seq)) if a.control else np.array(plans[k]["orig_idx"])
             rm = orig < 0
             assert len(seq) == len(orig), (c, k, len(seq), len(orig))
             kw = {"rm_template": runs(rm)} if rm.any() else {}
@@ -104,7 +105,7 @@ def main():
             np.savez(tmp, pred_atom37=np.asarray(aux["atom_positions"], np.float32), plddt=np.asarray(aux["plddt"], np.float32),
                      ptm=np.float32(aux["log"]["ptm"]), seq=np.array(seq), orig_idx=orig, rm=rm, num_recycles=np.int32(a.num_recycles))
             os.replace(tmp, out)
-            print(f"{c} d{k:02d}: L'={len(seq)} inserted={int(rm.sum())} {time.perf_counter() - t0:.0f}s "
+            print(f"{c} {'native' if a.control else f'd{k:02d}'}: L'={len(seq)} inserted={int(rm.sum())} {time.perf_counter() - t0:.0f}s "
                   f"pLDDT {100 * np.asarray(aux['plddt']).mean():.1f} ptm {float(aux['log']['ptm']):.2f}", flush=True)
 
 
