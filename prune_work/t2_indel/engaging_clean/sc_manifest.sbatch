@@ -7,4 +7,6 @@
 # SuperCloud-side manifest of the template tree that Engaging holds a pulled copy of
 mkdir -p /home/gridsan/cou/e_clean
 bash /home/gridsan/cou/of_t2indel/prune_work/t2_indel/engaging_clean/manifest_local.sh /home/gridsan/cou/pp1c_work/templates_merged /home/gridsan/cou/e_clean/sc_templates_merged.tsv.gz
-echo "rc_final=$?"
+rc=$?
+echo "rc_final=$rc"
+exit $rc

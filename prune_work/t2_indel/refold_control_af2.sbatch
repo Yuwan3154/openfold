@@ -14,4 +14,6 @@ export PYTHONNOUSERSITE=1 PYTHONUNBUFFERED=1
 cd /home/gridsan/cou/of_t2indel/prune_work/t2_indel
 D=/home/gridsan/cou/t2_indel_data
 python refold_native_control.py --method af2 --inputs-dir $D/inputs --chains 7du7_A 6kyf_A 5zo3_A 6ve7_W 6el2_A 6x61_B --out $D/refold_ctl_af2
-echo "rc_final=$?"
+rc=$?
+echo "rc_final=$rc"
+exit $rc

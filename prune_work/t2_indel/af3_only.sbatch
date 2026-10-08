@@ -8,4 +8,6 @@
 #SBATCH --output=/home/gridsan/cou/logs/t2indel_af3env-%j.out
 #SBATCH --error=/home/gridsan/cou/logs/t2indel_af3env-%j.err
 bash /home/gridsan/cou/of_t2indel/prune_work/t2_indel/af3_env_build.sbatch_body.sh
-echo "rc_final=$?"
+rc=$?
+echo "rc_final=$rc"
+exit $rc

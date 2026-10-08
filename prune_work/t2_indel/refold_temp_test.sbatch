@@ -19,4 +19,6 @@ python mpnn_temp_make.py --pool-root $D/pool_t250 --select 7du7_A:0 7du7_A:64 6k
 source activate esmfold2
 export HF_HUB_OFFLINE=1 PYTHONUNBUFFERED=1
 python refold_seqs_esm.py --pool-root $D/pool_t250 --seqs-json $D/temp_seqs.json --out $D/refold_temp
-echo "rc_final=$?"
+rc=$?
+echo "rc_final=$rc"
+exit $rc

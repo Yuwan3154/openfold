@@ -19,4 +19,6 @@ bash design_control_mpnn.sh $D/inputs $D/dctl_work $CH || { echo rc_final=1; exi
 source activate esmfold2
 export HF_HUB_OFFLINE=1 PYTHONUNBUFFERED=1
 python refold_design_control.py --work-dir $D/dctl_work --inputs-dir $D/inputs --chains $CH --out $D/refold_dctl_esm
-echo "rc_final=$?"
+rc=$?
+echo "rc_final=$rc"
+exit $rc

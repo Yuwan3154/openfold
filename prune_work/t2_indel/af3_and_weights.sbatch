@@ -11,8 +11,9 @@
 # (2) the ESMFold2 weights pre-fetch (esmfold2_weights.sh).
 source /etc/profile
 module load conda/Python-ML-2025b-pytorch
-bash /home/gridsan/cou/of_t2indel/prune_work/t2_indel/af3_env_build.sbatch_body.sh
-echo "rc_af3=$?"
-bash /home/gridsan/cou/of_t2indel/prune_work/t2_indel/esmfold2_weights.sh
-echo "rc_weights=$?"
-echo "rc_final=0"
+rc=0
+bash /home/gridsan/cou/of_t2indel/prune_work/t2_indel/af3_env_build.sbatch_body.sh || rc=$?
+echo "rc_af3=$rc"
+bash /home/gridsan/cou/of_t2indel/prune_work/t2_indel/esmfold2_weights.sh || rc=$?
+echo "rc_final=$rc"
+exit $rc
