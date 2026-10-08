@@ -9,6 +9,7 @@ Env: protpardelle on a GPU node. Run:
   python run_indel_pd.py --inputs-dir <inputs> --out-root <out> --model cc89 --chains 7du7_A --draws 0 1
 """
 import argparse
+import inspect
 import json
 import os
 import sys
@@ -23,6 +24,7 @@ from atomic_io import atomic_savez
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from generate_templates import MODEL_EPOCH, sampling_kwargs  # noqa: E402
+import protpardelle.core.models as ppm  # noqa: E402
 from protpardelle.core.models import load_model  # noqa: E402
 from protpardelle.data.pdb_io import load_feats_from_pdb  # noqa: E402
 from protpardelle.env import (  # noqa: E402
@@ -33,18 +35,21 @@ from protpardelle.env import (  # noqa: E402
 from protpardelle.utils import seed_everything  # noqa: E402
 
 
-def run_item(model, pdb, rewinds, schedule, seed):
+def run_item(model, pdb, rewinds, schedule, seed, seed_self_cond=False):
     feats, _ = load_feats_from_pdb(pdb, include_pos_feats=True)
     n = len(rewinds) if schedule == "tiered" else 1
 
     def call(rw):
         ridx = torch.tile(feats["residue_index"][None], (n, 1)).cuda()
         cidx = torch.tile(feats["chain_index"][None], (n, 1)).cuda()
+        kw = sampling_kwargs(pdb, rw)
+        if seed_self_cond:  # needs the protpardelle-1c patch partial_diffusion.seed_self_cond (patches/0001-*.patch); a stock checkout ignores the key
+            kw["partial_diffusion"]["seed_self_cond"] = True
         with torch.no_grad():
             return model.sample(
                 seq_mask=torch.ones_like(ridx).cuda(), residue_index=ridx, chain_index=cidx, hotspots=None,
                 sse_cond=None, adj_cond=None, motif_placements_full=None,
-                dummy_fill_mode=model.config.data.dummy_fill_mode, **sampling_kwargs(pdb, rw))
+                dummy_fill_mode=model.config.data.dummy_fill_mode, **kw)
 
     seed_everything(seed)
     t0 = time.perf_counter()
@@ -73,10 +78,14 @@ def main():
     p.add_argument("--draws", type=int, nargs="*", default=None, help="default: all draws in plans.json")
     p.add_argument("--kinds", nargs="+", default=["indel", "control"], choices=["indel", "control"])
     p.add_argument("--schedule", default="tiered", choices=["tiered", "grouped"])
+    p.add_argument("--seed-self-cond", action="store_true", help="first-step self-conditioning = the clean edited input (patched protpardelle-1c only)")
     p.add_argument("--span-cutoff", type=int, default=484)
     p.add_argument("--shard", type=int, default=0)
     p.add_argument("--num-shards", type=int, default=1)
     a = p.parse_args()
+    if a.seed_self_cond:  # a stock checkout would silently ignore the key and give an unseeded run
+        assert "seed_self_cond" in inspect.getsource(ppm.Protpardelle.sample), \
+            f"--seed-self-cond needs the patched protpardelle-1c (see patches/); loaded {ppm.__file__}"
     assert a.rewinds == sorted(a.rewinds, reverse=True), "rewinds must be descending"
 
     keys = a.chains if a.chains else sorted(os.listdir(a.inputs_dir))
@@ -108,9 +117,9 @@ def main():
                     open(Path(a.out_root) / "skipped.jsonl", "a").write(
                         json.dumps({"model": a.model, "chain": key, "item": name, "span": span}) + "\n")
                     continue
-                res, L = run_item(model, str(pdb), a.rewinds, a.schedule, seed)
+                res, L = run_item(model, str(pdb), a.rewinds, a.schedule, seed, a.seed_self_cond)
                 assert L == span, (key, name, L, span)
-                atomic_savez(out, model=a.model, schedule=a.schedule, seed=np.int64(seed), L_new=np.int32(L), **res)
+                atomic_savez(out, model=a.model, schedule=a.schedule, seed=np.int64(seed), L_new=np.int32(L), seed_self_cond=np.bool_(a.seed_self_cond), **res)
                 done += 1
                 print(f"{a.model} {key} {name} L={L} {float(res['seconds']):.1f}s ({a.schedule}) "
                       f"done={done} skipped={skipped}", flush=True)

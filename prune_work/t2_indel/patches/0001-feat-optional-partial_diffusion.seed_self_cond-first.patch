@@ -1,0 +1,81 @@
+From 9e2ed3c1945bb45229caa38c8ef124e9760ae80a Mon Sep 17 00:00:00 2001
+From: Chenxi Ou <kryst3154@outlook.com>
+Date: Thu, 8 Oct 2026 15:45:15 -0400
+Subject: [PATCH] feat: optional partial_diffusion.seed_self_cond - first-step
+ self-conditioning carries the clean (edited) input structure
+
+Flag-gated (default off = bit-identical). Seed = input coords dummy-filled like xt (no noise) / sigma_data, in the units forward() returns; non-tiered: initial x_self_cond; tiered: the x_self_cond_full buffer is seeded so entrants read it on their first step only; from the next step the model's own x0 is used.
+---
+ src/protpardelle/core/models.py | 28 ++++++++++++++++++++++------
+ 1 file changed, 22 insertions(+), 6 deletions(-)
+
+diff --git a/src/protpardelle/core/models.py b/src/protpardelle/core/models.py
+index 4104f66..314f9bb 100644
+--- a/src/protpardelle/core/models.py
++++ b/src/protpardelle/core/models.py
+@@ -1314,6 +1314,7 @@ class Protpardelle(nn.Module):
+         # .clone()` raised NameError -- i.e. xt_start could never be combined with partial
+         # diffusion. Keeping the pd setup and overriding only the coordinates makes `sample()`
+         # usable as the reference oracle for the tiered scheduler's equivalence gate.
++        pd_self_cond_seed = None  # set below when partial_diffusion.seed_self_cond is on
+         if partial_diffusion is not None and pd.enabled:
+             # `num_steps` may be a single rewind (all samples share one noise level) or a
+             # per-sample sequence of rewinds (one noise level per sample). The latter builds the
+@@ -1413,6 +1414,17 @@ class Protpardelle(nn.Module):
+                     noise_level=pd_noise_level,
+                     dummy_fill_mode=dummy_fill_mode,
+                 )
++            if "seed_self_cond" in pd and pd.seed_self_cond:
++                # Optional: the self-conditioning track of the FIRST step carries the clean (edited) input structure, dummy-filled
++                # exactly like xt but without noise and in the units forward() returns (coords / sigma_data); from the second step on
++                # the model's own x0 is used as usual. Off by default (bit-identical to the previous behaviour).
++                seed_mask = bb_atom_mask if ("repack" in pd and pd.repack) else pd_atom_mask
++                pd_self_cond_seed = (
++                    dummy_fill_noise_coords(
++                        pd_coords, seed_mask, noise_level=None, dummy_fill_mode=dummy_fill_mode
++                    )
++                    / self.sigma_data
++                )
+             logger.info(
+                 "Partial diffusion, going back to step %d, T=%.2f",
+                 pd_step,
+@@ -1467,7 +1479,7 @@ class Protpardelle(nn.Module):
+         # Prepare to run sampling trajectory
+         sigma = torch.full((seq_mask.shape[0],), sigma, device=self.device)
+         x0 = None
+-        x_self_cond = None
++        x_self_cond = pd_self_cond_seed
+         s_logprobs = None
+         s_self_cond = None
+         if tqdm_pbar is None:
+@@ -1580,8 +1592,12 @@ class Protpardelle(nn.Module):
+             seq_mask_full = seq_mask
+             residue_index_full = residue_index
+             chain_index_full = chain_index
+-            # zeros == the "no previous prediction" state a fresh member must start from
+-            x_self_cond_full = torch.zeros_like(xt_full)
++            # zeros == the "no previous prediction" state a fresh member must start from (unless partial_diffusion.seed_self_cond seeds it)
++            x_self_cond_full = (
++                torch.zeros_like(xt_full)
++                if pd_self_cond_seed is None
++                else pd_self_cond_seed.clone()  # entrants read their seed on their first step only
++            )
+             x0_full = None            # allocated after the first forward pass
+             n_prev_active = 0         # how many members were active on the previous iteration
+             tiered_fresh_from = 0
+@@ -1619,9 +1635,9 @@ class Protpardelle(nn.Module):
+                 # contiguous PREFIX -- which turns ragged injection into simple [:n] slicing, with
+                 # no dynamic concatenation and no per-member bookkeeping.
+                 # Members not yet entered keep their pre-noised seed untouched in the full buffer.
+-                # A member entering now must see struct_self_cond == 0 for its first step, which is
+-                # exactly what the zero-initialized full buffer provides (models.py:473-474 does
+-                # the same for a None self-cond).
++                # A member entering now must see struct_self_cond == 0 (or, with partial_diffusion.seed_self_cond, its
++                # clean-input seed) for its first step, which is exactly what the initialised full buffer provides
++                # (models.py:473-474 does the same for a None self-cond).
+                 n_active = int(tiered_n_active[i])
+                 xt = xt_full[:n_active]
+                 s_hat = s_hat_full[:n_active]
+-- 
+2.54.0 (Apple Git-157)
+
