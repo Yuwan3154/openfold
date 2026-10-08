@@ -12,6 +12,7 @@ Run: python af2_complete.py --inputs-dir D --chains c.. --draws k.. --out OUT
 import argparse
 import json
 import os
+import tempfile
 import time
 
 import numpy as np
@@ -29,6 +30,26 @@ def pdb_sequence(path):
             seq[int(ln[22:26])] = THREE2ONE[ln[17:20].strip()]
     assert sorted(seq) == list(range(1, len(seq) + 1)), path
     return "".join(seq[i] for i in sorted(seq))
+
+
+def clean_pdb(src, dst):
+    """Heavy atoms only, standard columns, chain A, no MODEL: the Raygun-arm inputs are cg2all (CHARMM) files with hydrogens (HT1, HA, ...),
+    a MODEL record and OT1/OT2 terminal oxygens, which Biopython/ColabDesign rejects ('Empty file'). OT1 -> O, OT2/OXT dropped."""
+    out, n, names = [], 0, {}
+    for ln in open(src):
+        if not ln.startswith("ATOM"):
+            continue
+        name = ln[12:16].strip()
+        if name[0] == "H" or name[0].isdigit() or name in ("OT2", "OXT"):
+            continue
+        name = "O" if name == "OT1" else name
+        assert ln[17:20] in THREE2ONE, (src, ln[17:20])
+        names.setdefault(int(ln[22:26]), set()).add(name)
+        n += 1
+        out.append(f"ATOM  {n:5d} {name:<4s} {ln[17:20]} A{int(ln[22:26]):4d}    {ln[30:54]}  1.00  0.00           {name[0]:>2s}")
+    assert n > 0 and sorted(names) == list(range(1, len(names) + 1)), src
+    assert all({"N", "CA", "C", "O"} <= v for v in names.values()), (src, [i for i, v in names.items() if not {"N", "CA", "C", "O"} <= v][:5])
+    open(dst, "w").write("\n".join(out) + "\nEND\n")
 
 
 def runs(mask):
@@ -65,13 +86,17 @@ def main():
             out = os.path.join(a.out, f"{c}_d{k:02d}.npz")
             if os.path.isfile(out):
                 continue
-            pdb = os.path.join(a.inputs_dir, c, f"d{k:02d}.pdb")
+            raw = os.path.join(a.inputs_dir, c, f"d{k:02d}.pdb")
+            td = tempfile.TemporaryDirectory()
+            pdb = os.path.join(td.name, "t.pdb")
+            clean_pdb(raw, pdb)
             seq = pdb_sequence(pdb)
             orig = np.array(plans[k]["orig_idx"])
             rm = orig < 0
             assert len(seq) == len(orig), (c, k, len(seq), len(orig))
             kw = {"rm_template": runs(rm)} if rm.any() else {}
             model.prep_inputs(pdb_filename=pdb, chain="A", **kw)
+            td.cleanup()
             t0 = time.perf_counter()
             model.predict(seq=seq, models=[0], num_recycles=a.num_recycles, verbose=False)
             aux = model.aux

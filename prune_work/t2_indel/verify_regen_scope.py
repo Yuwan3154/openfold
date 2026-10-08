@@ -21,8 +21,9 @@ TOL = 2e-3
 def read_bb(path):
     res = {}
     for ln in open(path):
-        if ln.startswith("ATOM") and ln[12:16].strip() in BB:
-            res.setdefault(int(ln[22:26]), {})[ln[12:16].strip()] = [float(ln[30:38]), float(ln[38:46]), float(ln[46:54])]
+        name = {"OT1": "O"}.get(ln[12:16].strip(), ln[12:16].strip())  # cg2all (Raygun-arm) files name the terminal oxygen OT1
+        if ln.startswith("ATOM") and name in BB:
+            res.setdefault(int(ln[22:26]), {})[name] = [float(ln[30:38]), float(ln[38:46]), float(ln[46:54])]
     return np.array([[res[i][a] for a in BB] for i in sorted(res)])
 
 
@@ -31,6 +32,7 @@ def main():
     p.add_argument("--inputs-dir", required=True)
     p.add_argument("--chains", nargs="+", required=True)
     p.add_argument("--out-csv", required=True)
+    p.add_argument("--ca-only", action="store_true", help="compare CA only (cg2all-built Raygun-arm files may move N/C/O slightly)")
     a = p.parse_args()
     rows = []
     for c in a.chains:
@@ -46,7 +48,7 @@ def main():
             if old.shape != new.shape or orig.tolist() != pl["orig_idx"]:
                 d, note = float("inf"), f"shape/orig_idx mismatch {old.shape} vs {new.shape}"
             else:
-                d = float(np.abs(old - new).max())
+                d = float(np.abs((old - new)[:, 1] if a.ca_only else old - new).max())
             rows.append(dict(chain=c, draw=k, max_abs_diff=d, changed=int(d > TOL), has_term=has_term, note=note))
     with open(a.out_csv, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0]))
