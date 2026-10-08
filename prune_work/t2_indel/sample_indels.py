@@ -43,11 +43,11 @@ def place_deletions(L, lengths, rng):
     return ops
 
 
-def draw_plan(L, chain, draw, global_seed=0):
+def draw_plan(L, chain, draw, global_seed=0, frac_lo=FRAC_LO, frac_hi=FRAC_HI):
     rng = np.random.default_rng([global_seed, zlib.crc32(chain.encode()), draw])
     rec = {}
     for name in ("ins", "del"):
-        frac = float(rng.uniform(FRAC_LO, FRAC_HI))
+        frac = float(rng.uniform(frac_lo, frac_hi))
         T = int(round(frac * L))
         k = int(rng.integers(1, K_MAX + 1))
         segs = split_total(T, k, rng)

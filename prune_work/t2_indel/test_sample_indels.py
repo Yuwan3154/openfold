@@ -92,3 +92,12 @@ def test_insertion_site_coverage_includes_terminals():
             if o[0] == "ins":
                 sites[o[1]] += 1
     assert -1 in sites and 59 in sites and len(sites) > 55
+
+
+def test_custom_fraction_range_is_respected_and_default_unchanged():
+    base = draw_plan(200, "c_A", 3)
+    assert draw_plan(200, "c_A", 3, 0, FRAC_LO, FRAC_HI) == base
+    for d in range(30):
+        r = draw_plan(300, "c_A", d, 0, 0.01, 0.05)
+        assert 0.01 <= r["ins"]["frac"] <= 0.05 and 0.01 <= r["del"]["frac"] <= 0.05
+        assert r["ins"]["T"] == sum(r["ins"]["segments"]) and r["del"]["T"] == sum(r["del"]["segments"])
