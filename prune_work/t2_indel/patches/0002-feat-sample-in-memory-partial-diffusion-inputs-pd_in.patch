@@ -1,0 +1,106 @@
+From 6a8fcf765b516fcabc6b0733bbff9af7a5f827f0 Mon Sep 17 00:00:00 2001
+From: Chenxi Ou <kryst3154@outlook.com>
+Date: Fri, 9 Oct 2026 16:54:45 -0400
+Subject: [PATCH] feat(sample): in-memory partial-diffusion inputs (pd_inputs)
+ with a known-atom mask
+
+Skips PDB writing/parsing for batches of distinct inputs; atoms outside known_mask are dummy-filled and noised (as the repack path does for side chains), per residue.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/protpardelle/core/models.py | 65 ++++++++++++++++++---------------
+ 1 file changed, 36 insertions(+), 29 deletions(-)
+
+diff --git a/src/protpardelle/core/models.py b/src/protpardelle/core/models.py
+index 4104f66..99678c3 100644
+--- a/src/protpardelle/core/models.py
++++ b/src/protpardelle/core/models.py
+@@ -958,6 +958,7 @@ class Protpardelle(nn.Module):
+         dummy_fill_mode: Literal["zero", "CA"] = "zero",
+         xt_start: Float[torch.Tensor, "B L A 3"] | None = None,
+         partial_diffusion: PartialDiffusion | None = None,
++        pd_inputs: dict | None = None,  # in-memory partial-diffusion inputs (aatype, atom_positions centred, known_mask), replaces the pdb parsing
+         conditional_cfg: ConditionalCfg | None = None,
+         motif_placements_full: list[str] | None = None,
+         motif_all_atom_stage1: Float[torch.Tensor, "B L A 3"] | None = None,
+@@ -1357,35 +1358,39 @@ class Protpardelle(nn.Module):
+             pd_step = min(pd_entry_steps)
+             pd_timestep = timesteps[pd_step]
+ 
+-            if not isinstance(pd.pdb_file_path, list):
+-                pd.pdb_file_path = [pd.pdb_file_path] * batch_size
+-
+-            # Parse each DISTINCT file once. The common case is one input structure replicated
+-            # across the batch (N templates from one structure); the original code re-parsed the
+-            # same PDB batch_size times, costing ~0.06 s per batch element (~7.7 s at B=128).
+-            pd_parsed: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+-            pd_motif_aatype, pd_motif_idx, pd_coords = [], [], []
+-            for pd_fp in pd.pdb_file_path:
+-                cache_key = str(pd_fp)
+-                if cache_key not in pd_parsed:
+-                    pd_feats, _ = load_feats_from_pdb(pd_fp, include_pos_feats=True)
+-                    centered = pd_feats["atom_positions"] - torch.mean(
+-                        pd_feats["atom_positions"][:, 1:2, :], dim=-3, keepdim=True
+-                    )
+-                    pd_parsed[cache_key] = (
+-                        make_fixed_size_1d(
+-                            pd_feats["aatype"].flatten().clone().detach(),
+-                            fixed_size=seq_mask.shape[-1],
+-                        )[0],
+-                        torch.arange(pd_feats["aatype"].shape[0]),
+-                        make_fixed_size_1d(centered, fixed_size=seq_mask.shape[-1])[0],
+-                    )
+-                cached_aatype, cached_idx, cached_coords = pd_parsed[cache_key]
+-                pd_motif_aatype.append(cached_aatype)
+-                pd_motif_idx.append(cached_idx)
+-                pd_coords.append(cached_coords)
+-            pd_motif_aatype = torch.stack(pd_motif_aatype).long().to(seq_mask.device)
+-            pd_coords = torch.stack(pd_coords).to(self.device)
++            if pd_inputs is not None:
++                pd_motif_aatype = pd_inputs["aatype"].long().to(seq_mask.device)
++                pd_coords = pd_inputs["atom_positions"].to(self.device)
++            else:
++                if not isinstance(pd.pdb_file_path, list):
++                    pd.pdb_file_path = [pd.pdb_file_path] * batch_size
++
++                # Parse each DISTINCT file once. The common case is one input structure replicated
++                # across the batch (N templates from one structure); the original code re-parsed the
++                # same PDB batch_size times, costing ~0.06 s per batch element (~7.7 s at B=128).
++                pd_parsed: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
++                pd_motif_aatype, pd_motif_idx, pd_coords = [], [], []
++                for pd_fp in pd.pdb_file_path:
++                    cache_key = str(pd_fp)
++                    if cache_key not in pd_parsed:
++                        pd_feats, _ = load_feats_from_pdb(pd_fp, include_pos_feats=True)
++                        centered = pd_feats["atom_positions"] - torch.mean(
++                            pd_feats["atom_positions"][:, 1:2, :], dim=-3, keepdim=True
++                        )
++                        pd_parsed[cache_key] = (
++                            make_fixed_size_1d(
++                                pd_feats["aatype"].flatten().clone().detach(),
++                                fixed_size=seq_mask.shape[-1],
++                            )[0],
++                            torch.arange(pd_feats["aatype"].shape[0]),
++                            make_fixed_size_1d(centered, fixed_size=seq_mask.shape[-1])[0],
++                        )
++                    cached_aatype, cached_idx, cached_coords = pd_parsed[cache_key]
++                    pd_motif_aatype.append(cached_aatype)
++                    pd_motif_idx.append(cached_idx)
++                    pd_coords.append(cached_coords)
++                pd_motif_aatype = torch.stack(pd_motif_aatype).long().to(seq_mask.device)
++                pd_coords = torch.stack(pd_coords).to(self.device)
+ 
+             # One vectorized noising call for the whole batch, each sample at its own sigma.
+             pd_noise_level = torch.tensor(
+@@ -1407,6 +1412,8 @@ class Protpardelle(nn.Module):
+                 )
+             else:
+                 pd_atom_mask = atom37_mask_from_aatype(pd_motif_aatype, seq_mask)
++                if pd_inputs is not None and pd_inputs.get("known_mask") is not None:
++                    pd_atom_mask = pd_atom_mask * pd_inputs["known_mask"].to(pd_atom_mask.device, pd_atom_mask.dtype)   # atoms absent from the input are dummy-filled and noised
+                 xt = dummy_fill_noise_coords(
+                     pd_coords,
+                     pd_atom_mask,
+-- 
+2.54.0 (Apple Git-157)
+
