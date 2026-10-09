@@ -1,4 +1,4 @@
-"""T3 export for localfold: for every af2compat template (set/chain/t) write the pool backbone as a PDB (N,CA,C,O + ideal CB from N,CA,C [AF2 formula], Gly none)
+"""T3 export for localfold: for every af2compat template (set/chain/t) write the pool backbone as a PDB (N,CA,C,O + ideal CB from N,CA,C [AF2 formula], also for Gly: ColabDesign adds a virtual CB to every residue)
 with residue names = the template's INPUT sequence ('own') or = the query sequence ('q', one template per query), and a run script folding each query (seq_kind 0 = input
 sequence, 1..4 = first MPNN designs, as af2_compat.py) with localfold model_1_ptm, 3 recycles, split over 4 GPUs. Queries are taken from the ColabDesign npz so both
 implementations fold the identical sequences. Run: python lf_t3_export.py T3_DIR OUT_DIR RUN_PREFIX REMOTE_DIR
@@ -26,8 +26,6 @@ def write_tpl(path, bb, names, resnums=None):
     resnums = np.arange(1, len(names) + 1) if resnums is None else resnums
     for i, nm in enumerate(names, start=1):
         for an, x in (("N", n[i - 1]), ("CA", ca[i - 1]), ("C", c[i - 1]), ("O", bb[i - 1, 3]), ("CB", cb[i - 1])):
-            if an == "CB" and nm == "G":
-                continue
             k += 1
             lines.append(f"ATOM  {k:5d} {an:<4s} {THREE[nm]:>3s} A{int(resnums[i - 1]):4d}    {x[0]:8.3f}{x[1]:8.3f}{x[2]:8.3f}  1.00  0.00          {an[0]:>2s}")
     open(path, "w").write("\n".join(lines) + "\nEND\n")

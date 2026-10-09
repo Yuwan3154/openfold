@@ -1,0 +1,51 @@
+diff --git a/cuda/featurise/af2_export.h b/cuda/featurise/af2_export.h
+index 49fca6a..2add55f 100644
+--- a/cuda/featurise/af2_export.h
++++ b/cuda/featurise/af2_export.h
+@@ -7,6 +7,7 @@
+ //                 [--a3m=<one or one a chain> [--paired-a3m=...] | --search] [--recycles=3] [--max-msa=512]
+ //                 [--max-extra=1024] [--seed=0] [--template=<file>:<chain>[@<chain>][+...]] [--template-search-chains=]
+ #pragma once
++#include <cstdlib>
+ #include <algorithm>
+ #include <chrono>
+ #include <cstdint>
+@@ -144,7 +145,9 @@ inline Af2Features makeA3mFeatures(const std::string& a3mText, const Af2Options&
+     p.centerCodes.resize(p.centers.size() * length);
+     for (size_t c = 0; c < p.centers.size(); ++c)
+       std::copy(encoded.begin() + (size_t)p.centers[c] * length, encoded.begin() + (size_t)(p.centers[c] + 1) * length, p.centerCodes.begin() + c * length);
++    static const bool noMlm = std::getenv("LOCALFOLD_NO_MLM") != nullptr;
+     for (size_t index = 0; index < p.centerCodes.size(); ++index) {
++      if (noMlm) continue;   // ColabDesign use_mlm=False: no BERT masking of the MSA row
+       if (random() >= 0.15) continue;
+       uint8_t original = p.centerCodes[index];
+       double draw = random();
+@@ -410,6 +413,7 @@ inline Af2Export exportAf2(const Args& args) {
+     std::string described = spec;
+     for (auto& p : searchParts) described += (described.empty() ? "" : " + ") + ("search hit " + p.label);
+     out.said.push_back("template: " + described + ", " + std::to_string(slot.covered) + " residues, " + std::to_string(slot.atoms) + " atoms");
++    if (std::getenv("LOCALFOLD_RM_TEMPLATE_SEQ")) std::fill(slot.aatype.begin(), slot.aatype.end(), 21);   // ColabDesign rm_template_seq: template_aatype = 21 (gap)
+     E.i("t/aatype", slot.aatype);
+     E.t("t/positions", slot.atomPositions);
+     E.t("t/mask", slot.atomMask);
+diff --git a/cuda/featurise/standalone.cpp b/cuda/featurise/standalone.cpp
+index 91db912..26f6cb0 100644
+--- a/cuda/featurise/standalone.cpp
++++ b/cuda/featurise/standalone.cpp
+@@ -1,5 +1,6 @@
+ // A port as one command - see standalone.h. Compiled by g++ with the featuriser's own flags (cuda/build.sh), so the
+ // input a standalone fold reads is byte for byte what cuda/featurise/<port>-featurise writes.
++#include <cstdlib>
+ #include "standalone.h"
+ #include "standalone_api.h"
+ 
+@@ -242,7 +243,8 @@ static int af3(Run& run, int (*fold)(int, char**), const char* argv0) {
+ static int af2(Run& run, int (*fold)(int, char**), const char* argv0) {
+   fetch::ModelWeights w = weightsFor(run, "af2");
+   std::string bundle = w.dirs[0];
+-  std::vector<std::string> foldArgs = {"--bundle=" + bundle, "--fast"};
++  std::vector<std::string> foldArgs = {"--bundle=" + bundle};
++  if (!std::getenv("LOCALFOLD_F32")) foldArgs.push_back("--fast");   // strict float32 only when asked
+   // models 2-5 of each are published as deltas on model 1, read as the page reads them
+   if (w.dirs.size() > 1) foldArgs.push_back("--delta=" + w.dirs[1]);
+   std::string warm = af2WarmShape(run.args);
