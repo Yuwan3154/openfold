@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 import shutil
+import zlib
 
 import numpy as np
 
@@ -26,7 +27,10 @@ def main():
     p.add_argument("--frac-lo", type=float, required=True)
     p.add_argument("--frac-hi", type=float, required=True)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--mut-frac-lo", type=float, default=None, help="optional point-mutation fraction range (with --mut-frac-hi): positions drawn uniformly among SURVIVORS")
+    p.add_argument("--mut-frac-hi", type=float, default=None)
     a = p.parse_args()
+    assert (a.mut_frac_lo is None) == (a.mut_frac_hi is None), "--mut-frac-lo and --mut-frac-hi go together"
     for c in a.chains:
         src, dst = os.path.join(a.inputs_dir, c), os.path.join(a.out_dir, c)
         os.makedirs(dst, exist_ok=True)
@@ -41,6 +45,14 @@ def main():
             rec = draw_plan(L, c, k, a.seed, a.frac_lo, a.frac_hi)
             assert rec["ins"]["T"] >= 1 and rec["del"]["T"] >= 1, (c, k, "edit fraction rounds to zero residues for this chain length")
             new, orig, n2n = edit(nat, [tuple(o) for o in rec["ops"]])
+            if a.mut_frac_lo is not None:
+                rng_m = np.random.default_rng([a.seed, zlib.crc32(c.encode()), k, 5])
+                fm = float(rng_m.uniform(a.mut_frac_lo, a.mut_frac_hi))
+                n_mut = int(round(fm * L))
+                surv_new = np.flatnonzero(orig >= 0)
+                assert 1 <= n_mut <= len(surv_new), (c, k, n_mut)
+                pick = sorted(rng_m.choice(surv_new, size=n_mut, replace=False).tolist())
+                rec["mut"] = {"frac": fm, "T": n_mut, "new_idx": pick, "native_idx": [int(orig[j]) for j in pick]}
             lines, n = [], 0
             for j, o in enumerate(orig, start=1):
                 if o >= 0:
@@ -55,7 +67,8 @@ def main():
             open(os.path.join(dst, f"d{k:02d}.pdb"), "w").write("\n".join(lines) + "\n")
             rec["orig_idx"], rec["native_to_new"], rec["L_new"] = orig.tolist(), n2n.tolist(), len(orig)
             plans.append(rec)
-        json.dump({"key": c, "L": L, "native_resnames": names, "plans": plans, "frac_range": [a.frac_lo, a.frac_hi]},
+        json.dump({"key": c, "L": L, "native_resnames": names, "plans": plans, "frac_range": [a.frac_lo, a.frac_hi],
+                   **({"mut_frac_range": [a.mut_frac_lo, a.mut_frac_hi]} if a.mut_frac_lo is not None else {})},
                   open(os.path.join(dst, "plans.json"), "w"))
         print(f"{c}: L={L} L_new range {min(p['L_new'] for p in plans)}-{max(p['L_new'] for p in plans)}", flush=True)
 

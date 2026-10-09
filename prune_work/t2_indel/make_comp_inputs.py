@@ -36,6 +36,8 @@ def main():
     p.add_argument("--cg-dir", default=None)
     p.add_argument("--fills", default=None, help="fills.json of esmc_fill_pilot.py: take the inserted types from it instead of the composition draw")
     p.add_argument("--fill-arm", default=None, help="arm name inside --fills (e.g. esmc_T0.7_p1.0)")
+    p.add_argument("--seqs", default=None, help="esmc_fill_mut.py JSON: take the FULL new-frame sequence (inserted + mutated types) from it; mutated survivors (plans mut.new_idx) are rebuilt by cg2all")
+    p.add_argument("--seq-arm", default=None, help="arm name inside --seqs (esmc_300m | esmc_600m)")
     p.add_argument("--chains", nargs="+", required=True)
     p.add_argument("--draws", type=int, nargs="+", required=True)
     a = p.parse_args()
@@ -44,6 +46,11 @@ def main():
         assert a.fill_arm, "--fills needs --fill-arm"
         fill_of = {(r["chain"], r["draw"]): r["fill"] for r in json.load(open(a.fills)) if r["arm"] == a.fill_arm}
         assert fill_of, f"arm {a.fill_arm} not in {a.fills}"
+    seq_of = {}
+    if a.seqs:
+        assert a.seq_arm and not a.fills, "--seqs needs --seq-arm and excludes --fills"
+        seq_of = {(r["chain"], r["draw"]): r["seq"] for r in json.load(open(a.seqs)) if r["arm"] == a.seq_arm}
+        assert seq_of, f"arm {a.seq_arm} not in {a.seqs}"
     for key in a.chains:
         src, dst = os.path.join(a.inputs_dir, key), os.path.join(a.out_dir, key)
         os.makedirs(dst, exist_ok=True)
@@ -59,6 +66,11 @@ def main():
             seq, it = [], iter(ins_types)
             for o in orig:
                 seq.append(nat[o] if o >= 0 else next(it))
+            mut_idx = set()
+            if a.seqs:
+                seq = list(seq_of[(key, k)])
+                assert len(seq) == len(orig), (key, k, len(seq), len(orig))
+                mut_idx = set(plans["plans"][k]["mut"]["new_idx"])
             plans["plans"][k]["comp_seq"] = "".join(seq)
             gly = atom_lines_by_res(os.path.join(src, f"d{k:02d}.pdb"))
             if a.stage == "bb":
@@ -73,8 +85,9 @@ def main():
                 cg = atom_lines_by_res(os.path.join(a.cg_dir, key, f"d{k:02d}.pdb"))
                 lines = []
                 for j, o in enumerate(orig, start=1):
-                    src_lines = gly[j] if orig[j - 1] >= 0 else cg[j]
-                    lines += [ln[:17] + f"{ONE2THREE[seq[j - 1]]:>3s}" + ln[20:] if orig[j - 1] < 0 else ln for ln in src_lines]
+                    native_kept = orig[j - 1] >= 0 and (j - 1) not in mut_idx
+                    src_lines = gly[j] if native_kept else cg[j]
+                    lines += [ln if native_kept else ln[:17] + f"{ONE2THREE[seq[j - 1]]:>3s}" + ln[20:] for ln in src_lines]
                 lines.append("END")
                 open(os.path.join(dst, f"d{k:02d}.pdb"), "w").write("\n".join(lines) + "\n")
         json.dump(plans, open(os.path.join(dst, "plans.json"), "w"))
