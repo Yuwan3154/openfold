@@ -33,7 +33,7 @@ def load_esmc(name, dev, pth):
     if pth is None:
         return ESMC.from_pretrained(name, device=torch.device(dev)).eval()
     d, h, n = ESMC_DIMS[name]
-    model = ESMC(d_model=d, n_heads=h, n_layers=n, tokenizer=get_esmc_model_tokenizers(), use_flash_attn=True).eval()
+    model = ESMC(d_model=d, n_heads=h, n_layers=n, tokenizer=get_esmc_model_tokenizers(), use_flash_attn=False).eval()   # fp32 without flash attention: the same numerics as the old CPU route
     model.load_state_dict(torch.load(pth, map_location="cpu"))
     return model.to(dev)
 
