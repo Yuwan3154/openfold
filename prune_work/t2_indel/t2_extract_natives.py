@@ -23,6 +23,7 @@ def main():
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--proteina-src", required=True, help="proteina checkout (read-only) providing proteinfoundation.utils.constants")
     ap.add_argument("--index", default=None, help="TSV id<TAB>path of the processed .pt files")
+    ap.add_argument("--lengths-out", default=None, help="write TSV id<TAB>L of every usable chain (also those already extracted): input of the length-sorted stage B order")
     ap.add_argument("--stats-only", action="store_true")
     a = ap.parse_args()
     sys.path.insert(0, a.proteina_src)
@@ -30,12 +31,13 @@ def main():
 
     ids = [ln.strip() for ln in open(a.chains_file) if ln.strip()]
     path_of = dict(ln.rstrip("\n").split("\t") for ln in open(a.index)) if a.index else {}
-    skipped, n_ok, lens = [], 0, []
+    skipped, n_ok, lens, id_len = [], 0, [], []
     os.makedirs(a.out_dir, exist_ok=True)
     for cid in ids:
         out = os.path.join(a.out_dir, cid[1:3], cid + ".npz")
         if os.path.isfile(out) and not a.stats_only:
             n_ok += 1
+            id_len.append((cid, int(np.load(out)["coords"].shape[0])))
             continue
         pt = path_of.get(cid, os.path.join(a.processed_dir, cid[1:3], cid + ".pt"))
         if not os.path.isfile(pt):
@@ -53,12 +55,16 @@ def main():
         n_inc = int((~mask[:, [0, 1, 2, 4]].all(1)).sum())   # AF order: N 0, CA 1, C 2, CB 3, O 4: residues kept with missing backbone atoms
         n_ok += 1
         lens.append(L)
+        id_len.append((cid, L))
         if not a.stats_only:
             os.makedirs(os.path.dirname(out), exist_ok=True)
             np.savez(out + ".tmp.npz", coords=coords, mask=mask, sequence=np.array(d.sequence), residue_pdb_idx=d.residue_pdb_idx.numpy(), n_incomplete=np.int32(n_inc))
             os.replace(out + ".tmp.npz", out)
     with open(os.path.join(a.out_dir, "skipped.tsv" if not a.stats_only else "skipped_stats.tsv"), "w") as f:
         f.writelines("\t".join(r) + "\n" for r in skipped)
+    if a.lengths_out:
+        with open(a.lengths_out, "w") as f:
+            f.writelines(f"{c}\t{n}\n" for c, n in id_len)
     why = {}
     for r in skipped:
         why[r[1]] = why.get(r[1], 0) + 1

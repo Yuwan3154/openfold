@@ -29,14 +29,17 @@ from t2_native import STANDARD, load_npz, native_ref, shard_path
 ESMC_DIMS = {"esmc_300m": (960, 15, 30), "esmc_600m": (1152, 18, 36)}
 
 
-def load_esmc(name, dev, pth):
+DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
+
+
+def load_esmc(name, dev, pth, dtype="fp32"):
     """from_pretrained, or (--esmc-pth) the legacy .pth checkpoint when the installed esm cannot read the hub layout (Engaging's esm 3.3.0)."""
     if pth is None:
-        return ESMC.from_pretrained(name, device=torch.device(dev)).eval()
+        return ESMC.from_pretrained(name, device=torch.device(dev)).eval().to(DTYPES[dtype])
     d, h, n = ESMC_DIMS[name]
     model = ESMC(d_model=d, n_heads=h, n_layers=n, tokenizer=get_esmc_model_tokenizers(), use_flash_attn=False).eval()   # fp32 without flash attention: the same numerics as the old CPU route
     model.load_state_dict(torch.load(pth, map_location="cpu"))
-    return model.to(dev)
+    return model.to(dev, DTYPES[dtype])
 
 
 def load_native(pdb):
@@ -120,6 +123,7 @@ def main():
     ap.add_argument("--mut-hi", type=float, default=0.10)
     ap.add_argument("--esmc", default="esmc_300m", choices=["esmc_300m", "esmc_600m"])
     ap.add_argument("--esmc-pth", default=None, help="legacy esmc_*.pth checkpoint (use when from_pretrained cannot read the hub layout)")
+    ap.add_argument("--esmc-dtype", default="fp32", choices=sorted(DTYPES), help="ESMC weights/activations dtype (reduced precision: parity via t2_esmc_parity.py)")
     ap.add_argument("--temp", type=float, default=0.7)
     ap.add_argument("--top-p", type=float, default=1.0)
     ap.add_argument("--batch-size", type=int, default=32)
@@ -129,7 +133,7 @@ def main():
     dev = "cuda"
     assert torch.cuda.is_available(), "stage A runs on the GPU (user 10-09: not on CPU)"
     os.makedirs(a.out_dir, exist_ok=True)
-    model = load_esmc(a.esmc, dev, a.esmc_pth)
+    model = load_esmc(a.esmc, dev, a.esmc_pth, a.esmc_dtype)
     tok = model.tokenizer
     ids_of = {c: tok.convert_tokens_to_ids(c) for c in AA}
     old_seqs = {(r["chain"], r["draw"]): r["seq"] for r in json.load(open(a.verify_seqs))} if a.verify_seqs else {}

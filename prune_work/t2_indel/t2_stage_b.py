@@ -158,6 +158,7 @@ def main():
     ap.add_argument("--max-broken", type=int, default=1, help="max broken backbone steps (CA-CA > 4.0 A where the native is continuous; T8 handoff: more than one is dropped)")
     ap.add_argument("--tm-lo", type=float, default=0.4)
     ap.add_argument("--tm-hi", type=float, default=0.9)
+    ap.add_argument("--store", default="all", choices=["all", "passing"], help="templates written to the npz: all 64 (metrics.csv flags the passing ones) or only those passing every gate; metrics.csv always has every row")
     ap.add_argument("--procs", type=int, default=8)
     ap.add_argument("--seed-offset", type=int, default=0, help="added to the per-chain noise seed (crc32 of the id): a second draw of the same edits, to measure the seed-to-seed spread")
     ap.add_argument("--fast", action="store_true", help="fused attention + fp16 autocast + torch.compile + CUDA-graph replay of the denoiser (RAW 140: 3.7-5.9x faster; coordinates deviate ~0.1 A from fp32)")
@@ -174,12 +175,44 @@ def main():
         torch._dynamo.config.cache_size_limit = 64   # one compiled graph per padded length bucket
         model.struct_model = GraphedDenoiser(torch.compile(model.struct_model, dynamic=False))
     last_bucket = None
+    pending = None
     tot = dict(build=0.0, pd=0.0, score=0.0)
+    def finalize(job):
+        if job is None:
+            return
+        chain, plans, items, kept, nat_bb, nat_loop, out = (job[k] for k in ("chain", "plans", "items", "kept", "nat_bb", "nat_loop", "out"))
+        t2 = time.perf_counter()
+        rows = job["rows"].get()
+        job["tmp"].cleanup()
+        tot["score"] += time.perf_counter() - t2   # only the wait that was NOT hidden behind the GPU
+        coords, masks, seqs = job["coords"], job["masks"], job["seqs"]
+        pool_items, recs = [], []
+        for j, c, m, s, r in zip(kept, coords, masks, seqs, rows):
+            p, it = plans[j], items[j]
+            r["pass_tm"] = bool(a.tm_lo <= r["tm_native"] <= a.tm_hi)
+            r["pass_bond"] = all(env[k][0] <= r[k] <= env[k][1] for k in env)
+            r["loop_increase"] = r["loop_frac"] - nat_loop
+            r["pass_loop"] = bool(r["loop_increase"] < a.loop_max)
+            r["pass_break"] = r["n_broken"] <= a.max_broken
+            r["pass_all"] = r["pass_tm"] and r["pass_bond"] and r["pass_loop"] and r["pass_break"]
+            recs.append(dict(chain=chain, draw=p["draw"], L=len(s), L_native=len(nat_bb), n_ins=p["n_ins"], n_del=p["n_del"], n_mut=p["n_mut"], **r))
+            if a.store == "passing" and not r["pass_all"]:
+                continue
+            pool_items.append(dict(arm="t2pipe", model=a.model, rewind=a.rewind, draw=p["draw"], coords=c[m].astype(np.float32), atom_mask=m, aatype=s, residue_index_orig=np.arange(1, len(s) + 1),
+                                   orig_idx=it[3], ops=p["ops"], tm_native=r["tm_native"], tm_template=r["tm_template"], L_native=len(nat_bb)))
+        if pool_items:   # a chain without survivors has no npz; its metrics.csv records why
+            np.savez(out, **ip.pack_chain(chain, pool_items))
+        csv = shard_path(a.out_dir, chain, ".metrics.csv")
+        pd.DataFrame(recs).to_csv(csv + ".tmp", index=False)
+        os.replace(csv + ".tmp", csv)
+        print(f"{chain} L={len(nat_bb)} n={len(plans)} Lmax={max(len(c) for c in coords)} pd {job['pd_s']:.2f}s score-wait {time.perf_counter() - t2:.2f}s "
+              f"pass_all {np.mean([x['pass_all'] for x in recs]):.2f} tm {np.mean([x['tm_native'] for x in recs]):.3f} peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB", flush=True)
+
     for ln in open(a.chains_file):
         chain, nat_path = native_ref(ln, a.natives_dir)
         out = shard_path(a.out_dir, chain, ".npz")
         pa = shard_path(a.stage_a_dir, chain, ".json")
-        if os.path.isfile(out) or not os.path.isfile(pa):
+        if os.path.isfile(shard_path(a.out_dir, chain, ".metrics.csv")) or not os.path.isfile(pa):   # metrics.csv is written last = the chain-done marker
             continue
         os.makedirs(os.path.dirname(out), exist_ok=True)
         sa = json.load(open(pa))
@@ -229,30 +262,17 @@ def main():
                 masks.append(m[b, :n])
                 seqs.append(s[b, :n])
                 kept.append(i + b)
+        if not kept:   # every draw was recorded in skipped.jsonl above
+            tmp.cleanup()
+            continue
         torch.cuda.synchronize()
         t2 = time.perf_counter()
-        rows = pool.map(score_one, [(c[:, BB_IDX].astype(np.float64), nat_pdb, items[j][3], plans[j]["seq"], nat_break) for c, j in zip(coords, kept)])
-        tmp.cleanup()
-        t3 = time.perf_counter()
-        pool_items, recs = [], []
-        for j, c, m, s, r in zip(kept, coords, masks, seqs, rows):
-            p, it = plans[j], items[j]
-            r["pass_tm"] = bool(a.tm_lo <= r["tm_native"] <= a.tm_hi)
-            r["pass_bond"] = all(env[k][0] <= r[k] <= env[k][1] for k in env)
-            r["loop_increase"] = r["loop_frac"] - nat_loop
-            r["pass_loop"] = bool(r["loop_increase"] < a.loop_max)
-            r["pass_break"] = r["n_broken"] <= a.max_broken
-            r["pass_all"] = r["pass_tm"] and r["pass_bond"] and r["pass_loop"] and r["pass_break"]
-            recs.append(dict(chain=chain, draw=p["draw"], L=len(s), L_native=len(nat_bb), n_ins=p["n_ins"], n_del=p["n_del"], n_mut=p["n_mut"], **r))
-            pool_items.append(dict(arm="t2pipe", model=a.model, rewind=a.rewind, draw=p["draw"], coords=c[m].astype(np.float32), atom_mask=m, aatype=s, residue_index_orig=np.arange(1, len(s) + 1),
-                                   orig_idx=it[3], ops=p["ops"], tm_native=r["tm_native"], tm_template=r["tm_template"], L_native=len(nat_bb)))
-        np.savez(out, **ip.pack_chain(chain, pool_items))
-        pd.DataFrame(recs).to_csv(shard_path(a.out_dir, chain, ".metrics.csv"), index=False)
         tot["build"] += t1 - t0
         tot["pd"] += t2 - t1
-        tot["score"] += t3 - t2
-        print(f"{chain} L={len(nat_bb)} n={len(plans)} Lmax={max(len(c) for c in coords)} build {t1 - t0:.2f}s pd {t2 - t1:.2f}s score {t3 - t2:.2f}s "
-              f"pass_all {np.mean([x['pass_all'] for x in recs]):.2f} tm {np.mean([x['tm_native'] for x in recs]):.3f} peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB", flush=True)
+        finalize(pending)   # the previous chain's scoring ran on the CPU pool while this chain was on the GPU
+        pending = dict(chain=chain, plans=plans, items=items, kept=kept, coords=coords, masks=masks, seqs=seqs, nat_bb=nat_bb, nat_loop=nat_loop, tmp=tmp, out=out, pd_s=t2 - t1,
+                       rows=pool.map_async(score_one, [(c[:, BB_IDX].astype(np.float64), nat_pdb, items[j][3], plans[j]["seq"], nat_break) for c, j in zip(coords, kept)]))
+    finalize(pending)
     print(f"totals: build {tot['build']:.1f}s pd {tot['pd']:.1f}s score {tot['score']:.1f}s")
 
 
