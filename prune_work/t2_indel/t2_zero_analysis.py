@@ -84,8 +84,8 @@ def main():
     in_df = {i.lower() for i in df.index}
     freq = Counter(v for k, v in cat_of.items() if v and k in in_df)
     s["cat"] = [cat_of.get(c.lower()) for c in s.chain]
-    s["cat_class"] = [c.split(".")[0] if c else None for c in s.cat]
-    s["fold_freq"] = [freq.get(c, np.nan) if c else np.nan for c in s.cat]
+    s["cat_class"] = [c.split(".")[0] if isinstance(c, str) else None for c in s.cat]
+    s["fold_freq"] = [freq.get(c, np.nan) if isinstance(c, str) else np.nan for c in s.cat]
     s.to_csv(a.out, sep="\t", index=False)
     num = ["L", "rg_ratio", "loop", "helix", "strand", "native_breaks", "floppy", "contacts", "n_incomplete", "n_chains", "resolution", "year", "family_size", "fold_freq"]
     print("\nMEDIANS per group (rows = chain; ZB = break-gate zero-survivor, ZT = TM-window zero-survivor, C = control with >= 8 survivors)")
