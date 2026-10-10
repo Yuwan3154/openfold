@@ -28,12 +28,25 @@ def main():
     ap.add_argument("--pad-multiple", type=int, default=1)
     ap.add_argument("--compile", default=None, help="torch.compile mode for the coordinate denoiser (default | reduce-overhead | max-autotune-no-cudagraphs)")
     ap.add_argument("--label", required=True)
+    ap.add_argument("--profile", action="store_true", help="one extra call under torch.profiler: top kernels by GPU time, GPU busy share, launches per step")
+    ap.add_argument("--graph-wrap", action="store_true", help="clone the compiled denoiser outputs and mark a CUDA-graph step per call (needed for reduce-overhead: the sampler reuses outputs across steps)")
     ap.add_argument("--save-ref", default=None)
     ap.add_argument("--ref", default=None)
     a = ap.parse_args()
     model = get_model()
     if a.compile:
-        model.struct_model = torch.compile(model.struct_model, mode=None if a.compile == "default" else a.compile, dynamic=False)
+        compiled = torch.compile(model.struct_model, mode=None if a.compile == "default" else a.compile, dynamic=False)
+        if a.graph_wrap:
+            class Wrapped(torch.nn.Module):
+                def __init__(self, m):
+                    super().__init__()
+                    self.m = m
+
+                def forward(self, *args, **kw):
+                    torch.compiler.cudagraph_mark_step_begin()
+                    return self.m(*args, **kw).clone()
+            compiled = Wrapped(compiled)
+        model.struct_model = compiled
     items, _, _ = load_items(a.stage_a_dir, a.chain, a.native_pdb, a.n)
     pb = sb.pad_batch(items, "cuda", a.pad_multiple)
     xt = initial_state(model, pb, a.rewind, list(range(100, 100 + len(items))))
@@ -50,6 +63,19 @@ def main():
         torch.cuda.synchronize()
         ts.append(time.perf_counter() - t0)
     rerun = float((out2 - out).abs().max())
+    if a.profile:
+        from torch.profiler import ProfilerActivity, profile
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+            sb.run_pd(model, pb, a.rewind, xt_start=xt)
+            torch.cuda.synchronize()
+        wall = time.perf_counter() - t0
+        ka = prof.key_averages()
+        gpu_total = sum(e.device_time_total for e in ka if e.device_type == torch.autograd.DeviceType.CUDA) / 1e6
+        n_launch = sum(e.count for e in ka if e.device_type == torch.autograd.DeviceType.CUDA)
+        print(f"[{a.label}] PROFILE wall {wall:.2f}s (profiler-inflated), GPU kernel time {gpu_total:.2f}s, kernel launches {n_launch} = {n_launch / steps:.0f} per step")
+        print(ka.table(sort_by="cuda_time_total", row_limit=18, max_name_column_width=70))
     med = float(np.median(ts))
     lens = [len(it[1]) for it in items]
     x = out.numpy()
