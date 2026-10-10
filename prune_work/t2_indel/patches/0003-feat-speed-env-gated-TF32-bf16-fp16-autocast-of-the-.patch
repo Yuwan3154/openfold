@@ -1,0 +1,112 @@
+From b1856bbe5f264a703383f13cff1bdf68d71c7024 Mon Sep 17 00:00:00 2001
+From: Chenxi Ou <kryst3154@outlook.com>
+Date: Sat, 10 Oct 2026 01:40:26 -0400
+Subject: [PATCH] feat(speed): env-gated TF32, bf16/fp16 autocast of the
+ denoiser and fused SDPA attention (all default off)
+
+T2_TF32=1, T2_AUTOCAST=bf16|fp16, T2_SDPA=1. Defaults reproduce the previous behaviour.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/protpardelle/core/models.py  | 32 ++++++++++++++++++++------------
+ src/protpardelle/core/modules.py | 20 ++++++++++++++++++++
+ 2 files changed, 40 insertions(+), 12 deletions(-)
+
+diff --git a/src/protpardelle/core/models.py b/src/protpardelle/core/models.py
+index 99678c3..3d21c9d 100644
+--- a/src/protpardelle/core/models.py
++++ b/src/protpardelle/core/models.py
+@@ -50,6 +50,12 @@ from protpardelle.utils import (
+ 
+ logger = get_logger(__name__)
+ 
++# T2 speed switches (all default off): TF32 matmuls, bf16/fp16 autocast of the coordinate denoiser
++_T2_AUTOCAST = {"bf16": torch.bfloat16, "fp16": torch.float16}.get(os.environ.get("T2_AUTOCAST", ""))
++if os.environ.get("T2_TF32") == "1":
++    torch.backends.cuda.matmul.allow_tf32 = True
++    torch.backends.cudnn.allow_tf32 = True
++
+ 
+ def fill_motif_seq(
+     s_hat: Int[torch.Tensor, "B L"],
+@@ -794,18 +800,20 @@ class Protpardelle(nn.Module):
+ 
+         # Coordinate denoiser
+         if run_struct_model:
+-            denoised_coords = self.struct_model(
+-                noisy_coords,
+-                noise_level,
+-                seq_mask,
+-                residue_index=residue_index,
+-                chain_index=chain_index,
+-                hotspot_mask=hotspot_mask,
+-                struct_self_cond=struct_self_cond,
+-                struct_crop_cond=struct_crop_cond,
+-                sse_cond=sse_cond,
+-                adj_cond=adj_cond,
+-            )
++            with torch.autocast("cuda", dtype=_T2_AUTOCAST, enabled=_T2_AUTOCAST is not None):
++                denoised_coords = self.struct_model(
++                    noisy_coords,
++                    noise_level,
++                    seq_mask,
++                    residue_index=residue_index,
++                    chain_index=chain_index,
++                    hotspot_mask=hotspot_mask,
++                    struct_self_cond=struct_self_cond,
++                    struct_crop_cond=struct_crop_cond,
++                    sse_cond=sse_cond,
++                    adj_cond=adj_cond,
++                )
++            denoised_coords = denoised_coords.float()
+         else:
+             denoised_coords = noisy_coords
+ 
+diff --git a/src/protpardelle/core/modules.py b/src/protpardelle/core/modules.py
+index 96c836e..1e9a324 100644
+--- a/src/protpardelle/core/modules.py
++++ b/src/protpardelle/core/modules.py
+@@ -4,6 +4,7 @@ Authors: Alex Chu, Jinho Kim, Richard Shuai, Tianyu Lu, Zhaoyang Li
+ """
+ 
+ import copy
++import os
+ from typing import Literal
+ 
+ import numpy as np
+@@ -23,6 +24,9 @@ from protpardelle.utils import get_logger, unsqueeze_trailing_dims
+ 
+ logger = get_logger(__name__)
+ 
++# T2 speed switch (default off = the original einsum attention): fused scaled_dot_product_attention
++_FAST_SDPA = os.environ.get("T2_SDPA") == "1"
++
+ 
+ def circular_relpos(
+     index: torch.Tensor,
+@@ -804,6 +808,22 @@ class TimeCondAttention(nn.Module):
+             q = self.rope.rotate_queries_or_keys(q, residx, chain_index=chain_index)
+             k = self.rope.rotate_queries_or_keys(k, residx, chain_index=chain_index)
+ 
++        if _FAST_SDPA and not self.training and self.attn_dropout.p == 0.0:
++            mask = None
++            if attn_bias is not None:
++                mask = self.attn_bias_proj(attn_bias) if self.attn_bias_proj is not None else attn_bias
++            if seq_mask is not None and not _seq_mask_is_all_ones(seq_mask):
++                pad = -1e6 * (1 - torch.einsum("b i, b j -> b i j", seq_mask, seq_mask)).unsqueeze(1)   # the same additive mask as below
++                mask = pad if mask is None else mask + pad
++            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=1.0)   # q is already scaled
++            out = rearrange(out, "b h n d -> b n (h d)")
++            out = self.to_out(out)
++            if self.dit and exists(time):
++                out = out * (alpha_1 + 1)
++            if seq_mask is not None:
++                out = out * seq_mask.unsqueeze(-1)
++            return self.out_dropout(out)
++
+         sim = torch.einsum("b h i d, b h j d -> b h i j", q, k)
+         if attn_bias is not None:
+             if self.attn_bias_proj is not None:
+-- 
+2.54.0 (Apple Git-157)
+

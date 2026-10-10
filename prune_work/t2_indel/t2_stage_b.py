@@ -79,9 +79,9 @@ def build_inputs(nat_pos, nat_bb, plan):
     return pos, aat, known, orig, new_bb
 
 
-def pad_batch(items, device):
+def pad_batch(items, device, multiple=1):
     B = len(items)
-    Lm = max(len(it[1]) for it in items)
+    Lm = -(-max(len(it[1]) for it in items) // multiple) * multiple   # padding is exact-neutral (checked: padded batch == alone), so a length bucket is free
     pos, aat, known = torch.zeros(B, Lm, 37, 3), torch.zeros(B, Lm, dtype=torch.long), torch.zeros(B, Lm, 37)
     mask, ridx = torch.zeros(B, Lm), torch.zeros(B, Lm, dtype=torch.long)
     for b, (p, a, k, _, _) in enumerate(items):
