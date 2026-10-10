@@ -81,7 +81,8 @@ def main():
     s["family_size"] = [size.get(member2rep.get(c, c), 1) for c in s.chain]
     cat = pickle.load(open(CAT, "rb"))
     cat_of = {k: ".".join(v[0].split(".")[:3]) if v else None for k, v in cat.items()}
-    freq = Counter(v for k, v in cat_of.items() if v and k in {i.lower() for i in df.index})
+    in_df = {i.lower() for i in df.index}
+    freq = Counter(v for k, v in cat_of.items() if v and k in in_df)
     s["cat"] = [cat_of.get(c.lower()) for c in s.chain]
     s["cat_class"] = [c.split(".")[0] if c else None for c in s.cat]
     s["fold_freq"] = [freq.get(c, np.nan) if c else np.nan for c in s.cat]
