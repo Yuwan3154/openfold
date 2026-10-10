@@ -14,10 +14,15 @@ Run: python t2_stage_b.py --stage-a-dir A --chains-file chains.tsv --out-dir O -
 import argparse
 import json
 import os
+import sys
 import tempfile
 import time
 import zlib
 from multiprocessing import Pool
+
+if "--fast" in sys.argv:   # read by protpardelle at import (patch 0003): fused attention + fp16 autocast of the denoiser
+    os.environ["T2_SDPA"] = "1"
+    os.environ["T2_AUTOCAST"] = "fp16"
 
 import hydra
 import numpy as np
@@ -36,6 +41,7 @@ from protpardelle.env import MINIMPNN_WEIGHTS, PROTPARDELLE_MODEL_CONFIGS, PROTP
 from protpardelle.utils import apply_dotdict_recursively, seed_everything
 from score_indel import usalign, write_ca_pdb
 from t2_dssp import loop_fraction
+from t2_graph import GraphedDenoiser
 from t2_native import load_npz, native_ref, shard_path
 
 MODEL_EPOCH = {"cc89": "415", "cc91": "383", "cc94": "3100"}
@@ -150,6 +156,8 @@ def main():
     ap.add_argument("--tm-lo", type=float, default=0.4)
     ap.add_argument("--tm-hi", type=float, default=0.9)
     ap.add_argument("--procs", type=int, default=8)
+    ap.add_argument("--fast", action="store_true", help="fused attention + fp16 autocast + torch.compile + CUDA-graph replay of the denoiser (RAW 140: 3.7-5.9x faster; coordinates deviate ~0.1 A from fp32)")
+    ap.add_argument("--pad-multiple", type=int, default=None, help="pad the batch length to a multiple of this (default 16 with --fast, else 1): bounds the number of compiled/captured shapes")
     a = ap.parse_args()
     assert torch.cuda.is_available(), "stage B runs on the GPU"
     os.makedirs(a.out_dir, exist_ok=True)
@@ -157,6 +165,11 @@ def main():
     pool = Pool(a.procs)   # forked before the model touches CUDA
     model = load_model(str(PROTPARDELLE_MODEL_CONFIGS / f"{a.model}.yaml"), str(PROTPARDELLE_MODEL_WEIGHTS / f"{a.model}_epoch{MODEL_EPOCH[a.model]}.pth"))
     model.load_minimpnn(MINIMPNN_WEIGHTS)
+    mult = a.pad_multiple or (16 if a.fast else 1)
+    if a.fast:
+        torch._dynamo.config.cache_size_limit = 64   # one compiled graph per padded length bucket
+        model.struct_model = GraphedDenoiser(torch.compile(model.struct_model, dynamic=False))
+    last_bucket = None
     tot = dict(build=0.0, pd=0.0, score=0.0)
     for ln in open(a.chains_file):
         chain, nat_path = native_ref(ln, a.natives_dir)
@@ -197,12 +210,16 @@ def main():
         coords, masks, seqs, kept = [], [], [], []
         for i in range(0, len(items), a.chunk):
             sub = items[i:i + a.chunk]
-            aux = run_pd(model, pad_batch(sub, "cuda"), a.rewind)
+            pb = pad_batch(sub, "cuda", mult)
+            if a.fast and pb["aat"].shape[1] != last_bucket:   # graphs of a finished length bucket are dropped (compiled code is kept)
+                model.struct_model.clear()
+                last_bucket = pb["aat"].shape[1]
+            aux = run_pd(model, pb, a.rewind)
             x, m, s = aux["xt_traj"][-1].numpy(), aux["atom_mask"].cpu().numpy().astype(bool), aux["s"].cpu().numpy()
             for b, it in enumerate(sub):
                 n = len(it[1])
-                if not (s[b, :n] == it[1].numpy()).all():
-                    open(os.path.join(a.out_dir, "skipped.jsonl"), "a").write(json.dumps(dict(chain=chain, draw=plans[i + b]["draw"], why="sequence changed during partial diffusion")) + "\n")
+                if not (s[b, :n] == it[1].numpy()).all() or not np.isfinite(x[b, :n]).all():
+                    open(os.path.join(a.out_dir, "skipped.jsonl"), "a").write(json.dumps(dict(chain=chain, draw=plans[i + b]["draw"], why="sequence changed or non-finite coordinates")) + "\n")
                     continue
                 coords.append(x[b, :n])
                 masks.append(m[b, :n])

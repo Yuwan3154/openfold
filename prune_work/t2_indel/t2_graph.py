@@ -17,6 +17,10 @@ class GraphedDenoiser(nn.Module):
         self.graphs = {}
         self.keepalive = []
 
+    def clear(self):
+        self.graphs.clear()
+        self.keepalive.clear()
+
     def forward(self, noisy_coords, noise_level, seq_mask, residue_index=None, chain_index=None, hotspot_mask=None, struct_self_cond=None, struct_crop_cond=None, sse_cond=None,
                 adj_cond=None, tol=1e-6):
         args = dict(noisy_coords=noisy_coords, noise_level=noise_level, seq_mask=seq_mask, residue_index=residue_index, chain_index=chain_index, hotspot_mask=hotspot_mask,
