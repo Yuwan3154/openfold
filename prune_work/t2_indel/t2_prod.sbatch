@@ -6,17 +6,17 @@
 #SBATCH -c 8
 #SBATCH --mem=64G
 #SBATCH -t 06:00:00
-#SBATCH -o /orcd/scratch/orcd/011/chenxiou/t2_synth_v2/logs/%x_%a_%j.log
+#SBATCH -o /orcd/compute/so3/002/chenxi/t2_synth_v2/logs/%x_%a_%j.log
 # Production run of the T2 synthetic-template pipeline for the T8 chain list (RAW 137). One array task = one shard (chain i of the list goes to shard i % NSHARD), 1 L40S each.
 # Resumable at every stage (natives npz, stage A json, stage B metrics.csv are skipped when present); resubmit the same array to continue after the 6 h limit.
-# Submit: sbatch --array=0-1 --export=ALL,NSHARD=2 t2_prod.sbatch   (NSHARD defaults to 2)
+# Shakedown: LIMIT=200 (first 200 chains of the shard; use OUT_TAG to keep it out of the real output dir). Submit: sbatch --array=0-1 --export=ALL,NSHARD=2 t2_prod.sbatch   (NSHARD defaults to 2)
 set -uo pipefail
 NSHARD=${NSHARD:-2}
 S=${SLURM_ARRAY_TASK_ID:-0}
 CH=/orcd/scratch/orcd/011/chenxiou
 LIST=$CH/t8_template_list
 R=$CH/t2pipe
-OUT=$CH/t2_synth_v2
+OUT=/orcd/compute/so3/002/chenxi/t2_synth_v2${OUT_TAG:-}   # NOT scratch: scratch is at 968 of 1024 GB and 895k of 1M inodes
 W=$OUT/work
 PR=/orcd/pool/006/chenxiou/proteina/data/pdb_train/processed
 PTH=$R/hf/hub/models--biohub--esmc-300m-2024-12/snapshots/7f10b20ae75017b2dbc884070e03434515709a8d/data/weights/esmc_300m_2024_12_v0.pth
@@ -36,8 +36,10 @@ if [ -z "$want_n" ] || [ "$want_n" != "$got_n" ] || [ "$want_sha" != "$got_sha" 
 
 # 2. this shard's chains, natives from the proteina processed .pt files (label ids), lengths for the length-sorted order
 git -C $R/repo pull -q --ff-only || exit 1
-awk -v s=$S -v n=$NSHARD '(NR-1)%n==s' $LIST/template_chains.txt > ids_shard$S.txt
-[ -s $W/pt_index.tsv ] || { echo "missing $W/pt_index.tsv (run the index step once)"; exit 1; }
+awk -v s=$S -v n=$NSHARD '(NR-1)%n==s' $LIST/template_chains.txt | head -n ${LIMIT:-1000000} > ids_shard$S.txt   # LIMIT = shakedown subset
+if [ ! -s $W/pt_index.tsv ]; then   # id<TAB>path of every processed .pt (the tree is sharded below id[1:3] and sits behind a symlink: find -L)
+  if [ -s $R/out/pt_index.tsv ]; then cp $R/out/pt_index.tsv $W/pt_index.tsv; else find -L $PR -name "*.pt" | awk -F/ '{n=$NF; sub(/\.pt$/,"",n); print n"\t"$0}' > $W/pt_index.tsv.tmp && mv $W/pt_index.tsv.tmp $W/pt_index.tsv; fi
+fi
 PYTHONPATH=$CODE $HOME/.conda/envs/proteina/bin/python $CODE/t2_extract_natives.py --chains-file ids_shard$S.txt --processed-dir $PR --index $W/pt_index.tsv --out-dir $W/natives --proteina-src $HOME/orcd/scratch/proteina_tri --lengths-out lengths_shard$S.tsv || exit 1
 sort -t$'\t' -k2,2n -k1,1 lengths_shard$S.tsv | cut -f1 > order_shard$S.txt
 echo "shard $S: $(wc -l < ids_shard$S.txt) listed, $(wc -l < order_shard$S.txt) usable"
