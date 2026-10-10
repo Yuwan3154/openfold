@@ -153,7 +153,7 @@ def main():
     ap.add_argument("--rewind", type=int, default=250)
     ap.add_argument("--num-steps", type=int, default=None, help="total ODE steps of the schedule (default: the config value, 500); entry noise level = rewind / num-steps, so --num-steps 250 --rewind 125 = the same noise level with half the denoiser calls")
     ap.add_argument("--chunk", type=int, default=64, help="draws per sampler call")
-    ap.add_argument("--span-cutoff", type=int, default=484)
+    ap.add_argument("--span-cutoff", type=int, default=600, help="max template length (= residue-index span) sent to cc89; its training data ends at ~495, so 485-600 is extrapolation that the gates (TM, break, loop, bond) then validate: measured on 24 chains of L >= 485, pass-all 0.52 (RAW 160). Was 484.")
     ap.add_argument("--tol", type=float, default=0.05, help="bond-length tolerance, A (user 10-09)")
     ap.add_argument("--loop-max", type=float, default=0.15, help="max coil-fraction increase vs the native, absolute (user 10-09)")
     ap.add_argument("--max-broken", type=int, default=1, help="max broken backbone steps (CA-CA > 4.0 A where the native is continuous; T8 handoff: more than one is dropped)")
