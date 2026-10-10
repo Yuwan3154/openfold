@@ -18,6 +18,7 @@ import sys
 import tempfile
 import time
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import Pool
 
 if "--fast" in sys.argv:   # read by protpardelle at import (patch 0003): fused attention + fp16 autocast of the denoiser
@@ -177,7 +178,7 @@ def main():
         model.struct_model = GraphedDenoiser(torch.compile(model.struct_model, dynamic=False))
     last_bucket = None
     pending = None
-    tot = dict(build=0.0, pd=0.0, score=0.0)
+    tot = dict(build=0.0, pd=0.0, score=0.0, wait=0.0)
     def finalize(job):
         if job is None:
             return
@@ -209,19 +210,20 @@ def main():
         print(f"{chain} L={len(nat_bb)} n={len(plans)} Lmax={max(len(c) for c in coords)} pd {job['pd_s']:.2f}s score-wait {time.perf_counter() - t2:.2f}s "
               f"pass_all {np.mean([x['pass_all'] for x in recs]):.2f} tm {np.mean([x['tm_native'] for x in recs]):.3f} peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB", flush=True)
 
-    for ln in open(a.chains_file):
+    def prepare(ln):
+        """CPU-only preparation of one chain (runs in a worker thread while the previous chain is on the GPU); None = skipped (recorded) or already done."""
         chain, nat_path = native_ref(ln, a.natives_dir)
         out = shard_path(a.out_dir, chain, ".npz")
         pa = shard_path(a.stage_a_dir, chain, ".json")
         if os.path.isfile(shard_path(a.out_dir, chain, ".metrics.csv")) or not os.path.isfile(pa):   # metrics.csv is written last = the chain-done marker
-            continue
+            return None
         os.makedirs(os.path.dirname(out), exist_ok=True)
         sa = json.load(open(pa))
         plans = [p for p in sa["plans"] if len(p["orig_idx"]) <= a.span_cutoff or a.model != "cc89"]
         if len(plans) < len(sa["plans"]):
             open(os.path.join(a.out_dir, "skipped.jsonl"), "a").write(json.dumps(dict(chain=chain, model=a.model, n_skipped=len(sa["plans"]) - len(plans), why="span > cutoff")) + "\n")
         if not plans:
-            continue
+            return None
         t0 = time.perf_counter()
         if nat_path.endswith(".npz"):
             nd = load_npz(nat_path)
@@ -233,7 +235,7 @@ def main():
             nat_bb, nat_complete = nat_pos[:, BB_IDX].numpy().astype(np.float64), np.ones(len(nat_pos), bool)
         if len(nat_pos) != sa["L"]:
             open(os.path.join(a.out_dir, "skipped.jsonl"), "a").write(json.dumps(dict(chain=chain, why="native length differs between stage A and B", L_a=sa["L"], L_b=len(nat_pos))) + "\n")
-            continue
+            return None
         nat_is_pro = np.array([c == "P" for c in sa["names"]])
         nat_loop = loop_fraction(nat_bb, nat_is_pro, nat_complete)
         nat_break = np.linalg.norm(nat_bb[1:, 1] - nat_bb[:-1, 1], axis=1) > 4.0
@@ -243,6 +245,20 @@ def main():
             nat_pdb = os.path.join(tmp.name, "native_ca.pdb")
             write_ca_pdb(nat_pdb, nat_bb[:, 1])
         items = [build_inputs(nat_pos, nat_mask, nat_bb, p) for p in plans]
+        t1 = time.perf_counter()
+        return dict(chain=chain, out=out, plans=plans, items=items, nat_bb=nat_bb, nat_loop=nat_loop, nat_break=nat_break, nat_pdb=nat_pdb, tmp=tmp, build_s=t1 - t0)
+
+    chain_lines = list(open(a.chains_file))
+    ex = ThreadPoolExecutor(max_workers=1)
+    nxt = ex.submit(prepare, chain_lines[0]) if chain_lines else None
+    for n_line in range(len(chain_lines)):
+        tw = time.perf_counter()
+        job = nxt.result()
+        tot["wait"] += time.perf_counter() - tw   # GPU idle while the next chain is still being prepared
+        nxt = ex.submit(prepare, chain_lines[n_line + 1]) if n_line + 1 < len(chain_lines) else None
+        if job is None:
+            continue
+        chain, out, plans, items, nat_bb, nat_loop, nat_break, nat_pdb, tmp = (job[k] for k in ("chain", "out", "plans", "items", "nat_bb", "nat_loop", "nat_break", "nat_pdb", "tmp"))
         t1 = time.perf_counter()
         seed_everything((zlib.crc32(chain.encode()) + a.seed_offset) % 2**31)
         coords, masks, seqs, kept = [], [], [], []
@@ -268,13 +284,13 @@ def main():
             continue
         torch.cuda.synchronize()
         t2 = time.perf_counter()
-        tot["build"] += t1 - t0
+        tot["build"] += job["build_s"]
         tot["pd"] += t2 - t1
         finalize(pending)   # the previous chain's scoring ran on the CPU pool while this chain was on the GPU
         pending = dict(chain=chain, plans=plans, items=items, kept=kept, coords=coords, masks=masks, seqs=seqs, nat_bb=nat_bb, nat_loop=nat_loop, tmp=tmp, out=out, pd_s=t2 - t1,
                        rows=pool.map_async(score_one, [(c[:, BB_IDX].astype(np.float64), nat_pdb, items[j][3], plans[j]["seq"], nat_break) for c, j in zip(coords, kept)]))
     finalize(pending)
-    print(f"totals: build {tot['build']:.1f}s pd {tot['pd']:.1f}s score {tot['score']:.1f}s")
+    print(f"totals: build (overlapped with the GPU) {tot['build']:.1f}s, GPU idle waiting for the next chain {tot['wait']:.1f}s, pd {tot['pd']:.1f}s, score wait {tot['score']:.1f}s")
 
 
 if __name__ == "__main__":
