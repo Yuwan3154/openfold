@@ -2,7 +2,9 @@
 ~20 us of CPU per launch (350-430 launches per step), which becomes the bottleneck once the kernels are fast (fp16) or the batch is small. GraphedDenoiser captures the module once per
 (argument shapes/dtypes/None-pattern) key with static input buffers, then each call copies the inputs in, replays the graph and returns a clone (the sampler keeps outputs across steps).
 The wrapped module runs a few eager warm-up calls first, which also fills the module's memoised sync-needing checks (all-ones seq_mask test, relpos cache) so the capture itself has no host sync.
-Every tensor argument is a graph input (None patterns are part of the key).
+Every tensor argument is a graph input (None patterns are part of the key). The denoiser memoises the relative-position embedding and the rotary frequencies in single-entry caches keyed on tensor
+identity+version; a graph reads those cached tensors as constants, so a later capture (new static buffers -> cache miss -> entry replaced -> old tensors freed) would leave an earlier graph
+pointing at freed memory (segfault on its next replay). `keepalive` holds every cache entry that existed at each capture.
 """
 import torch
 import torch.nn as nn
@@ -13,6 +15,7 @@ class GraphedDenoiser(nn.Module):
         super().__init__()
         self.m = module
         self.graphs = {}
+        self.keepalive = []
 
     def forward(self, noisy_coords, noise_level, seq_mask, residue_index=None, chain_index=None, hotspot_mask=None, struct_self_cond=None, struct_crop_cond=None, sse_cond=None,
                 adj_cond=None, tol=1e-6):
@@ -31,6 +34,10 @@ class GraphedDenoiser(nn.Module):
             with torch.cuda.graph(g), torch.no_grad():
                 out = self.m(**static, tol=tol)
             self.graphs[key] = (g, static, out)
+            for mod in self.m.modules():
+                for attr in ("_relpos_cache", "_freqs_cache"):
+                    if getattr(mod, attr, None) is not None:
+                        self.keepalive.append(getattr(mod, attr))
         g, static, out = self.graphs[key]
         for k, v in args.items():
             if v is not None:
