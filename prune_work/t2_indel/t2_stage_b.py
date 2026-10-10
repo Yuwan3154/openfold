@@ -159,6 +159,7 @@ def main():
     ap.add_argument("--tm-lo", type=float, default=0.4)
     ap.add_argument("--tm-hi", type=float, default=0.9)
     ap.add_argument("--procs", type=int, default=8)
+    ap.add_argument("--seed-offset", type=int, default=0, help="added to the per-chain noise seed (crc32 of the id): a second draw of the same edits, to measure the seed-to-seed spread")
     ap.add_argument("--fast", action="store_true", help="fused attention + fp16 autocast + torch.compile + CUDA-graph replay of the denoiser (RAW 140: 3.7-5.9x faster; coordinates deviate ~0.1 A from fp32)")
     ap.add_argument("--pad-multiple", type=int, default=None, help="pad the batch length to a multiple of this (default 16 with --fast, else 1): bounds the number of compiled/captured shapes")
     a = ap.parse_args()
@@ -209,7 +210,7 @@ def main():
             write_ca_pdb(nat_pdb, nat_bb[:, 1])
         items = [build_inputs(nat_pos, nat_mask, nat_bb, p) for p in plans]
         t1 = time.perf_counter()
-        seed_everything(zlib.crc32(chain.encode()) % 2**31)
+        seed_everything((zlib.crc32(chain.encode()) + a.seed_offset) % 2**31)
         coords, masks, seqs, kept = [], [], [], []
         for i in range(0, len(items), a.chunk):
             sub = items[i:i + a.chunk]
