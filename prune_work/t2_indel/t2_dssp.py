@@ -5,10 +5,15 @@ Needs pydssp (pip install pydssp; numpy only).
 import numpy as np
 import pydssp
 
+CODE = {"-": 0, "H": 1, "E": 2}
+
 
 def assign(bb, is_pro, complete=None):
     """bb (L,4,3) N,CA,C,O; is_pro (L,) bool; complete (L,) bool (default all) -> int array, -1 where the backbone is incomplete."""
-    ss = np.asarray(pydssp.assign(np.asarray(bb, dtype=np.float32), donor_mask=(~np.asarray(is_pro)).astype(np.float32))).astype(int)
+    ss = np.asarray(pydssp.assign(np.asarray(bb, dtype=np.float32), donor_mask=(~np.asarray(is_pro)).astype(np.float32)))
+    if ss.dtype.kind in "US":   # this pydssp returns the characters '-', 'H', 'E'
+        ss = np.array([CODE[c] for c in ss])
+    ss = ss.astype(int)
     if complete is not None:
         ss = np.where(complete, ss, -1)
     return ss
