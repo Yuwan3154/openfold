@@ -34,7 +34,7 @@ def load_items(stage_a_dir, chain, native_pdb, n):
     feats, _ = load_feats_from_pdb(native_pdb, include_pos_feats=True)
     nat_pos = feats["atom_positions"].float()
     nat_bb = nat_pos[:, sb.BB_IDX].numpy().astype(np.float64)
-    return [sb.build_inputs(nat_pos, nat_bb, p, "cuda") for p in sa["plans"][:n]], nat_pos, feats
+    return [sb.build_inputs(nat_pos, nat_bb, p) for p in sa["plans"][:n]], nat_pos, feats
 
 
 def check_inmemory(model, native_pdb, rewind):
