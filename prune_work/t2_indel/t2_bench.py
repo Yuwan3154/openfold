@@ -68,8 +68,8 @@ def main():
             devs.append(np.linalg.norm(x[b, :n] - r["x"][b, :n], axis=-1)[valid])
         d = np.concatenate(devs)
         ca = np.array([np.linalg.norm(x[b, :n, 1] - r["x"][b, :n, 1], axis=-1).mean() for b, n in enumerate(lens)])
-        cb = [sb.score_one((x[b, :n][:, sb.BB_IDX].astype(np.float64), a.native_pdb, 0.0))["tm_native"] for b, n in enumerate(lens)]
-        cr = [sb.score_one((r["x"][b, :n][:, sb.BB_IDX].astype(np.float64), a.native_pdb, 0.0))["tm_native"] for b, n in enumerate(lens)]
+        cb = [sb.score_one((x[b, :n][:, sb.BB_IDX].astype(np.float64), a.native_pdb, items[b][3], "A" * n, np.zeros(max(len(items[b][3]) - 1, 0), bool)))["tm_native"] for b, n in enumerate(lens)]
+        cr = [sb.score_one((r["x"][b, :n][:, sb.BB_IDX].astype(np.float64), a.native_pdb, items[b][3], "A" * n, np.zeros(max(len(items[b][3]) - 1, 0), bool)))["tm_native"] for b, n in enumerate(lens)]
         msg += (f" | parity vs ref: atom dev max {d.max():.3e} A, p99 {np.percentile(d, 99):.3e}, mean-over-samples mean CA dev "
                 f"{ca.mean():.3e} A (max sample {ca.max():.3e}); tm_native mean {np.mean(cb):.4f} vs ref {np.mean(cr):.4f}, mean |dTM| {np.mean(np.abs(np.array(cb) - np.array(cr))):.4f}")
     print(msg)

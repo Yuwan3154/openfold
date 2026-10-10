@@ -6,8 +6,8 @@ constant batch, padded to the longest variant; per-sample seq_mask / residue_ind
     (N, CA, C, O; the rigid insertion of indel_edit.edit) and their side chains are DUMMY-FILLED and noised by the sampler (protpardelle patch 0002, pd_inputs.known_mask) instead of
     being rebuilt by cg2all;
   * after the call each template gets: sequence-independent TM to the native (USalign default mode, normalised by the NATIVE length = the pool's tm_native), the geometry gate
-    (median C-N, N-CA, CA-C inside the native envelope +- tol, user 10-09: 0.05 A) and the DSSP loop gate (coil fraction increase vs the native < 0.15, absolute, user 10-09), and the
-    TM window gate (0.4-0.9, user 10-09). Refolding is NOT run (user 10-09: skip the refold filter).
+    (median C-N, N-CA, CA-C inside the native envelope +- tol, user 10-09: 0.05 A) the DSSP loop gate (pydssp with the proline donor mask, T8 rule; coil fraction increase vs the native < 0.15, absolute, user 10-09), the backbone-break gate (at most one CA-CA step > 4.0 A
+    where the native is continuous, T8 handoff) and the TM window gate (0.4-0.9, user 10-09). Refolding is NOT run (user 10-09: skip the refold filter).
 Writes <out>/<chain>.npz (indel_pool layout, via pack_chain) and <out>/<chain>.metrics.csv. Env: protpardelle + mdtraj + USalign at ~/.local/bin/USalign.
 Run: python t2_stage_b.py --stage-a-dir A --chains-file chains.tsv --out-dir O --geom-ref geom_pools.csv [--rewind 250 --chunk 64 --tol 0.05]
 """
@@ -27,7 +27,6 @@ from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 
 import indel_pool as ip
-from diagnose_indel import dssp
 from indel_edit import edit
 from protpardelle.common import residue_constants as rc
 from protpardelle.core.models import load_model
@@ -36,6 +35,8 @@ from protpardelle.data.pdb_io import load_feats_from_pdb
 from protpardelle.env import MINIMPNN_WEIGHTS, PROTPARDELLE_MODEL_CONFIGS, PROTPARDELLE_MODEL_WEIGHTS, PROTPARDELLE_RUNNING_CONFIGS
 from protpardelle.utils import apply_dotdict_recursively, seed_everything
 from score_indel import usalign, write_ca_pdb
+from t2_dssp import loop_fraction
+from t2_native import load_npz, native_ref, shard_path
 
 MODEL_EPOCH = {"cc89": "415", "cc91": "383", "cc94": "3100"}
 BB_IDX = [0, 1, 2, 4]                       # atom37 N, CA, C, O
@@ -58,7 +59,7 @@ def sampling_kwargs(rewinds):
     return s
 
 
-def build_inputs(nat_pos, nat_bb, plan):
+def build_inputs(nat_pos, nat_mask, nat_bb, plan):
     """In-memory edited input of one draw: positions (L',37,3) centred on the mean CA, aatype (L',), known mask (L',37), orig_idx, backbone (L',4,3)."""
     new_bb, orig, _ = edit(nat_bb, [tuple(o) for o in plan["ops"]])
     Lp = len(orig)
@@ -71,7 +72,7 @@ def build_inputs(nat_pos, nat_bb, plan):
     known = torch.zeros(Lp, 37)
     ki = torch.from_numpy(np.flatnonzero(keep))
     pos[ki] = nat_pos[torch.from_numpy(orig[keep])]
-    known[ki] = full[ki]
+    known[ki] = full[ki] * nat_mask[torch.from_numpy(orig[keep])]   # native atoms that were not resolved stay unknown (dummy-filled by the sampler)
     oi = torch.from_numpy(np.flatnonzero(~keep))
     pos[oi[:, None], torch.tensor(BB_IDX)[None, :]] = torch.from_numpy(new_bb[~keep]).float()
     known[oi[:, None], torch.tensor(BB_IDX)[None, :]] = 1.0
@@ -104,15 +105,25 @@ def bond_medians(bb):
     return float(np.median(cn)), float(np.median(np.linalg.norm(bb[:, 1] - bb[:, 0], axis=1))), float(np.median(np.linalg.norm(bb[:, 2] - bb[:, 1], axis=1)))
 
 
+def n_broken_steps(ca, orig, nat_break):
+    """Template CA-CA steps > 4.0 A, except steps joining two native-adjacent survivors whose native step is itself broken (T8 handoff: a broken step is one where the native is continuous)."""
+    d = np.linalg.norm(ca[1:] - ca[:-1], axis=1)
+    adj = (orig[1:] >= 0) & (orig[:-1] >= 0) & (orig[1:] == orig[:-1] + 1)
+    native_broken = np.zeros(len(d), bool)
+    native_broken[adj] = nat_break[orig[:-1][adj]]
+    return int(((d > 4.0) & ~native_broken).sum())
+
+
 def score_one(task):
-    """(bb (L,4,3), native pdb path, native loop fraction) -> tm_native, tm_template, bond medians, loop fraction."""
-    bb, nat_pdb, _ = task
+    """(bb (L,4,3), native pdb path, orig_idx, template sequence, native CA-CA break flags) -> tm_native, tm_template, bond medians, loop fraction, broken steps."""
+    bb, nat_pdb, orig, seq, nat_break = task
     with tempfile.TemporaryDirectory() as td:
         tpl = os.path.join(td, "t.pdb")
         write_ca_pdb(tpl, bb[:, 1])
         tm1, tm2, _, _ = usalign(tpl, nat_pdb)
     cn, nca, cac = bond_medians(bb)
-    return dict(tm_template=tm1, tm_native=tm2, cn_med=cn, nca_med=nca, cac_med=cac, loop_frac=float(np.mean(dssp(bb) == "C")))
+    return dict(tm_template=tm1, tm_native=tm2, cn_med=cn, nca_med=nca, cac_med=cac, loop_frac=loop_fraction(bb, np.array([c == "P" for c in seq])),
+                n_broken=n_broken_steps(bb[:, 1], orig, nat_break))
 
 
 def native_envelope(geom_csv, tol):
@@ -125,7 +136,8 @@ def native_envelope(geom_csv, tol):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--stage-a-dir", required=True)
-    ap.add_argument("--chains-file", required=True, help="TSV: chain<TAB>native.pdb")
+    ap.add_argument("--chains-file", required=True, help="one chain id per line (natives from --natives-dir) or TSV chain<TAB>native.pdb")
+    ap.add_argument("--natives-dir", default=None, help="t2_extract_natives.py output: <dir>/<id[1:3]>/<id>.npz")
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--geom-ref", required=True, help="geom_pools.csv: its native rows give the bond-length envelope")
     ap.add_argument("--model", default="cc89", choices=sorted(MODEL_EPOCH))
@@ -134,6 +146,7 @@ def main():
     ap.add_argument("--span-cutoff", type=int, default=484)
     ap.add_argument("--tol", type=float, default=0.05, help="bond-length tolerance, A (user 10-09)")
     ap.add_argument("--loop-max", type=float, default=0.15, help="max coil-fraction increase vs the native, absolute (user 10-09)")
+    ap.add_argument("--max-broken", type=int, default=1, help="max broken backbone steps (CA-CA > 4.0 A where the native is continuous; T8 handoff: more than one is dropped)")
     ap.add_argument("--tm-lo", type=float, default=0.4)
     ap.add_argument("--tm-hi", type=float, default=0.9)
     ap.add_argument("--procs", type=int, default=8)
@@ -146,11 +159,12 @@ def main():
     model.load_minimpnn(MINIMPNN_WEIGHTS)
     tot = dict(build=0.0, pd=0.0, score=0.0)
     for ln in open(a.chains_file):
-        chain, nat_pdb = ln.rstrip("\n").split("\t")
-        out = os.path.join(a.out_dir, chain + ".npz")
-        pa = os.path.join(a.stage_a_dir, chain + ".json")
+        chain, nat_path = native_ref(ln, a.natives_dir)
+        out = shard_path(a.out_dir, chain, ".npz")
+        pa = shard_path(a.stage_a_dir, chain, ".json")
         if os.path.isfile(out) or not os.path.isfile(pa):
             continue
+        os.makedirs(os.path.dirname(out), exist_ok=True)
         sa = json.load(open(pa))
         plans = [p for p in sa["plans"] if len(p["orig_idx"]) <= a.span_cutoff or a.model != "cc89"]
         if len(plans) < len(sa["plans"]):
@@ -158,14 +172,26 @@ def main():
         if not plans:
             continue
         t0 = time.perf_counter()
-        feats, _ = load_feats_from_pdb(nat_pdb, include_pos_feats=True)
-        nat_pos = feats["atom_positions"].float()
+        if nat_path.endswith(".npz"):
+            nd = load_npz(nat_path)
+            nat_pos, nat_mask, nat_bb, nat_complete = torch.from_numpy(nd["pos"]), torch.from_numpy(nd["mask"]).float(), nd["bb"], nd["complete"]
+        else:
+            feats, _ = load_feats_from_pdb(nat_path, include_pos_feats=True)
+            nat_pos = feats["atom_positions"].float()
+            nat_mask = (nat_pos.abs().sum(-1) > 0).float()
+            nat_bb, nat_complete = nat_pos[:, BB_IDX].numpy().astype(np.float64), np.ones(len(nat_pos), bool)
         if len(nat_pos) != sa["L"]:
             open(os.path.join(a.out_dir, "skipped.jsonl"), "a").write(json.dumps(dict(chain=chain, why="native length differs between stage A and B", L_a=sa["L"], L_b=len(nat_pos))) + "\n")
             continue
-        nat_bb = nat_pos[:, BB_IDX].numpy().astype(np.float64)
-        nat_loop = float(np.mean(dssp(nat_bb) == "C"))
-        items = [build_inputs(nat_pos, nat_bb, p) for p in plans]
+        nat_is_pro = np.array([c == "P" for c in sa["names"]])
+        nat_loop = loop_fraction(nat_bb, nat_is_pro, nat_complete)
+        nat_break = np.linalg.norm(nat_bb[1:, 1] - nat_bb[:-1, 1], axis=1) > 4.0
+        tmp = tempfile.TemporaryDirectory()
+        nat_pdb = nat_path
+        if nat_path.endswith(".npz"):
+            nat_pdb = os.path.join(tmp.name, "native_ca.pdb")
+            write_ca_pdb(nat_pdb, nat_bb[:, 1])
+        items = [build_inputs(nat_pos, nat_mask, nat_bb, p) for p in plans]
         t1 = time.perf_counter()
         seed_everything(zlib.crc32(chain.encode()) % 2**31)
         coords, masks, seqs, kept = [], [], [], []
@@ -184,7 +210,8 @@ def main():
                 kept.append(i + b)
         torch.cuda.synchronize()
         t2 = time.perf_counter()
-        rows = pool.map(score_one, [(c[:, BB_IDX].astype(np.float64), nat_pdb, nat_loop) for c in coords])
+        rows = pool.map(score_one, [(c[:, BB_IDX].astype(np.float64), nat_pdb, items[j][3], plans[j]["seq"], nat_break) for c, j in zip(coords, kept)])
+        tmp.cleanup()
         t3 = time.perf_counter()
         pool_items, recs = [], []
         for j, c, m, s, r in zip(kept, coords, masks, seqs, rows):
@@ -193,12 +220,13 @@ def main():
             r["pass_bond"] = all(env[k][0] <= r[k] <= env[k][1] for k in env)
             r["loop_increase"] = r["loop_frac"] - nat_loop
             r["pass_loop"] = bool(r["loop_increase"] < a.loop_max)
-            r["pass_all"] = r["pass_tm"] and r["pass_bond"] and r["pass_loop"]
+            r["pass_break"] = r["n_broken"] <= a.max_broken
+            r["pass_all"] = r["pass_tm"] and r["pass_bond"] and r["pass_loop"] and r["pass_break"]
             recs.append(dict(chain=chain, draw=p["draw"], L=len(s), L_native=len(nat_bb), n_ins=p["n_ins"], n_del=p["n_del"], n_mut=p["n_mut"], **r))
             pool_items.append(dict(arm="t2pipe", model=a.model, rewind=a.rewind, draw=p["draw"], coords=c[m].astype(np.float32), atom_mask=m, aatype=s, residue_index_orig=np.arange(1, len(s) + 1),
                                    orig_idx=it[3], ops=p["ops"], tm_native=r["tm_native"], tm_template=r["tm_template"], L_native=len(nat_bb)))
         np.savez(out, **ip.pack_chain(chain, pool_items))
-        pd.DataFrame(recs).to_csv(os.path.join(a.out_dir, chain + ".metrics.csv"), index=False)
+        pd.DataFrame(recs).to_csv(shard_path(a.out_dir, chain, ".metrics.csv"), index=False)
         tot["build"] += t1 - t0
         tot["pd"] += t2 - t1
         tot["score"] += t3 - t2

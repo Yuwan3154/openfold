@@ -3,7 +3,7 @@
 Replaces make_mild_inputs.py (plans) + esmc_fill_mut.py (fill) of the file-per-draw route, whose cost was the CPU ESMC forward (xeon-p8 node, no GPU) and the per-file
 launches around it. Logic is imported, not re-implemented: draw_plan / edit / sample_positions are the same functions, so the plans (ops, orig_idx, mutation sites) and the
 sampling given the logits are identical to the old route; only the ESMC forward is batched (padded token matrix, pad-masked by the model) and run on the GPU.
-Per chain it writes <out>/<chain>.json = {chain, L, names, plans: [{draw, ops, orig_idx, mut_idx, seq, n_ins, n_del, n_mut}]}. A chain whose edit fractions round to zero
+Per chain it writes <out>/<id[1:3]>/<chain>.json = {chain, L, names, plans: [{draw, ops, orig_idx, mut_idx, seq, n_ins, n_del, n_mut}]}. A chain whose edit fractions round to zero
 residues (too short) is SKIPPED AND RECORDED in <out>/skipped.jsonl.
 Edit sizes: insertion, deletion and point-mutation fractions each U(frac_lo, frac_hi) of L (user 10-08: 5-10 %), ESMC T 0.7, top-p 1.0, native residue excluded at mutated sites.
 Run: python t2_stage_a.py --chains-file chains.tsv(chain<TAB>native.pdb) --out-dir D --n-draws 64 [--verify-dir inputs_mf --verify-seqs mf_seqs_300m.json]
@@ -23,6 +23,7 @@ from esmc_fill_pilot import AA, THREE2ONE, sample_positions
 from indel_edit import edit
 from regen_gly_inputs import backbone, native_residues
 from sample_indels import draw_plan
+from t2_native import STANDARD, load_npz, native_ref, shard_path
 
 
 ESMC_DIMS = {"esmc_300m": (960, 15, 30), "esmc_600m": (1152, 18, 36)}
@@ -39,6 +40,9 @@ def load_esmc(name, dev, pth):
 
 
 def load_native(pdb):
+    if pdb.endswith(".npz"):
+        d = load_npz(pdb)
+        return d["bb"], d["names"]
     res = native_residues(pdb)
     names = "".join(THREE2ONE[res[i][0][17:20].strip()] for i in sorted(res))
     return backbone(res), names
@@ -105,7 +109,8 @@ def sample_sequences(names, chain, plans, logits, temp, top_p):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--chains-file", required=True, help="TSV: chain<TAB>native.pdb")
+    ap.add_argument("--chains-file", required=True, help="one chain id per line (natives from --natives-dir) or TSV chain<TAB>native.pdb")
+    ap.add_argument("--natives-dir", default=None, help="t2_extract_natives.py output: <dir>/<id[1:3]>/<id>.npz")
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--n-draws", type=int, default=64)
     ap.add_argument("--seed", type=int, default=0)
@@ -131,12 +136,16 @@ def main():
     n_same = n_tot = 0
     t_plan = t_fwd = t_samp = 0.0
     for ln in open(a.chains_file):
-        chain, pdb = ln.rstrip("\n").split("\t")
-        out = os.path.join(a.out_dir, chain + ".json")
+        chain, pdb = native_ref(ln, a.natives_dir)
+        out = shard_path(a.out_dir, chain, ".json")
         if os.path.isfile(out):
             continue
+        os.makedirs(os.path.dirname(out), exist_ok=True)
         t0 = time.perf_counter()
         nat_bb, names = load_native(pdb)
+        if set(names) - STANDARD:
+            open(os.path.join(a.out_dir, "skipped.jsonl"), "a").write(json.dumps(dict(chain=chain, L=len(nat_bb), why="non-standard residue type in the native sequence")) + "\n")
+            continue
         plans = make_plans(chain, nat_bb, a.n_draws, a.seed, a.frac_lo, a.frac_hi, a.mut_lo, a.mut_hi)
         if plans is None:
             open(os.path.join(a.out_dir, "skipped.jsonl"), "a").write(json.dumps(dict(chain=chain, L=len(nat_bb), why="edit fraction rounds to zero residues")) + "\n")

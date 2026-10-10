@@ -33,8 +33,9 @@ def load_items(stage_a_dir, chain, native_pdb, n):
     sa = json.load(open(os.path.join(stage_a_dir, chain + ".json")))
     feats, _ = load_feats_from_pdb(native_pdb, include_pos_feats=True)
     nat_pos = feats["atom_positions"].float()
+    nat_mask = (nat_pos.abs().sum(-1) > 0).float()
     nat_bb = nat_pos[:, sb.BB_IDX].numpy().astype(np.float64)
-    return [sb.build_inputs(nat_pos, nat_bb, p) for p in sa["plans"][:n]], nat_pos, feats
+    return [sb.build_inputs(nat_pos, nat_mask, nat_bb, p) for p in sa["plans"][:n]], nat_pos, feats
 
 
 def check_inmemory(model, native_pdb, rewind):
@@ -109,7 +110,8 @@ def check_metrics(pool_npz, geom_csv, chain, native_pdb, n):
     for i in range(min(n, int(z["n_templates"]))):
         t = ip.read_template(pool_npz, i)
         bb = ip.atom37_coords(t)[:, sb.BB_IDX].astype(np.float64)
-        r = sb.score_one((bb, native_pdb, 0.0))
+        seq = "".join(ip.AA_ORDER[int(x)] for x in t["aatype"])
+        r = sb.score_one((bb, native_pdb, np.asarray(t["orig_idx"]), seq, np.zeros(t["L_native"] - 1, bool)))
         old = g[(g.draw == t["draw"]) & (g.set.str.endswith(t["arm"]))]
         assert len(old) == 1, (chain, t["draw"], t["arm"], len(old))
         for k in ("cn_med", "nca_med", "cac_med"):
