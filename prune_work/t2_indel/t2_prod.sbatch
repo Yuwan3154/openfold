@@ -9,7 +9,7 @@
 #SBATCH -o /orcd/compute/so3/002/chenxi/t2_synth_v2/logs/%x_%a_%j.log
 # Production run of the T2 synthetic-template pipeline for the T8 chain list (RAW 137). One array task = one shard (chain i of the list goes to shard i % NSHARD), 1 L40S each.
 # Resumable at every stage (natives npz, stage A json, stage B metrics.csv are skipped when present); resubmit the same array to continue after the 6 h limit.
-# Shakedown: LIMIT=200 (first 200 chains of the shard; use OUT_TAG to keep it out of the real output dir). Submit: sbatch --array=0-1 --export=ALL,NSHARD=2 t2_prod.sbatch   (NSHARD defaults to 2)
+# HALF=1 -> half-step schedule for stage B. Shakedown: LIMIT=200 (first 200 chains of the shard; use OUT_TAG to keep it out of the real output dir). Submit: sbatch --array=0-1 --export=ALL,NSHARD=2 t2_prod.sbatch   (NSHARD defaults to 2)
 set -uo pipefail
 NSHARD=${NSHARD:-2}
 S=${SLURM_ARRAY_TASK_ID:-0}
@@ -23,6 +23,7 @@ PTH=$R/hf/hub/models--biohub--esmc-300m-2024-12/snapshots/7f10b20ae75017b2dbc884
 GEOM=$HOME/orcd/scratch/t2pipe_data/geom_pools.csv
 CODE=$R/repo/prune_work/t2_indel
 ESMC_DTYPE=${ESMC_DTYPE:-fp16}
+SB_ARGS=""; [ "${HALF:-0}" = 1 ] && SB_ARGS="--num-steps 250 --rewind 125"   # half-step schedule (user 10-10: same entry noise level, half the denoiser calls)
 mkdir -p $OUT/logs $OUT/templates $W/natives $W/stageA
 cd $W
 
@@ -49,7 +50,7 @@ HF_HUB_OFFLINE=1 PYTHONPATH=$CODE $HOME/.conda/envs/esmfold2_env/bin/python $COD
 rc=$?
 if [ $rc -ne 0 ]; then echo "stage A failed rc=$rc"; exit $rc; fi
 export PYTHONPATH=$R/pp/src:$R/extra:$CODE PYTHONUNBUFFERED=1 PROTPARDELLE_KEEP_TRAJECTORY=0 PROTPARDELLE_EMPTY_CACHE_PER_STEP=0
-$CH/pp1c/env/bin/python $CODE/t2_stage_b.py --stage-a-dir $W/stageA --chains-file order_shard$S.txt --natives-dir $W/natives --out-dir $OUT/templates --geom-ref $GEOM --fast --store passing
+$CH/pp1c/env/bin/python $CODE/t2_stage_b.py --stage-a-dir $W/stageA --chains-file order_shard$S.txt --natives-dir $W/natives --out-dir $OUT/templates --geom-ref $GEOM --fast --store passing $SB_ARGS
 rc=$?
 echo "stage B rc=$rc"
 exit $rc
