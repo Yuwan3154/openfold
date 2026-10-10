@@ -57,9 +57,9 @@ def check_inmemory(model, native_pdb, rewind):
     print(f"inmemory vs file: max |dx| = {float((a_mem - a_file).abs().max()):.3e} A over {tuple(a_mem.shape)}")
 
 
-def initial_state(model, pb, rewind, seeds):
+def initial_state(model, pb, rewind, seeds, num_steps=None):
     """Per-sample initial noisy state, identical whether the sample is alone or in a padded batch (same per-sample generator seed)."""
-    kw = sb.sampling_kwargs([rewind])
+    kw = sb.sampling_kwargs([rewind], num_steps)
     ts = torch.linspace(1, 0, int(kw["num_steps"]) + 1)
     sigma = float(model.sampling_noise_schedule_default(ts[int(kw["num_steps"]) - rewind]))
     rows = []

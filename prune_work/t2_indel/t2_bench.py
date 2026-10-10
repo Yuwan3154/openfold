@@ -25,6 +25,7 @@ def main():
     ap.add_argument("--native-pdb", required=True)
     ap.add_argument("--n", type=int, default=64)
     ap.add_argument("--rewind", type=int, default=250)
+    ap.add_argument("--num-steps", type=int, default=None, help="total ODE steps (default 500); with a different value the output is a different sampler discretisation: compare as a distribution, not per atom")
     ap.add_argument("--repeat", type=int, default=3)
     ap.add_argument("--pad-multiple", type=int, default=1)
     ap.add_argument("--compile", default=None, help="torch.compile mode for the coordinate denoiser (default | reduce-overhead | max-autotune-no-cudagraphs)")
@@ -53,17 +54,17 @@ def main():
         model.struct_model = GraphedDenoiser(model.struct_model)
     items, _, _ = load_items(a.stage_a_dir, a.chain, a.native_pdb, a.n)
     pb = sb.pad_batch(items, "cuda", a.pad_multiple)
-    xt = initial_state(model, pb, a.rewind, list(range(100, 100 + len(items))))
-    steps = int(sb.sampling_kwargs([a.rewind])["num_steps"])
+    xt = initial_state(model, pb, a.rewind, list(range(100, 100 + len(items))), a.num_steps)
+    steps = a.rewind   # denoising steps actually taken
     t0 = time.perf_counter()
-    out = sb.run_pd(model, pb, a.rewind, xt_start=xt)["xt_traj"][-1]
+    out = sb.run_pd(model, pb, a.rewind, xt_start=xt, num_steps=a.num_steps)["xt_traj"][-1]
     torch.cuda.synchronize()
     first = time.perf_counter() - t0
     torch.cuda.reset_peak_memory_stats()
     ts = []
     for _ in range(a.repeat):
         t0 = time.perf_counter()
-        out2 = sb.run_pd(model, pb, a.rewind, xt_start=xt)["xt_traj"][-1]
+        out2 = sb.run_pd(model, pb, a.rewind, xt_start=xt, num_steps=a.num_steps)["xt_traj"][-1]
         torch.cuda.synchronize()
         ts.append(time.perf_counter() - t0)
     rerun = float((out2 - out).abs().max())
@@ -72,7 +73,7 @@ def main():
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-            sb.run_pd(model, pb, a.rewind, xt_start=xt)
+            sb.run_pd(model, pb, a.rewind, xt_start=xt, num_steps=a.num_steps)
             torch.cuda.synchronize()
         wall = time.perf_counter() - t0
         ka = prof.key_averages()

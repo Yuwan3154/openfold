@@ -49,7 +49,7 @@ BB_IDX = [0, 1, 2, 4]                       # atom37 N, CA, C, O
 CFG = "sampling_partial_diffusion_allatom"
 
 
-def sampling_kwargs(rewinds):
+def sampling_kwargs(rewinds, num_steps=None):
     """As prune_work/generate_templates.py:sampling_kwargs (ODE, no churn), with no PDB path (inputs come from pd_inputs)."""
     with initialize_config_dir(config_dir=str(PROTPARDELLE_RUNNING_CONFIGS), version_base="1.3.2"):
         c = compose(config_name=CFG)
@@ -58,6 +58,8 @@ def sampling_kwargs(rewinds):
     s["step_scale"], s["s_churn"] = 1.0, 0
     s["conditional_cfg"]["crop_conditional_guidance"]["start"] = 0.0
     s["partial_diffusion"]["pdb_file_path"] = None
+    if num_steps is not None:
+        s["num_steps"] = num_steps   # total discretisation steps; rewind is the number of them taken (entry noise level = rewind / num_steps)
     s["partial_diffusion"]["num_steps"] = rewinds
     s["motif_file_path"] = "test_dir/empty.pdb"
     s.update(apply_dotdict_recursively(s.pop("allatom_cfg")))
@@ -99,11 +101,11 @@ def pad_batch(items, device, multiple=1):
 
 
 @torch.no_grad()
-def run_pd(model, pb, rewind, xt_start=None):
+def run_pd(model, pb, rewind, xt_start=None, num_steps=None):
     B = pb["aat"].shape[0]
     return model.sample(seq_mask=pb["mask"], residue_index=pb["ridx"], chain_index=torch.zeros_like(pb["ridx"]), hotspots=None, sse_cond=None, adj_cond=None,
                         motif_placements_full=None, dummy_fill_mode=model.config.data.dummy_fill_mode, xt_start=xt_start,
-                        pd_inputs=dict(aatype=pb["aat"], atom_positions=pb["pos"], known_mask=pb["known"]), **sampling_kwargs([rewind] * B))
+                        pd_inputs=dict(aatype=pb["aat"], atom_positions=pb["pos"], known_mask=pb["known"]), **sampling_kwargs([rewind] * B, num_steps))
 
 
 def bond_medians(bb):
@@ -148,6 +150,7 @@ def main():
     ap.add_argument("--geom-ref", required=True, help="geom_pools.csv: its native rows give the bond-length envelope")
     ap.add_argument("--model", default="cc89", choices=sorted(MODEL_EPOCH))
     ap.add_argument("--rewind", type=int, default=250)
+    ap.add_argument("--num-steps", type=int, default=None, help="total ODE steps of the schedule (default: the config value, 500); entry noise level = rewind / num-steps, so --num-steps 250 --rewind 125 = the same noise level with half the denoiser calls")
     ap.add_argument("--chunk", type=int, default=64, help="draws per sampler call")
     ap.add_argument("--span-cutoff", type=int, default=484)
     ap.add_argument("--tol", type=float, default=0.05, help="bond-length tolerance, A (user 10-09)")
@@ -214,7 +217,7 @@ def main():
             if a.fast and pb["aat"].shape[1] != last_bucket:   # graphs of a finished length bucket are dropped (compiled code is kept)
                 model.struct_model.clear()
                 last_bucket = pb["aat"].shape[1]
-            aux = run_pd(model, pb, a.rewind)
+            aux = run_pd(model, pb, a.rewind, num_steps=a.num_steps)
             x, m, s = aux["xt_traj"][-1].numpy(), aux["atom_mask"].cpu().numpy().astype(bool), aux["s"].cpu().numpy()
             for b, it in enumerate(sub):
                 n = len(it[1])
