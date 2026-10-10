@@ -14,6 +14,7 @@ import numpy as np
 import torch
 
 import t2_stage_b as sb
+from t2_graph import GraphedDenoiser
 from t2_verify import get_model, initial_state, load_items
 
 
@@ -29,6 +30,7 @@ def main():
     ap.add_argument("--compile", default=None, help="torch.compile mode for the coordinate denoiser (default | reduce-overhead | max-autotune-no-cudagraphs)")
     ap.add_argument("--label", required=True)
     ap.add_argument("--profile", action="store_true", help="one extra call under torch.profiler: top kernels by GPU time, GPU busy share, launches per step")
+    ap.add_argument("--graphs", action="store_true", help="manual CUDA-graph replay of the denoiser (t2_graph.GraphedDenoiser), also on top of --compile")
     ap.add_argument("--graph-wrap", action="store_true", help="clone the compiled denoiser outputs and mark a CUDA-graph step per call (needed for reduce-overhead: the sampler reuses outputs across steps)")
     ap.add_argument("--save-ref", default=None)
     ap.add_argument("--ref", default=None)
@@ -47,6 +49,8 @@ def main():
                     return self.m(*args, **kw).clone()
             compiled = Wrapped(compiled)
         model.struct_model = compiled
+    if a.graphs:
+        model.struct_model = GraphedDenoiser(model.struct_model)
     items, _, _ = load_items(a.stage_a_dir, a.chain, a.native_pdb, a.n)
     pb = sb.pad_batch(items, "cuda", a.pad_multiple)
     xt = initial_state(model, pb, a.rewind, list(range(100, 100 + len(items))))
