@@ -22,7 +22,7 @@ PR=/orcd/pool/006/chenxiou/proteina/data/pdb_train/processed
 PTH=$R/hf/hub/models--biohub--esmc-300m-2024-12/snapshots/7f10b20ae75017b2dbc884070e03434515709a8d/data/weights/esmc_300m_2024_12_v0.pth
 GEOM=$HOME/orcd/scratch/t2pipe_data/geom_pools.csv
 CODE=$R/repo/prune_work/t2_indel
-ESMC_DTYPE=${ESMC_DTYPE:-fp32}
+ESMC_DTYPE=${ESMC_DTYPE:-fp16}
 mkdir -p $OUT/logs $OUT/templates $W/natives $W/stageA
 cd $W
 
