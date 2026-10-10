@@ -51,11 +51,11 @@ def load_native(pdb):
     return backbone(res), names
 
 
-def make_plans(chain, nat_bb, n_draws, seed, frac_lo, frac_hi, mut_lo, mut_hi):
+def make_plans(chain, nat_bb, n_draws, seed, frac_lo, frac_hi, mut_lo, mut_hi, draw_start=0):
     """Same sampling as make_mild_inputs.py (draw_plan + the mutation draw rng [seed, crc32(chain), draw, 5])."""
     L = len(nat_bb)
     plans = []
-    for k in range(n_draws):
+    for k in range(draw_start, draw_start + n_draws):
         rec = draw_plan(L, chain, k, seed, frac_lo, frac_hi)
         if rec["ins"]["T"] < 1 or rec["del"]["T"] < 1:
             return None
@@ -117,6 +117,7 @@ def main():
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--n-draws", type=int, default=64)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--draw-start", type=int, default=0, help="first draw index: --draw-start 64 --n-draws 192 makes NEW edits for a rescue run (draw ids are part of the edit and sampling seeds)")
     ap.add_argument("--frac-lo", type=float, default=0.05)
     ap.add_argument("--frac-hi", type=float, default=0.10)
     ap.add_argument("--mut-lo", type=float, default=0.05)
@@ -150,7 +151,7 @@ def main():
         if set(names) - STANDARD:
             open(os.path.join(a.out_dir, "skipped.jsonl"), "a").write(json.dumps(dict(chain=chain, L=len(nat_bb), why="non-standard residue type in the native sequence")) + "\n")
             continue
-        plans = make_plans(chain, nat_bb, a.n_draws, a.seed, a.frac_lo, a.frac_hi, a.mut_lo, a.mut_hi)
+        plans = make_plans(chain, nat_bb, a.n_draws, a.seed, a.frac_lo, a.frac_hi, a.mut_lo, a.mut_hi, a.draw_start)
         if plans is None:
             open(os.path.join(a.out_dir, "skipped.jsonl"), "a").write(json.dumps(dict(chain=chain, L=len(nat_bb), why="edit fraction rounds to zero residues")) + "\n")
             continue
