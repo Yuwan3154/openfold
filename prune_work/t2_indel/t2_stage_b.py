@@ -159,6 +159,7 @@ def main():
     ap.add_argument("--tm-lo", type=float, default=0.4)
     ap.add_argument("--tm-hi", type=float, default=0.9)
     ap.add_argument("--store", default="all", choices=["all", "passing"], help="templates written to the npz: all 64 (metrics.csv flags the passing ones) or only those passing every gate; metrics.csv always has every row")
+    ap.add_argument("--graph-per-chain", action="store_true", help="recapture the CUDA graphs for every chain (the denoiser's memoised relative-position / rotary tensors are constants of the graph and belong to the chain that captured it)")
     ap.add_argument("--procs", type=int, default=8)
     ap.add_argument("--seed-offset", type=int, default=0, help="added to the per-chain noise seed (crc32 of the id): a second draw of the same edits, to measure the seed-to-seed spread")
     ap.add_argument("--fast", action="store_true", help="fused attention + fp16 autocast + torch.compile + CUDA-graph replay of the denoiser (RAW 140: 3.7-5.9x faster; coordinates deviate ~0.1 A from fp32)")
@@ -248,7 +249,7 @@ def main():
         for i in range(0, len(items), a.chunk):
             sub = items[i:i + a.chunk]
             pb = pad_batch(sub, "cuda", mult)
-            if a.fast and pb["aat"].shape[1] != last_bucket:   # graphs of a finished length bucket are dropped (compiled code is kept)
+            if a.fast and (pb["aat"].shape[1] != last_bucket or (a.graph_per_chain and i == 0)):   # graphs of a finished length bucket are dropped (compiled code is kept)
                 model.struct_model.clear()
                 last_bucket = pb["aat"].shape[1]
             aux = run_pd(model, pb, a.rewind, num_steps=a.num_steps)
