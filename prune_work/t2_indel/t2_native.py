@@ -15,10 +15,19 @@ def load_npz(path):
     z = np.load(path)
     pos, mask = z["coords"].astype(np.float32), z["mask"].astype(bool)
     ca_ok = mask[:, 1]
-    if not ca_ok.all():   # placeholder CA of a residue without one (edit geometry only; the sampler marks its atoms unknown): linear interpolation between the nearest resolved neighbours, ends copy the nearest
+    if not ca_ok.all():   # placeholder CA of a residue without one (edit geometry only; the sampler marks its atoms unknown): linear interpolation between the nearest resolved neighbours; a terminal run is extended along the last resolved CA-CA direction in 3.8 A steps (copying the nearest CA would make coincident CA atoms, which indel_edit rejects)
         idx = np.arange(len(ca_ok))
+        ok = np.flatnonzero(ca_ok)
         for k in range(3):
-            pos[~ca_ok, 1, k] = np.interp(idx[~ca_ok], idx[ca_ok], pos[ca_ok, 1, k])
+            pos[~ca_ok, 1, k] = np.interp(idx[~ca_ok], ok, pos[ok, 1, k])
+        for lo, hi, step in ((ok[0], ok[1] if len(ok) > 1 else ok[0], -1), (ok[-1], ok[-2] if len(ok) > 1 else ok[-1], 1)):
+            d = pos[lo, 1] - pos[hi, 1]
+            d = d / max(float(np.linalg.norm(d)), 1e-6)
+            run = range(lo + step, -1 if step < 0 else len(ca_ok), step)
+            for j in run:
+                if ca_ok[j]:
+                    break
+                pos[j, 1] = pos[lo, 1] + d * 3.8 * abs(j - lo)
     bb, bm = pos[:, BB_AF].copy(), mask[:, BB_AF]
     for j in range(4):
         bb[~bm[:, j], j] = pos[~bm[:, j], 1]
