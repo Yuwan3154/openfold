@@ -3,7 +3,7 @@
 proteinfoundation.utils.constants.ATOM_NUMBERING); they are reordered to the AF/OpenFold atom37 order the pipeline (Protpardelle) uses with PDB_TO_OPENFOLD_INDEX_TENSOR.
 Writes <out>/<id[1:3]>/<id>.npz: coords (L,37,3) f32 atom37, mask (L,37) bool, sequence str, residue_pdb_idx (L,), n_incomplete (residues missing any of N/CA/C/O).
 Residues with a missing N/C/O (CA present) are KEPT: their mask stays False, stage A fills the missing backbone atoms with the CA only to run the edit geometry, and stage B marks those atoms
-unknown so the sampler dummy-fills and noises them (T8 DSSP rule: such residues are -1 in DSSP). Chains that are missing, have a sequence/length mismatch or a residue without CA are NOT written
+unknown so the sampler dummy-fills and noises them (T8 DSSP rule: such residues are -1 in DSSP). Residues without a CA are KEPT too (user 10-11: the 1,133 chains with 1-4 such residues, median 1, must not be dropped; handoff: DSSP -1 for residues lacking a full N/CA/C/O): t2_native.load_npz gives them an interpolated placeholder CA for the edit geometry only, the sampler treats their atoms as unknown. Chains that are missing or have a sequence/length mismatch are NOT written
 and are recorded in <out>/skipped.tsv. The processed files are not all under <id[1:3]>/ (the tree is sharded), so --index (TSV id<TAB>path, made once with `find -L`) is used when given.
 Resumable (existing npz skipped). With --stats-only nothing is written: prints the skip statistics.
 Run: python t2_extract_natives.py --chains-file ids.txt --processed-dir P --out-dir O --proteina-src /path/to/proteina [--index idx.tsv] [--stats-only]
@@ -48,9 +48,6 @@ def main():
         coords, mask = d.coords[:, reorder].numpy().astype(np.float32), d.coord_mask[:, reorder].numpy().astype(bool)
         if len(d.sequence) != L:
             skipped.append((cid, "sequence length differs from coords", f"{len(d.sequence)} vs {L}"))
-            continue
-        if not mask[:, 1].all():
-            skipped.append((cid, "residue without CA", f"{int((~mask[:, 1]).sum())} of {L} residues"))
             continue
         n_inc = int((~mask[:, [0, 1, 2, 4]].all(1)).sum())   # AF order: N 0, CA 1, C 2, CB 3, O 4: residues kept with missing backbone atoms
         n_ok += 1

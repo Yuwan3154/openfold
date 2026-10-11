@@ -14,6 +14,11 @@ STANDARD = set("ACDEFGHIKLMNPQRSTVWY")
 def load_npz(path):
     z = np.load(path)
     pos, mask = z["coords"].astype(np.float32), z["mask"].astype(bool)
+    ca_ok = mask[:, 1]
+    if not ca_ok.all():   # placeholder CA of a residue without one (edit geometry only; the sampler marks its atoms unknown): linear interpolation between the nearest resolved neighbours, ends copy the nearest
+        idx = np.arange(len(ca_ok))
+        for k in range(3):
+            pos[~ca_ok, 1, k] = np.interp(idx[~ca_ok], idx[ca_ok], pos[ca_ok, 1, k])
     bb, bm = pos[:, BB_AF].copy(), mask[:, BB_AF]
     for j in range(4):
         bb[~bm[:, j], j] = pos[~bm[:, j], 1]
