@@ -29,13 +29,17 @@ def main():
         tms.append(m.tm_native.values)
         lens.append(np.full(len(m), int(m.L_native.iloc[0])))
         passes.append(m.pass_all.values)
-        rows.append(dict(chain=cid, has_metrics=True, n_run=len(m), n_pass=int(m.pass_all.sum()), **{"fail_" + g[5:]: int((~m[g]).sum()) for g in GATES}))
+        rf = os.path.join(a.templates, cid[1:3], cid + ".rescue.metrics.csv")
+        n_resc = int(pd.read_csv(rf).pass_all.sum()) if os.path.isfile(rf) else 0
+        rows.append(dict(chain=cid, has_metrics=True, n_run=len(m), n_pass=int(m.pass_all.sum()), n_pass_rescue=n_resc, **{"fail_" + g[5:]: int((~m[g]).sum()) for g in GATES}))
     df = pd.DataFrame(rows)
     df.to_csv(a.out, sep="\t", index=False)
     have = df[df.has_metrics]
     print(f"rows = chain of the list (n = {len(df)}); {len(have)} have metrics, {len(df) - len(have)} have none")
     for k in (1, 8, 16, 32, 64):
         print(f"chains with >= {k:2d} surviving templates: {int((have.n_pass >= k).sum())} ({100 * (have.n_pass >= k).sum() / len(df):.1f} % of the list)")
+    final = have.n_pass + have.n_pass_rescue
+    print(f"rescue (rewind 100): {int((have.n_pass_rescue > 0).sum())} chains gained survivors ({int(have.n_pass_rescue.sum())} templates); chains with >= 1 survivor incl. rescue: {int((final >= 1).sum())}, zero: {int((final == 0).sum())}")
     print(f"mean survivors per chain (over chains with metrics): {have.n_pass.mean():.1f} of {have.n_run.mean():.1f} run")
 
 
