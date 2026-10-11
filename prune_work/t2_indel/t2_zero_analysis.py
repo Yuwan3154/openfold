@@ -58,7 +58,7 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
     rows = []
-    for f in glob.glob(os.path.join(a.templates, "*", "*.metrics.csv")):
+    for f in (g for g in glob.glob(os.path.join(a.templates, "*", "*.metrics.csv")) if not g.endswith(".rescue.metrics.csv")):   # the main run, not the rescue
         m = pd.read_csv(f)
         rows.append(dict(chain=m.chain.iloc[0], L=int(m.L_native.iloc[0]), n_pass=int(m.pass_all.sum()), tm_ok=m.pass_tm.mean(), brk_pass=m.pass_break.mean(), n_broken=m.n_broken.mean(), loop_pass=m.pass_loop.mean()))
     t = pd.DataFrame(rows)
