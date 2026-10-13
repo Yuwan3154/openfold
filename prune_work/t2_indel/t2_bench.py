@@ -33,10 +33,15 @@ def main():
     ap.add_argument("--profile", action="store_true", help="one extra call under torch.profiler: top kernels by GPU time, GPU busy share, launches per step")
     ap.add_argument("--graphs", action="store_true", help="manual CUDA-graph replay of the denoiser (t2_graph.GraphedDenoiser), also on top of --compile")
     ap.add_argument("--graph-wrap", action="store_true", help="clone the compiled denoiser outputs and mark a CUDA-graph step per call (needed for reduce-overhead: the sampler reuses outputs across steps)")
+    ap.add_argument("--fast-loop", action="store_true", help="whole sampler step in one CUDA graph (t2_fast_sampler.FastPD; needs --compile default --graphs)")
+    ap.add_argument("--fp8", action="store_true", help="e4m3 FP8 linear layers in the denoiser (t2_fp8.convert; option, judge with the panel gates)")
     ap.add_argument("--save-ref", default=None)
     ap.add_argument("--ref", default=None)
     a = ap.parse_args()
     model = get_model()
+    if a.fp8:
+        from t2_fp8 import convert
+        print(f"[{a.label}] fp8: {convert(model.struct_model)} linear layers converted")
     if a.compile:
         compiled = torch.compile(model.struct_model, mode=None if a.compile == "default" else a.compile, dynamic=False)
         if a.graph_wrap:
@@ -56,15 +61,22 @@ def main():
     pb = sb.pad_batch(items, "cuda", a.pad_multiple)
     xt = initial_state(model, pb, a.rewind, list(range(100, 100 + len(items))), a.num_steps)
     steps = a.rewind   # denoising steps actually taken
+    if a.fast_loop:
+        assert a.compile == "default" and a.graphs and not a.graph_wrap, "--fast-loop needs --compile default --graphs (the T2 production configuration)"
+        from t2_fast_sampler import FastPD
+        fp = FastPD(model)
+        runner = lambda: fp.run(pb, a.rewind, num_steps=a.num_steps, xt_start=xt)
+    else:
+        runner = lambda: sb.run_pd(model, pb, a.rewind, xt_start=xt, num_steps=a.num_steps)
     t0 = time.perf_counter()
-    out = sb.run_pd(model, pb, a.rewind, xt_start=xt, num_steps=a.num_steps)["xt_traj"][-1]
+    out = runner()["xt_traj"][-1]
     torch.cuda.synchronize()
     first = time.perf_counter() - t0
     torch.cuda.reset_peak_memory_stats()
     ts = []
     for _ in range(a.repeat):
         t0 = time.perf_counter()
-        out2 = sb.run_pd(model, pb, a.rewind, xt_start=xt, num_steps=a.num_steps)["xt_traj"][-1]
+        out2 = runner()["xt_traj"][-1]
         torch.cuda.synchronize()
         ts.append(time.perf_counter() - t0)
     rerun = float((out2 - out).abs().max())
@@ -73,7 +85,7 @@ def main():
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-            sb.run_pd(model, pb, a.rewind, xt_start=xt, num_steps=a.num_steps)
+            runner()
             torch.cuda.synchronize()
         wall = time.perf_counter() - t0
         ka = prof.key_averages()

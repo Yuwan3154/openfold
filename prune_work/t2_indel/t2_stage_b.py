@@ -161,6 +161,7 @@ def main():
     ap.add_argument("--tm-hi", type=float, default=0.9)
     ap.add_argument("--store", default="all", choices=["all", "passing"], help="templates written to the npz: all 64 (metrics.csv flags the passing ones) or only those passing every gate; metrics.csv always has every row")
     ap.add_argument("--graph-per-chain", action="store_true", help="recapture the CUDA graphs for every chain (the denoiser's memoised relative-position / rotary tensors are constants of the graph and belong to the chain that captured it)")
+    ap.add_argument("--fast-loop", action="store_true", help="whole sampler step in one CUDA graph (t2_fast_sampler.FastPD, direction (a) of T2_KERNEL_OPT_PLAN.md); needs --fast; default OFF")
     ap.add_argument("--procs", type=int, default=8)
     ap.add_argument("--seed-offset", type=int, default=0, help="added to the per-chain noise seed (crc32 of the id): a second draw of the same edits, to measure the seed-to-seed spread")
     ap.add_argument("--fast", action="store_true", help="fused attention + fp16 autocast + torch.compile + CUDA-graph replay of the denoiser (RAW 140: 3.7-5.9x faster; coordinates deviate ~0.1 A from fp32)")
@@ -176,6 +177,11 @@ def main():
     if a.fast:
         torch._dynamo.config.cache_size_limit = 64   # one compiled graph per padded length bucket
         model.struct_model = GraphedDenoiser(torch.compile(model.struct_model, dynamic=False))
+    fastpd = None
+    if a.fast_loop:
+        assert a.fast, "--fast-loop needs --fast"
+        from t2_fast_sampler import FastPD
+        fastpd = FastPD(model)
     last_bucket = None
     pending = None
     tot = dict(build=0.0, pd=0.0, score=0.0, wait=0.0)
@@ -267,8 +273,10 @@ def main():
             pb = pad_batch(sub, "cuda", mult)
             if a.fast and (pb["aat"].shape[1] != last_bucket or (a.graph_per_chain and i == 0)):   # graphs of a finished length bucket are dropped (compiled code is kept)
                 model.struct_model.clear()
+                if fastpd is not None:
+                    fastpd.clear()
                 last_bucket = pb["aat"].shape[1]
-            aux = run_pd(model, pb, a.rewind, num_steps=a.num_steps)
+            aux = fastpd.run(pb, a.rewind, num_steps=a.num_steps) if fastpd is not None else run_pd(model, pb, a.rewind, num_steps=a.num_steps)
             x, m, s = aux["xt_traj"][-1].numpy(), aux["atom_mask"].cpu().numpy().astype(bool), aux["s"].cpu().numpy()
             for b, it in enumerate(sub):
                 n = len(it[1])
