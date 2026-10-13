@@ -60,11 +60,12 @@ def write_pdb(path, ca):
         f.write("END\n")
 
 
-def usalign_tm(ca_a, ca_b):
+def usalign_tm(ca_a, ca_b, lnat=None):
+    """USalign TM (sequence-independent alignment); with lnat both TM values are normalised by that length (USalign -u, = the native length: user 10-13), else mean of the two chain-length normalisations"""
     with tempfile.TemporaryDirectory() as td:
         pa, pb = os.path.join(td, "a.pdb"), os.path.join(td, "b.pdb")
         write_pdb(pa, ca_a); write_pdb(pb, ca_b)
-        out = subprocess.run([USALIGN, pa, pb], capture_output=True, text=True, check=True).stdout
+        out = subprocess.run([USALIGN, pa, pb] + (["-u", str(int(lnat))] if lnat else []), capture_output=True, text=True, check=True).stdout
     t1 = next(float(l.split()[1]) for l in out.splitlines() if l.startswith("TM-score=") and "Structure_1" in l)
     t2 = next(float(l.split()[1]) for l in out.splitlines() if l.startswith("TM-score=") and "Structure_2" in l)
     return (t1 + t2) / 2
