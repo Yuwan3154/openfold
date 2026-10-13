@@ -29,9 +29,14 @@ def kabsch(P, Q, w=None):
     return R, P.mean(0), Q.mean(0)
 
 
-def proxy_tm(a, b, lnat):
+def orig_map(o):
+    return {int(x): i for i, x in enumerate(o) if x >= 0}
+
+
+def proxy_tm(a, b, lnat, ma=None, mb=None):
     (ca_a, o_a), (ca_b, o_b) = a, b
-    ma, mb = {int(o): i for i, o in enumerate(o_a) if o >= 0}, {int(o): i for i, o in enumerate(o_b) if o >= 0}
+    ma = orig_map(o_a) if ma is None else ma
+    mb = orig_map(o_b) if mb is None else mb
     common = sorted(set(ma) & set(mb))
     if len(common) < 10:
         return np.nan
