@@ -17,6 +17,7 @@ import pandas as pd
 import indel_pool as ip
 from t2_diversity import ca_of, orig_map, proxy_tm, usalign_tm
 from t2_pack_reader import TemplatePack
+from t2_topup import ROUNDS
 
 
 def pair_matrix(cas, lnat):
@@ -74,7 +75,7 @@ def pool_of(cid, tp, topup):
         items.append((t["round"], t["draw"], t))
     for f in sorted(glob.glob(os.path.join(topup, "*", "templates", cid[1:3], cid + ".npz"))):
         rd = f.split(os.sep)[-4]
-        if rd in have:
+        if rd in have or rd not in ROUNDS:   # a stray directory (the P1 shakedown 'P1test') is not a round of the product
             continue
         z = np.load(f, allow_pickle=False)   # every member is read ONCE (ip.read_template re-opens the npz per template)
         n, ro, ao = int(z["n_templates"]), z["res_offsets"], z["atom_offsets"]

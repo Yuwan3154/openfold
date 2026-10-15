@@ -114,7 +114,9 @@ def scenario(legacy):
     ok = run(*verify)
     assert "ALL GATES PASSED" in ok and "FAIL" not in ok and "A1 " in ok and "A2 " in ok and "A3 " in ok, ok
     # selection: the pool read from the appended pack == the pool read from the pre-append pack + the loose rounds
+    shutil.copytree(os.path.join(top, "P1"), os.path.join(top, "P1test"))   # a stray shakedown directory must never enter a pool
     run("t2_select_diverse.py", "--pack", pre, "--topup", top, "--out", os.path.join(tmp, "sel_pre.tsv"), "--k", str(K))
+    assert "P1test" not in open(os.path.join(tmp, "sel_pre.tsv")).read(), "a non-round directory entered the selection pool"
     run("t2_select_diverse.py", "--pack", out, "--topup", top, "--out", os.path.join(tmp, "sel0.tsv"), "--k", str(K), "--n-shards", "2", "--shard", "0")
     run("t2_select_diverse.py", "--pack", out, "--topup", top, "--out", os.path.join(tmp, "sel1.tsv"), "--k", str(K), "--n-shards", "2", "--shard", "1")
     pre_df = pd.read_csv(os.path.join(tmp, "sel_pre.tsv"), sep="\t").set_index("chain")
