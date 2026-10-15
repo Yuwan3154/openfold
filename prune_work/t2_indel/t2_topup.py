@@ -28,6 +28,7 @@ ROUNDS = {
     "R3": dict(proto="r100", n_draws=512, draw_start=2512, rewind=100, seed_offset=3003),
 }
 CAP = 1024
+NUM_STEPS = 250
 
 
 def base_status(pack):
@@ -99,7 +100,7 @@ def plan(pack, topup, rd, n_shards):
     for k in range(n_shards):
         with open(os.path.join(out, f"ids_shard{k}.txt"), "w") as fh:
             fh.write("\n".join(ids[k::n_shards]) + "\n")
-    cfg = dict(ROUNDS[rd], round=rd, n_chains=len(ids), stage_b_args=f"--num-steps 250 --rewind {ROUNDS[rd]['rewind']} --seed-offset {ROUNDS[rd]['seed_offset']} --store passing")
+    cfg = dict(ROUNDS[rd], round=rd, n_chains=len(ids), stage_b_args=f"--num-steps {NUM_STEPS} --rewind {ROUNDS[rd]['rewind']} --seed-offset {ROUNDS[rd]['seed_offset']} --store passing")
     with open(os.path.join(out, "round.json"), "w") as fh:
         json.dump(cfg, fh, indent=1)
     print(f"round {rd}: {len(ids)} chains, {cfg['n_draws']} draws each (ids {cfg['draw_start']}..{cfg['draw_start'] + cfg['n_draws'] - 1}), expected deficit {int((64 - sel.have).sum())} templates -> {out}")
