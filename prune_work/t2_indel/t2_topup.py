@@ -3,9 +3,11 @@ Status (rows = chain): the stored survivors of the first production (main run, o
 (<topup>/<round>/templates/<id[1:3]>/<id>.metrics.csv). Rounds (cap 1,024 extra draws per chain and protocol):
   P1..P4  production protocol (half-step: --num-steps 250 --rewind 125): +64, +128, +256, +576 draws (draw ids 64.., cumulative 1,024), noise seed offsets 11..14
   R1..R3  rewind-100 attempt (--num-steps 250 --rewind 100): +256, +256, +512 draws (draw ids 2000.., cumulative 1,024), seed offsets 3001..3003
+  R4..R6  (user 10-16: 'try more' for the chains still short after every round above, exceeding the per-chain cap on purpose) rewind 100, +256, +256, +512 draws (ids 3024.., seed offsets 3004..3006)
 Round membership is keyed on COMPLETED rounds (a metrics.csv of the round exists), never on run counts (stage B can write fewer rows than n_draws).
 Who goes into which round:
   P1: chains with 0 < base survivors < 64 whose expected extra draws (at the chain's own smoothed pass rate) are <= 1,024; P2..P4: chains of the previous P round still < 64 candidates.
+  R4: chains with 1-63 candidates after the closed rounds P1-R3 (use only after they all ran); R5 / R6: chains of the previous R4 / R5 that gained >= 1 passing template in THAT round and are still < 64 (the user's 'accept if they still fail' rule)
   R1: chains still < 64 that need rescue = zero base survivors, or expected extra draws > 1,024, or production cap exhausted (P4 done); R2, R3: chains of R1 that gained >= 1 survivor and are still < 64 (a chain that gains nothing in R1 is accepted as failed).
 Usage: python t2_topup.py status --pack P --topup T ;  python t2_topup.py plan --pack P --topup T --round P1 --n-shards 2
 `plan` writes <topup>/<round>/ids_shard<k>.txt (length-sorted, chain i -> shard i % n) and <topup>/<round>/round.json (n_draws, draw_start, stage-B arguments).
@@ -26,6 +28,9 @@ ROUNDS = {
     "R1": dict(proto="r100", n_draws=256, draw_start=2000, rewind=100, seed_offset=3001),
     "R2": dict(proto="r100", n_draws=256, draw_start=2256, rewind=100, seed_offset=3002),
     "R3": dict(proto="r100", n_draws=512, draw_start=2512, rewind=100, seed_offset=3003),
+    "R4": dict(proto="r100", n_draws=256, draw_start=3024, rewind=100, seed_offset=3004),
+    "R5": dict(proto="r100", n_draws=256, draw_start=3280, rewind=100, seed_offset=3005),
+    "R6": dict(proto="r100", n_draws=512, draw_start=3536, rewind=100, seed_offset=3006),
 }
 CAP = 1024
 NUM_STEPS = 250
@@ -71,6 +76,9 @@ def status(pack, topup):
     d["have"] = d.have_base + d.pass_prod + d.pass_r100
     d["p_base"] = (d.have_base + 1) / (d.runs_base + 2)
     d["exp_extra"] = np.ceil(np.maximum(64 - d.have_base, 0) / d.p_base).astype(int)
+    for rd in ROUNDS:
+        s = rc[rc["round"] == rd].set_index("chain").passed if len(rc) else pd.Series(dtype=int)
+        d["pass_" + rd] = s.reindex(d.index).fillna(0).astype(int)
     d["extra_prod"] = d.runs_prod
     d["extra_r100"] = d.runs_r100
     return d.join(done_flags(rc, d.index))
@@ -87,6 +95,11 @@ def members(d, rd):
     if rd == "R1":
         need = ~prod_ok | d.done_P4
         return d[short & need & ~d.done_R1]
+    if rd == "R4":   # P1-R3 are CLOSED (all ran): the chains whose production budget ended short never got their R1 (planned before P4 ran) and enter here
+        return d[short & (d.have > 0) & ~d.done_R4]
+    if rd in ("R5", "R6"):
+        prev = {"R5": "R4", "R6": "R5"}[rd]
+        return d[short & d["done_" + prev] & ~d["done_" + rd] & (d["pass_" + prev] >= 1)]
     prev = {"R2": "done_R1", "R3": "done_R2"}[rd]
     return d[short & d[prev] & ~d["done_" + rd] & (d.pass_r100 >= 1)]
 

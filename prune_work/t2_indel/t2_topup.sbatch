@@ -12,7 +12,7 @@
 # Submit: sbatch --array=0-1 --export=ALL,ROUND=P1 t2_topup.sbatch   (backups: add -p mit_preemptable --gres=gpu:l40s:1 / gpu:h200:1 -c 8 --requeue, one process per shard)
 set -uo pipefail
 S=${SLURM_ARRAY_TASK_ID:-0}
-ROUND=${ROUND:?set ROUND=P1|P2|P3|P4|R1|R2|R3}
+ROUND=${ROUND:?set ROUND=P1|P2|P3|P4|R1|R2|R3|R4|R5|R6}
 CH=/orcd/scratch/orcd/011/chenxiou
 R=$CH/t2pipe
 O=/orcd/compute/so3/002/chenxi/t2_synth_v2
