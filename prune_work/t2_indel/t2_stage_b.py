@@ -42,6 +42,7 @@ from protpardelle.env import MINIMPNN_WEIGHTS, PROTPARDELLE_MODEL_CONFIGS, PROTP
 from protpardelle.utils import apply_dotdict_recursively, seed_everything
 from score_indel import usalign, write_ca_pdb
 from t2_dssp import loop_fraction
+from t2_fp8 import convert
 from t2_graph import GraphedDenoiser
 from t2_native import load_npz, native_ref, shard_path
 
@@ -162,6 +163,7 @@ def main():
     ap.add_argument("--store", default="all", choices=["all", "passing"], help="templates written to the npz: all 64 (metrics.csv flags the passing ones) or only those passing every gate; metrics.csv always has every row")
     ap.add_argument("--graph-per-chain", action="store_true", help="recapture the CUDA graphs for every chain (the denoiser's memoised relative-position / rotary tensors are constants of the graph and belong to the chain that captured it)")
     ap.add_argument("--fast-loop", action="store_true", help="whole sampler step in one CUDA graph (t2_fast_sampler.FastPD, direction (a) of T2_KERNEL_OPT_PLAN.md); needs --fast; default OFF")
+    ap.add_argument("--fp8", action="store_true", help="e4m3 FP8 linear layers in the denoiser (t2_fp8.convert; option, default OFF; judge with t2_panel_compare against the seed spread)")
     ap.add_argument("--procs", type=int, default=8)
     ap.add_argument("--seed-offset", type=int, default=0, help="added to the per-chain noise seed (crc32 of the id): a second draw of the same edits, to measure the seed-to-seed spread")
     ap.add_argument("--fast", action="store_true", help="fused attention + fp16 autocast + torch.compile + CUDA-graph replay of the denoiser (RAW 140: 3.7-5.9x faster; coordinates deviate ~0.1 A from fp32)")
@@ -174,6 +176,8 @@ def main():
     model = load_model(str(PROTPARDELLE_MODEL_CONFIGS / f"{a.model}.yaml"), str(PROTPARDELLE_MODEL_WEIGHTS / f"{a.model}_epoch{MODEL_EPOCH[a.model]}.pth"))
     model.load_minimpnn(MINIMPNN_WEIGHTS)
     mult = a.pad_multiple or (16 if a.fast else 1)
+    if a.fp8:
+        print(f"fp8: {convert(model.struct_model)} linear layers converted", flush=True)   # before torch.compile / graph capture
     if a.fast:
         torch._dynamo.config.cache_size_limit = 64   # one compiled graph per padded length bucket
         model.struct_model = GraphedDenoiser(torch.compile(model.struct_model, dynamic=False))

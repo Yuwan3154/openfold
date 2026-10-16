@@ -79,6 +79,8 @@ def pool_of(cid, tp, topup):
             continue
         z = np.load(f, allow_pickle=False)   # every member is read ONCE (ip.read_template re-opens the npz per template)
         n, ro, ao = int(z["n_templates"]), z["res_offsets"], z["atom_offsets"]
+        n_pass = int(pd.read_csv(f[:-len(".npz")] + ".metrics.csv", usecols=["pass_all"]).pass_all.sum())
+        assert n == n_pass, (f, "the npz holds", n, "templates but its metrics.csv has", n_pass, "passing runs: the round was not run with --store passing")
         am, co, oi, aat, draw, rewind, lnat = z["atom_mask"], z["coords"], z["orig_idx"], z["aatype"], z["draw"], z["rewind"], int(z["L_native"])
         for i in range(n):
             r0, r1, a0, a1 = int(ro[i]), int(ro[i + 1]), int(ao[i]), int(ao[i + 1])

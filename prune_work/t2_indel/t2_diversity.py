@@ -16,6 +16,7 @@ USALIGN = os.path.expanduser("~/.local/bin/USalign")
 
 
 def ca_of(t):
+    assert t["atom_mask"][:, 1].all(), "a template residue without a CA atom (a zero row would enter the superposition and USalign)"
     full = np.zeros((len(t["aatype"]), 37, 3), np.float32)
     full[t["atom_mask"]] = t["coords"]
     return full[:, 1].astype(np.float64), t["orig_idx"]
@@ -60,15 +61,25 @@ def write_pdb(path, ca):
         f.write("END\n")
 
 
+def parse_usalign(out, lnat=None):
+    """TM from the USalign text: with lnat the extra line 'normalized by user-specified L=<lnat>' that -u adds (the native length: user 10-13), else the mean of the two own-length normalisations"""
+    lines = [l for l in out.splitlines() if l.startswith("TM-score=")]
+    if lnat:
+        user = [l for l in lines if "user-specified" in l]
+        assert len(user) == 1 and f"L={int(lnat)}." in user[0], ("USalign printed no TM-score normalised by the user-specified length", lnat, lines)
+        return float(user[0].split()[1])
+    t1 = next(float(l.split()[1]) for l in lines if "Structure_1" in l)
+    t2 = next(float(l.split()[1]) for l in lines if "Structure_2" in l)
+    return (t1 + t2) / 2
+
+
 def usalign_tm(ca_a, ca_b, lnat=None):
-    """USalign TM (sequence-independent alignment); with lnat both TM values are normalised by that length (USalign -u, = the native length: user 10-13), else mean of the two chain-length normalisations"""
+    """USalign TM (sequence-independent alignment) normalised by lnat (-u) when given, else mean of the two own-length normalisations"""
     with tempfile.TemporaryDirectory() as td:
         pa, pb = os.path.join(td, "a.pdb"), os.path.join(td, "b.pdb")
         write_pdb(pa, ca_a); write_pdb(pb, ca_b)
         out = subprocess.run([USALIGN, pa, pb] + (["-u", str(int(lnat))] if lnat else []), capture_output=True, text=True, check=True).stdout
-    t1 = next(float(l.split()[1]) for l in out.splitlines() if l.startswith("TM-score=") and "Structure_1" in l)
-    t2 = next(float(l.split()[1]) for l in out.splitlines() if l.startswith("TM-score=") and "Structure_2" in l)
-    return (t1 + t2) / 2
+    return parse_usalign(out, lnat)
 
 
 def leader_clusters(M, tau):

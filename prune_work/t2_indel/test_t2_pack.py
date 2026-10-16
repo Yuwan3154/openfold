@@ -24,7 +24,7 @@ def fake_chain(cid, rng, n, rewind, tm_lo=0.45):
         mask[:, 3] = rng.random(L) < 0.9
         A = int(mask.sum())
         items.append(dict(arm="t2pipe", model="cc89", rewind=rewind, draw=d * 3 + 1, coords=rng.normal(size=(A, 3)).astype(np.float32) * 10, atom_mask=mask, aatype=rng.integers(0, 20, L).astype(np.int8),
-                          residue_index_orig=np.arange(1, L + 1), orig_idx=np.where(rng.random(L) < 0.1, -1, np.arange(L)), ops=[["ins", 3, 2]], tm_native=tm_lo + 0.4 * rng.random(), tm_template=0.5, L_native=L - 2))
+                          residue_index_orig=np.arange(1, L + 1), orig_idx=np.where(rng.random(L) < 0.1, -1, np.arange(L)), ops=[["ins", 3, 2]], tm_native=tm_lo + 0.4 * rng.random(), tm_template=0.5, L_native=45))   # one native length per chain, as in the real data
     return ip.pack_chain(cid, items)
 
 

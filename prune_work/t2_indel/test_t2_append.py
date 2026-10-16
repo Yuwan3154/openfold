@@ -1,4 +1,5 @@
 """Unit test of t2_pack_build.py --append, the FinalSet reader and the append / selection gates of t2_pack_verify.py on synthetic chains (numpy + pandas). Run: python test_t2_append.py"""
+import fcntl
 import glob
 import hashlib
 import json
@@ -75,6 +76,7 @@ def scenario(legacy):
     # append P1 first, then R1 in a second call (numbering continues; the first call must not be redone)
     run("t2_pack_build.py", "--append", "--out", out, "--topup", top, "--rounds", "P1", "--shard-gb", "0.00001", "--procs", "2")
     n_mid = json.load(open(os.path.join(out, "MANIFEST.json")))["n_shards"]
+    man_mid = open(os.path.join(out, "MANIFEST.json")).read()
     run("t2_pack_build.py", "--append", "--out", out, "--topup", top, "--rounds", "P1", "R1", "--shard-gb", "0.00001", "--procs", "2")
     man = json.load(open(os.path.join(out, "MANIFEST.json")))
     assert n_mid > n_base and man["n_shards"] > n_mid and man["n_base_shards"] == n_base and [e["round"] for e in man["appended"]] == ["P1", "R1"], man
@@ -127,6 +129,9 @@ def scenario(legacy):
     assert sel.loc["1abc_A"].n_pool == 6 and sel.loc["5new_E"].n_pool == 4
     final = os.path.join(out, "final_selection.npz")
     print(run("t2_select_diverse.py", "--merge", os.path.join(tmp, "sel0.tsv"), os.path.join(tmp, "sel1.tsv"), "--final", final).strip())
+    sel_all = os.path.join(tmp, "sel_all.tsv")
+    sel.reset_index().to_csv(sel_all, sep="\t", index=False)
+    verify += ["--sel-tsv", sel_all]   # the merged selection table (gate S5; --final requires it)
     fs = FinalSet(out)
     got = {c: ts for c, ts in fs}
     assert set(got) == set(sel.index) and all(len(got[c]) == min(K, len(tp.rows(c))) for c in got), {c: len(v) for c, v in got.items()}
@@ -134,6 +139,12 @@ def scenario(legacy):
     assert all(x["coords"].dtype == np.float32 for ts in got.values() for x in ts)
     ok = run(*verify, "--final", final, "--k", str(K))
     assert "ALL GATES PASSED" in ok and "S1 " in ok and "S2 " in ok and "S3 " in ok and "S4 " in ok, ok
+    # S5: the proxy max pair TM of the chosen sets recomputed from the pack equals the selection TSV; a shifted TSV must fail
+    ok = run(*verify, "--final", final, "--k", str(K))
+    assert "PASS S5 " in ok and "FAIL" not in ok and "0 differ" in ok, ok
+    shifted = sel.reset_index().assign(max_pair=lambda d: d.max_pair + 0.05)
+    shifted.to_csv(os.path.join(tmp, "sel_shift.tsv"), sep="\t", index=False)
+    assert "FAIL S5 " in run(*verify, "--final", final, "--k", str(K), "--sel-tsv", os.path.join(tmp, "sel_shift.tsv"), ok=False)
     # selection gates must fail on a duplicate, a key outside the pool, a wrong count
     keys = {c: fs.keys(c) for c in map(str, fs.stems)}
     k1 = keys["1abc_A"]
@@ -173,6 +184,37 @@ def scenario(legacy):
     os.remove(os.path.join(broken, "R1", "ids_shard1.txt"))
     assert "round not complete" in run("t2_pack_build.py", "--append", "--out", neg, "--topup", broken, "--rounds", "R1", "--procs", "2", ok=False)
     assert snapshot(neg) == before, "a refused append (empty / unfinished round) changed the pack"
+    # a crash between the idx writes and the manifest write of the 2nd append (idx ahead of the manifest) is repaired by the re-run; touching the loose files does not turn a no-op re-run into an error
+    ahead = os.path.join(tmp, "pack_idx_ahead")
+    shutil.copytree(out, ahead)
+    open(os.path.join(ahead, "MANIFEST.json"), "w").write(man_mid)
+    run("t2_pack_build.py", "--append", "--out", ahead, "--topup", top, "--rounds", "P1", "R1", "--shard-gb", "0.00001", "--procs", "2")
+    assert [e["round"] for e in json.load(open(os.path.join(ahead, "MANIFEST.json")))["appended"]] == ["P1", "R1"]
+    assert json.load(open(os.path.join(ahead, "MANIFEST.json")))["chain_shard_md5"] == man["chain_shard_md5"]
+    for f in glob.glob(os.path.join(top, "P1", "templates", "*", "*.npz")):
+        os.utime(f, None)
+    assert "nothing to append" in run("t2_pack_build.py", "--append", "--out", out, "--topup", top, "--rounds", "P1", "R1", "--procs", "2")
+    # a second append while another holds the lock (twin job) fails at once; a metrics.csv with another column set is refused before any shard is built;
+    # a restored old index with the newer manifest is refused (not accepted as 'nothing to append'); a loose round not run with --store passing never enters a pool
+    lock = open(os.path.join(neg, ".append.lock"), "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    assert "temporarily unavailable" in run("t2_pack_build.py", "--append", "--out", neg, "--topup", top, "--rounds", "P1", "--procs", "2", ok=False)
+    lock.close()
+    odd = os.path.join(tmp, "topup_odd")
+    shutil.copytree(top, odd)
+    mf = os.path.join(odd, "P1", "templates", "ab", "1abc_A.metrics.csv")
+    pd.read_csv(mf).assign(extra=1).to_csv(mf, index=False)
+    assert "other columns" in run("t2_pack_build.py", "--append", "--out", neg, "--topup", odd, "--rounds", "P1", "--procs", "2", ok=False)
+    assert snapshot(neg) == before, "a refused append (lock / schema) changed the pack"
+    bad_idx = os.path.join(tmp, "pack_idx_old")
+    shutil.copytree(out, bad_idx)
+    shutil.copy(os.path.join(pre, "chain.idx.npz"), os.path.join(bad_idx, "chain.idx.npz"))
+    assert "does not cover the shards" in run("t2_pack_build.py", "--append", "--out", bad_idx, "--topup", top, "--rounds", "P1", "R1", "--procs", "2", ok=False)
+    guard = os.path.join(tmp, "topup_guard")
+    shutil.copytree(top, guard)
+    gf = os.path.join(guard, "R1", "templates", "qr", "3qrs_C.metrics.csv")
+    pd.read_csv(gf).assign(pass_all=True).to_csv(gf, index=False)
+    assert "--store passing" in run("t2_select_diverse.py", "--pack", pre, "--topup", guard, "--out", os.path.join(tmp, "sel_guard.tsv"), "--k", str(K), ok=False)
     shutil.rmtree(tmp)
 
 

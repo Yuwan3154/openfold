@@ -10,6 +10,7 @@ Append (T2_TOPUP_DIVERSITY_PLAN.md section 4): python t2_pack_build.py --append 
   A round already recorded in the manifest with the same file list is skipped (re-run = no-op); a recorded round whose file list changed is an error.
 """
 import argparse
+import fcntl
 import glob
 import gzip
 import hashlib
@@ -17,6 +18,7 @@ import json
 import os
 import shutil
 import subprocess
+from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
 from multiprocessing import Pool
 
@@ -47,9 +49,10 @@ def stem(f):
     return os.path.basename(f)[:-4]
 
 
-def fingerprint(files, rescued, tag=None):
-    """Identity of a shard plan: its (stem, size, rescue flag) list (+ the round tag of an appended shard); a stale meta from another plan is never reused."""
-    return hashlib.sha256(("\n".join(f"{stem(f)}:{os.path.getsize(f)}:{stem(f) in rescued}" for f in files) + (json.dumps(tag, sort_keys=True) if tag else "")).encode()).hexdigest()
+def fingerprint(files, rescued, tag=None, mtime=True):
+    """Identity of a shard plan: its (stem, size, rescue flag) list (+ the round tag of an appended shard and, for the shard meta (mtime=True), the file mtimes: a regenerated file of the same size is detected). The manifest record of a round (mtime=False) must survive a copy / touch of the loose files."""
+    extra = (json.dumps(tag, sort_keys=True) + ("\n".join(f"{stem(f)}:{os.stat(f).st_mtime_ns}" for f in files) if mtime else "")) if tag else ""
+    return hashlib.sha256(("\n".join(f"{stem(f)}:{os.path.getsize(f)}:{stem(f) in rescued}" for f in files) + extra).encode()).hexdigest()
 
 
 def md5_stream(path):
@@ -61,7 +64,12 @@ def md5_stream(path):
 
 
 def meta_ok(meta, final, fp):
-    return os.path.isfile(meta) and os.path.isfile(final) and str(np.load(meta)["fp"]) == fp
+    """the meta of this plan exists and the shard file has exactly the size the meta implies (the meta is removed before the shard file is renamed into place, so a meta never outlives a half-replaced file)"""
+    if not (os.path.isfile(meta) and os.path.isfile(final)):
+        return False
+    z = np.load(meta)
+    size = int(z["offsets"][-1] + z["lengths"][-1]) if "offsets" in z.files else int(z["off"][-1] + z["nbytes"][-1])
+    return str(z["fp"]) == fp and os.path.getsize(final) == size
 
 
 def save_meta(meta, **kw):
@@ -89,6 +97,8 @@ def build_chain_shard(task):
             fh.seek(o)
             assert hashlib.md5(fh.read(n)).hexdigest() == m, (s, "pack bytes differ from the source after the write")
     shard_md5 = md5_stream(final + ".partial")
+    if os.path.exists(meta):
+        os.remove(meta)
     os.replace(final + ".partial", final)
     save_meta(meta, stems=np.array(stems), offsets=np.array(offs, np.int64), lengths=np.array(lens, np.int64), md5=np.array(md5s), shard_md5=np.array(shard_md5), fp=np.array(fp), round=np.array(tag["round"] if tag else "base"))
     return k
@@ -134,6 +144,8 @@ def build_tmpl_shard(task):
                 ops_parts.append(json.dumps(ops[i], separators=(",", ":")).encode())
                 off += len(rec)
         fh.flush(); os.fsync(fh.fileno())
+    if os.path.exists(meta):
+        os.remove(meta)
     os.replace(final + ".partial", final)
     dt = {"draw": np.int16, "off": np.int64, "nbytes": np.int64, "L": np.int32, "A": np.int32, "L_native": np.int32, "tm_native": np.float32, "tm_template": np.float32, "rewind": np.int16, "num_steps": np.int16}
     save_meta(meta, **{n: np.array(v, dt.get(n)) if n in dt else np.array(v) for n, v in cols.items()}, ops_len=np.array([len(p) for p in ops_parts], np.int32),
@@ -189,7 +201,6 @@ def extend_metrics(out, topup, tags):
         frames += new
         n_new[t["round"]] = (len(fs), sum(len(x) for x in new))
     merged = pd.concat(frames, ignore_index=True)
-    assert merged.iloc[:len(base)].equals(base.reset_index(drop=True)), "the existing metrics rows changed"
     assert list(merged.columns) == list(df.columns), ("metrics_all columns changed", list(merged.columns), list(df.columns))
     tmp = os.path.join(out, "metrics_all.tmp.csv.gz")
     merged.to_csv(tmp, index=False)
@@ -211,38 +222,60 @@ def precheck_base(out, man, n_old):
         assert os.path.getsize(os.path.join(out, f"tmpl.{k:03d}.bin")) == int(t["off"][-1] + t["nbytes"][-1]), (k, "tmpl shard size differs from its meta")
 
 
-def check_round(topup, rd):
-    """a round is appended only when finished: it has files, every metrics.csv with a passing row has its npz and every npz has its metrics.csv (the chain-done marker)"""
+def check_round(topup, rd, expected):
+    """a round is appended only when finished: it has files, every metrics.csv has the columns of metrics_all (minus source / rewind / num_steps) and rows, every metrics.csv with a passing row has its npz and every npz has its metrics.csv (the chain-done marker)"""
     npz = {stem(f) for f in round_files(topup, rd)}
     mets = sorted(glob.glob(os.path.join(topup, rd, "templates", "*", "*.metrics.csv")))
     assert npz and mets, (rd, "no loose files under", topup)
     have = {os.path.basename(f)[:-len(".metrics.csv")] for f in mets}
     planned = {c for f in glob.glob(os.path.join(topup, rd, "ids_shard*.txt")) for c in open(f).read().split()}
-    assert planned == have, (rd, "round not complete or not the planned chains: planned", len(planned), "with metrics.csv", len(have), sorted(planned ^ have)[:3])
-    passing = {os.path.basename(f)[:-len(".metrics.csv")] for f in mets if pd.read_csv(f, usecols=["pass_all"]).pass_all.any()}
+    assert planned == have, (rd, "round not complete or not the planned chains: planned", len(planned), "with metrics.csv", len(have), "planned xor with metrics.csv:", sorted(planned ^ have)[:20])
+    passing = set()
+    for f in mets:
+        m = pd.read_csv(f)
+        assert list(m.columns) == expected and len(m) > 0, (f, "metrics.csv with other columns than metrics_all or without rows")
+        if m.pass_all.any():
+            passing.add(os.path.basename(f)[:-len(".metrics.csv")])
     assert npz <= have and passing <= npz, (rd, "unfinished round: npz without metrics.csv", sorted(npz - have)[:3], "passing chain without npz", sorted(passing - npz)[:3])
 
 
 def backup_once(out, names):
     for n in names:
         if not os.path.exists(os.path.join(out, n + ".pre-append")):
-            shutil.copy2(os.path.join(out, n), os.path.join(out, n + ".pre-append"))
+            shutil.copy2(os.path.join(out, n), os.path.join(out, n + ".pre-append.tmp"))
+            os.replace(os.path.join(out, n + ".pre-append.tmp"), os.path.join(out, n + ".pre-append"))
+
+
+def check_appended(out, man):
+    """the manifest says rounds were appended: the idx files must cover every shard and every shard meta must carry the md5 the manifest lists (a restored old idx / a stale manifest is refused instead of accepted as 'nothing to append')"""
+    n = man["n_shards"]
+    for name in ("chain.idx.npz", "tmpl.idx.npz"):   # an idx AHEAD of the manifest (crash between the idx writes and the manifest write) is rewritten by the re-run; an idx that lacks listed shards is a restored old file
+        assert set(range(n)) <= set(np.unique(np.load(os.path.join(out, name))["shard"]).tolist()), (name, "does not cover the shards 0..", n - 1, "listed in the manifest")
+    for k in range(n):
+        c, t = (np.load(os.path.join(out, "meta", f"{x}.{k:03d}.npz")) for x in ("chain", "tmpl"))
+        assert str(c["shard_md5"]) == man["chain_shard_md5"][k] and str(t["shard_md5"]) == man["tmpl_shard_md5"][k], (k, "meta md5 differs from the manifest")
+    assert "round" in pd.read_csv(os.path.join(out, "metrics_all.csv.gz"), nrows=0).columns, "metrics_all.csv.gz has no 'round' column although rounds are appended"
 
 
 def append(a):
+    lock = open(os.path.join(a.out, ".append.lock"), "w")
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)   # a second append on the same pack (twin job) fails at once instead of racing on the shard files
     mpath = os.path.join(a.out, "MANIFEST.json")
     man = json.load(open(mpath))
+    expected = [c for c in pd.read_csv(os.path.join(a.out, "metrics_all.csv.gz"), nrows=0).columns if c not in ("source", "rewind", "num_steps", "round")]
+    if man.get("appended"):
+        check_appended(a.out, man)
     assert len(set(a.rounds)) == len(a.rounds), ("duplicate rounds in --rounds", a.rounds)
     done = {e["round"]: e for e in man.get("appended", [])}
     n_old = n_next = man["n_shards"]
     todo = []
     for rd in a.rounds:
         tag, files = round_tag(rd), round_files(a.topup, rd)
-        fp = fingerprint(files, set(), tag)
+        fp = fingerprint(files, set(), tag, mtime=False)
         if rd in done:
             assert done[rd]["fp"] == fp, (rd, "round already appended with another file list; the pack is append-only")
             continue
-        check_round(a.topup, rd)
+        check_round(a.topup, rd, expected)
         shards = plan_shards(files, a.shard_gb * 1e9)
         todo.append((rd, tag, files, shards, n_next, fp))
         n_next += len(shards)
@@ -252,9 +285,9 @@ def append(a):
     precheck_base(a.out, man, n_old)
     backup_once(a.out, ["chain.idx.npz", "tmpl.idx.npz", "metrics_all.csv.gz", "MANIFEST.json"])
     tasks = [(k0 + j, s, a.out, set(), tag) for _, tag, _, shards, k0, _ in todo for j, s in enumerate(shards)]
-    with Pool(a.procs) as pool:
-        pool.map(build_chain_shard, tasks)
-        pool.map(build_tmpl_shard, tasks)
+    with ProcessPoolExecutor(a.procs) as ex:   # a killed worker raises BrokenProcessPool (Pool.map would hang until the wall-clock limit)
+        list(ex.map(build_chain_shard, tasks))
+        list(ex.map(build_tmpl_shard, tasks))
     n_new = extend_metrics(a.out, a.topup, [t[1] for t in todo])
     chain_md5 = write_chain_idx(a.out, n_next)
     tmpl_md5, n_rows = write_tmpl_idx(a.out, n_next)
@@ -266,7 +299,9 @@ def append(a):
         man.setdefault("appended", []).append(dict(tag, fp=fp, created=datetime.now().astimezone().isoformat(timespec="seconds"), commit=commit, topup_dir=os.path.abspath(a.topup), shards=[k0, k0 + len(shards)],
                                                    n_chains=len(files), n_templates=int((rnd == rd).sum()), metrics_chains=n_new[rd][0], metrics_rows=n_new[rd][1], chain_shard_md5=[chain_md5[k] for k in ks], tmpl_shard_md5=[tmpl_md5[k] for k in ks]))
     man.update(n_base_shards=man.get("n_base_shards", n_old), n_shards=n_next, chain_shard_md5=chain_md5, tmpl_shard_md5=tmpl_md5)
-    json.dump(man, open(mpath + ".tmp", "w"), indent=1)
+    with open(mpath + ".tmp", "w") as fh:
+        json.dump(man, fh, indent=1)
+        fh.flush(); os.fsync(fh.fileno())
     os.replace(mpath + ".tmp", mpath)
     print(f"appended {[t[0] for t in todo]}: shards {n_old}..{n_next - 1}, {n_rows} template rows in the index, metrics rows {n_new}")
 

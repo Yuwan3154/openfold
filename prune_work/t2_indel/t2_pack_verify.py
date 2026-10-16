@@ -25,7 +25,9 @@ import numpy as np
 import pandas as pd
 
 import indel_pool as ip
+from t2_diversity import ca_of
 from t2_pack_reader import ChainPack, FinalSet, TemplatePack
+from t2_select_diverse import pair_matrix
 
 FAILS = []
 
@@ -80,12 +82,15 @@ def main():
     ap.add_argument("--pack", required=True)
     ap.add_argument("--topup", help="loose top-up round trees (<topup>/<round>/templates/..); required when the pack has appended rounds")
     ap.add_argument("--final", help="final_selection.npz: run the selection gates")
+    ap.add_argument("--sel-tsv", help="selection TSV (columns chain, max_pair): S5 recomputes the proxy max pair TM of the chosen sets of --n-chains random chains and compares")
     ap.add_argument("--k", type=int, default=64)
     ap.add_argument("--n-chains", type=int, default=1000)
     ap.add_argument("--n-bench", type=int, default=1000)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--procs", type=int, default=8)
     a = ap.parse_args()
+    if a.final and not a.sel_tsv:
+        ap.error("--final needs --sel-tsv (gate S5)")
     rng = np.random.default_rng(a.seed)
     man = json.load(open(os.path.join(a.pack, "MANIFEST.json")))
     files = sorted(f for f in glob.glob(os.path.join(a.templates, "*", "*.npz")) if not f.endswith(".tmp.npz"))
@@ -180,6 +185,18 @@ def main():
         runs = m[["chain", "source", "round", "draw", "pass_all"]]
         j2 = joined.merge(runs, how="left", on=["chain", "source", "round", "draw"])
         check(len(chosen) > 0 and len(j2) == len(chosen) and (j2.pass_all == True).all(), f"S4 chosen templates pass the final filter (pass_all of their run row): {len(chosen)} chosen, {int((j2.pass_all != True).sum())} not passing, {len(j2) - len(chosen)} ambiguous run rows")
+    if a.final and a.sel_tsv:
+        tsv = pd.read_csv(a.sel_tsv, sep="\t").set_index("chain")
+        assert tsv.index.is_unique and set(map(str, fs.stems)) <= set(tsv.index), "--sel-tsv must be the merged selection table of every chain of the final set"
+        cand = [c for c in map(str, fs.stems) if len(fs.keys(c)) > 1]
+        pick5 = np.random.default_rng(a.seed + 1).choice(len(cand), size=min(a.n_chains, len(cand)), replace=False)
+        bad5 = 0
+        for i in pick5:
+            ts = [tp.get(cand[i], int(d), rd) for rd, d in fs.keys(cand[i])]
+            assert len({t["L_native"] for t in ts}) == 1, (cand[i], "the chosen templates of a chain have different native lengths")
+            M = pair_matrix([ca_of(t) for t in ts], int(ts[0]["L_native"]))
+            bad5 += not np.isclose(M[np.triu_indices(len(ts), 1)].max(), tsv.loc[cand[i], "max_pair"], rtol=0, atol=1e-9)
+        check(bad5 == 0 and len(pick5) > 0, f"S5 proxy max pair TM of the chosen set recomputed from the pack == selection TSV max_pair: {len(pick5)} random chains, {bad5} differ")
     # G4
     pick = [(str(c), int(rng.integers(0, per_chain[("base", str(c))]))) for c in rng.choice(list(loose), size=a.n_bench)]
     t = {}
