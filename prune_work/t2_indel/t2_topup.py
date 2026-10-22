@@ -32,6 +32,21 @@ ROUNDS = {
     "R5": dict(proto="r100", n_draws=256, draw_start=3280, rewind=100, seed_offset=3005),
     "R6": dict(proto="r100", n_draws=512, draw_start=3536, rewind=100, seed_offset=3006),
 }
+# T8b regeneration of the chains whose proteina natives were re-processed (insertion-code merges / non-monotone order; user 10-22: own pack, fresh draw ids >= 4048, new seed
+# offsets 21+, full ladder): same rounds, sizes and rewinds as ROUNDS, new ids / offsets. Its base run = t2_prod.sbatch with DRAW_START=4048 SEED_OFFSET=21 (ids 4048..4111).
+T8B_ROUNDS = {
+    "P1": dict(ROUNDS["P1"], draw_start=4112, seed_offset=22),
+    "P2": dict(ROUNDS["P2"], draw_start=4176, seed_offset=23),
+    "P3": dict(ROUNDS["P3"], draw_start=4304, seed_offset=24),
+    "P4": dict(ROUNDS["P4"], draw_start=4560, seed_offset=25),
+    "R1": dict(ROUNDS["R1"], draw_start=5136, seed_offset=26),
+    "R2": dict(ROUNDS["R2"], draw_start=5392, seed_offset=27),
+    "R3": dict(ROUNDS["R3"], draw_start=5648, seed_offset=28),
+    "R4": dict(ROUNDS["R4"], draw_start=6160, seed_offset=29),
+    "R5": dict(ROUNDS["R5"], draw_start=6416, seed_offset=30),
+    "R6": dict(ROUNDS["R6"], draw_start=6672, seed_offset=31),
+}
+TABLES = {"t2": ROUNDS, "t8b": T8B_ROUNDS}
 CAP = 1024
 NUM_STEPS = 250
 
@@ -104,7 +119,7 @@ def members(d, rd):
     return d[short & d[prev] & ~d["done_" + rd] & (d.pass_r100 >= 1)]
 
 
-def plan(pack, topup, rd, n_shards):
+def plan(pack, topup, rd, n_shards, table="t2"):
     d = status(pack, topup)
     sel = members(d, rd).sort_values(["L"])
     out = os.path.join(topup, rd)
@@ -113,7 +128,8 @@ def plan(pack, topup, rd, n_shards):
     for k in range(n_shards):
         with open(os.path.join(out, f"ids_shard{k}.txt"), "w") as fh:
             fh.write("\n".join(ids[k::n_shards]) + "\n")
-    cfg = dict(ROUNDS[rd], round=rd, n_chains=len(ids), stage_b_args=f"--num-steps {NUM_STEPS} --rewind {ROUNDS[rd]['rewind']} --seed-offset {ROUNDS[rd]['seed_offset']} --store passing")
+    t = TABLES[table][rd]
+    cfg = dict(t, round=rd, table=table, n_chains=len(ids), stage_b_args=f"--num-steps {NUM_STEPS} --rewind {t['rewind']} --seed-offset {t['seed_offset']} --store passing")
     with open(os.path.join(out, "round.json"), "w") as fh:
         json.dump(cfg, fh, indent=1)
     print(f"round {rd}: {len(ids)} chains, {cfg['n_draws']} draws each (ids {cfg['draw_start']}..{cfg['draw_start'] + cfg['n_draws'] - 1}), expected deficit {int((64 - sel.have).sum())} templates -> {out}")
@@ -127,9 +143,10 @@ def main():
     ap.add_argument("--topup", required=True)
     ap.add_argument("--round", choices=sorted(ROUNDS))
     ap.add_argument("--n-shards", type=int, default=2)
+    ap.add_argument("--table", choices=sorted(TABLES), default="t2", help="plan: draw ids / seed offsets (t8b = the T8b regeneration)")
     a = ap.parse_args()
     if a.cmd == "plan":
-        plan(a.pack, a.topup, a.round, a.n_shards)
+        plan(a.pack, a.topup, a.round, a.n_shards, a.table)
         return
     d = status(a.pack, a.topup)
     print(f"rows = chain (n = {len(d)}): candidates passing (base + top-up): zero {int((d.have == 0).sum())}, 1-63 {int(((d.have > 0) & (d.have < 64)).sum())}, >= 64 {int((d.have >= 64).sum())}; extra draws used: production {int(d.extra_prod.sum())}, rewind-100 {int(d.extra_r100.sum())}")

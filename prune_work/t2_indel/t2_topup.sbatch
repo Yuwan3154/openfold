@@ -15,19 +15,22 @@ S=${SLURM_ARRAY_TASK_ID:-0}
 ROUND=${ROUND:?set ROUND=P1|P2|P3|P4|R1|R2|R3|R4|R5|R6}
 CH=/orcd/scratch/orcd/011/chenxiou
 R=$CH/t2pipe
-O=/orcd/compute/so3/002/chenxi/t2_synth_v2
+O=${T2_OUT:-/orcd/compute/so3/002/chenxi/t2_synth_v2}   # T8b regeneration: /orcd/compute/so3/002/chenxi/t2_synth_v2_t8b
 W=$O/work
 T=$O/topup/$ROUND
 PTH=$R/hf/hub/models--biohub--esmc-300m-2024-12/snapshots/7f10b20ae75017b2dbc884070e03434515709a8d/data/weights/esmc_300m_2024_12_v0.pth
 GEOM=$HOME/orcd/scratch/t2pipe_data/geom_pools.csv
-CODE=$R/repo/prune_work/t2_indel
-git -C $R/repo pull -q --ff-only || echo "git pull failed (continuing with the checked-out code)"
+REPO=${REPO_DIR:-$R/repo}
+CODE=$REPO/prune_work/t2_indel
+git -C $REPO pull -q --ff-only || echo "git pull failed (continuing with the checked-out code)"
 [ -s $T/ids_shard$S.txt ] || { echo "no chain list $T/ids_shard$S.txt"; exit 1; }
 PYJ=$CH/pp1c/env/bin/python
 N=$($PYJ -c "import json;print(json.load(open('$T/round.json'))['n_draws'])")
 D=$($PYJ -c "import json;print(json.load(open('$T/round.json'))['draw_start'])")
 ARGS=$($PYJ -c "import json;print(json.load(open('$T/round.json'))['stage_b_args'])")
 [ -n "$N" ] && [ -n "$D" ] && [ -n "$ARGS" ] || { echo "could not read $T/round.json"; exit 1; }
+TAB=$($PYJ -c "import json;print(json.load(open('$T/round.json')).get('table', 't2'))")
+if [ -n "${T2_OUT:-}" ] && [ "$TAB" != t8b ]; then echo "T2_OUT is set but $T/round.json was planned with table $TAB (use t2_topup.py plan --table t8b)"; exit 1; fi
 cd $W   # stage B's sampler config refers to a relative test_dir path (as in t2_prod.sbatch)
 echo "round $ROUND shard $S: $(wc -l < $T/ids_shard$S.txt) chains, $N draws from id $D, stage B args: $ARGS"
 HF_HUB_OFFLINE=1 PYTHONPATH=$CODE $HOME/.conda/envs/esmfold2_env/bin/python $CODE/t2_stage_a.py --chains-file $T/ids_shard$S.txt --natives-dir $W/natives --out-dir $T/stageA --n-draws $N --draw-start $D --esmc-pth $PTH --batch-size 64 --esmc-dtype fp16

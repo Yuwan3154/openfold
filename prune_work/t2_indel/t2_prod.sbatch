@@ -14,17 +14,23 @@ set -uo pipefail
 NSHARD=${NSHARD:-2}
 S=${SLURM_ARRAY_TASK_ID:-0}
 CH=/orcd/scratch/orcd/011/chenxiou
-LIST=$CH/t8_template_list
+LIST=${LIST_DIR:-$CH/t8_template_list}   # T8b regeneration: its own list dir with READY.txt
 R=$CH/t2pipe
 OUT=/orcd/compute/so3/002/chenxi/t2_synth_v2${OUT_TAG:-}   # NOT scratch: scratch is at 968 of 1024 GB and 895k of 1M inodes
 W=$OUT/work
-PR=/orcd/pool/006/chenxiou/proteina/data/pdb_train/processed
+PR=${PROCESSED:-/orcd/pool/006/chenxiou/proteina/data/pdb_train/processed}   # T8b regeneration: the repaired (SEQRES-order) tree
 PTH=$R/hf/hub/models--biohub--esmc-300m-2024-12/snapshots/7f10b20ae75017b2dbc884070e03434515709a8d/data/weights/esmc_300m_2024_12_v0.pth
 GEOM=$HOME/orcd/scratch/t2pipe_data/geom_pools.csv
-CODE=$R/repo/prune_work/t2_indel
+REPO=${REPO_DIR:-$R/repo}
+CODE=$REPO/prune_work/t2_indel
 ESMC_DTYPE=${ESMC_DTYPE:-fp16}
-SB_ARGS=""; [ "${HALF:-0}" = 1 ] && SB_ARGS="--num-steps 250 --rewind 125"   # half-step schedule (user 10-10: same entry noise level, half the denoiser calls)
+SB_ARGS="--seed-offset ${SEED_OFFSET:-0}"; [ "${HALF:-0}" = 1 ] && SB_ARGS="$SB_ARGS --num-steps 250 --rewind 125"   # half-step schedule (user 10-10: same entry noise level, half the denoiser calls)
 mkdir -p $OUT/logs $OUT/templates $W/natives $W/stageA
+if [ -n "${PROCESSED:-}${DRAW_START:-}${SEED_OFFSET:-}" ] && [ -z "${OUT_TAG:-}" ]; then echo "PROCESSED / DRAW_START / SEED_OFFSET need their own OUT_TAG root"; exit 1; fi
+if [ -n "${OUT_TAG:-}" ]; then   # a tagged root records which tree its natives came from; the T2 product root is left as it was
+  if [ -s $W/natives/SOURCE ] && [ "$(cat $W/natives/SOURCE)" != "$PR" ]; then echo "natives under $W were extracted from $(cat $W/natives/SOURCE), not $PR"; exit 1; fi
+  echo "$PR" > $W/natives/SOURCE
+fi
 cd $W
 
 # 1. the chain list is used only when READY.txt is present and its count and sha256 match the file (T8 handoff)
@@ -36,17 +42,19 @@ echo "list: count $got_n (READY $want_n) sha $got_sha"
 if [ -z "$want_n" ] || [ "$want_n" != "$got_n" ] || [ "$want_sha" != "$got_sha" ]; then echo "LIST VERIFICATION FAILED"; exit 1; fi
 
 # 2. this shard's chains, natives from the proteina processed .pt files (label ids), lengths for the length-sorted order
-git -C $R/repo pull -q --ff-only || exit 1
+git -C $REPO pull -q --ff-only || exit 1
 awk -v s=$S -v n=$NSHARD '(NR-1)%n==s' $LIST/template_chains.txt | head -n ${LIMIT:-1000000} > ids_shard$S.txt   # LIMIT = shakedown subset
 if [ ! -s $W/pt_index.tsv ]; then   # id<TAB>path of every processed .pt (the tree is sharded below id[1:3] and sits behind a symlink: find -L)
-  if [ -s $R/out/pt_index.tsv ]; then cp $R/out/pt_index.tsv $W/pt_index.tsv; else find -L $PR -name "*.pt" | awk -F/ '{n=$NF; sub(/\.pt$/,"",n); print n"\t"$0}' > $W/pt_index.tsv.tmp && mv $W/pt_index.tsv.tmp $W/pt_index.tsv; fi
+  if [ -z "${PROCESSED:-}" ] && [ -s $R/out/pt_index.tsv ]; then   # that index lists the ORIGINAL tree: never for another PROCESSED
+   cp $R/out/pt_index.tsv $W/pt_index.tsv; else find -L $PR -name "*.pt" | awk -F/ '{n=$NF; sub(/\.pt$/,"",n); print n"\t"$0}' > $W/pt_index.tsv.tmp && mv $W/pt_index.tsv.tmp $W/pt_index.tsv; fi
 fi
+if [ -n "${OUT_TAG:-}" ] && [ -n "$(awk -F'\t' -v p="$PR/" 'index($2, p) != 1' $W/pt_index.tsv | head -1)" ]; then echo "pt_index.tsv lists files outside $PR"; exit 1; fi
 PYTHONPATH=$CODE $HOME/.conda/envs/proteina/bin/python $CODE/t2_extract_natives.py --chains-file ids_shard$S.txt --processed-dir $PR --index $W/pt_index.tsv --out-dir $W/natives --proteina-src $HOME/orcd/scratch/proteina_tri --lengths-out lengths_shard$S.tsv || exit 1
 sort -t$'\t' -k2,2n -k1,1 lengths_shard$S.tsv | cut -f1 > order_shard$S.txt
 echo "shard $S: $(wc -l < ids_shard$S.txt) listed, $(wc -l < order_shard$S.txt) usable"
 
 # 3. stage A (edit plans + ESMC-300M fill), then stage B (partial diffusion + gates), both in length order
-HF_HUB_OFFLINE=1 PYTHONPATH=$CODE $HOME/.conda/envs/esmfold2_env/bin/python $CODE/t2_stage_a.py --chains-file order_shard$S.txt --natives-dir $W/natives --out-dir $W/stageA --n-draws 64 --esmc-pth $PTH --batch-size 64 --esmc-dtype $ESMC_DTYPE
+HF_HUB_OFFLINE=1 PYTHONPATH=$CODE $HOME/.conda/envs/esmfold2_env/bin/python $CODE/t2_stage_a.py --chains-file order_shard$S.txt --natives-dir $W/natives --out-dir $W/stageA --n-draws 64 --draw-start ${DRAW_START:-0} --esmc-pth $PTH --batch-size 64 --esmc-dtype $ESMC_DTYPE
 rc=$?
 if [ $rc -ne 0 ]; then echo "stage A failed rc=$rc"; exit $rc; fi
 export PYTHONPATH=$R/pp/src:$R/extra:$CODE PYTHONUNBUFFERED=1 PROTPARDELLE_KEEP_TRAJECTORY=0 PROTPARDELLE_EMPTY_CACHE_PER_STEP=0
