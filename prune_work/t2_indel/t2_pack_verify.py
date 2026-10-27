@@ -9,7 +9,12 @@ Appended top-up rounds (MANIFEST 'appended'; needs --topup, the loose round tree
   A3 provenance: source / rewind / num_steps of the pack rows and metrics rows of each round == the manifest record of the round; manifest counts (templates, metrics rows) == the files.
 Selection (--final final_selection.npz, --k 64): S1 chosen count per chain == min(k, candidates in the pack); S2 no duplicate (chain, round, draw); S3 chosen set is a subset of the pool (the pack rows of the chain);
   S4 every chosen template passes the final filter (pass_all in metrics_all, the run row of its source / round / draw).
+Level-2-only mode (--level2-only; required iff MANIFEST.json has a 'level1_removed' record, user 10-27): level 1 and the loose files are gone, so --templates / --topup do not apply; every gate needing them is printed as SKIPPED with
+  the reason; G0 = tmpl shards only; G3 = the level-2 index (chain_stems / first / count == the chain column) and the metrics_all counts (total and per (round, chain)); G4 = level 2 only; A1-A3 and S1-S5 unchanged; plus
+  R1 (in place of G1 / G2): --n-chains random (chain, round) npz rebuilt from level 2 (t2_rebuild_chain_npz.rebuild): atom_mask sum == A of every record, one key set and one dtype per key over the sample, shapes and
+  n_templates / offsets == the tmpl.idx rows, and indel_pool.read_template of the rebuilt npz == TemplatePack, field by field.
 Run: python t2_pack_verify.py --templates T --pack P [--topup TOPUP] [--final final_selection.npz] [--n-chains 1000] [--n-bench 1000]
+     python t2_pack_verify.py --level2-only --pack P [--final final_selection.npz --sel-tsv S] [--n-chains 1000] [--n-bench 1000]
 """
 import argparse
 import glob
@@ -27,15 +32,22 @@ import pandas as pd
 import indel_pool as ip
 from t2_diversity import ca_of
 from t2_pack_reader import ChainPack, FinalSet, TemplatePack
+from t2_rebuild_chain_npz import rebuild
 from t2_select_diverse import pair_matrix
 
 FAILS = []
+SKIPS = []
 
 
 def check(ok, msg):
     print(("PASS " if ok else "FAIL ") + msg, flush=True)
     if not ok:
         FAILS.append(msg)
+
+
+def skip(gate, why):
+    print(f"SKIPPED {gate}: {why}", flush=True)
+    SKIPS.append(gate)
 
 
 def md5_file(p):
@@ -72,13 +84,29 @@ def md5_chain_shard(args):
 
 
 def md5_shard_files(args):
-    pack, k = args
-    return k, md5_file(os.path.join(pack, f"chain.{k:03d}.pack")), md5_file(os.path.join(pack, f"tmpl.{k:03d}.bin"))
+    pack, k, with_chain = args
+    return k, md5_file(os.path.join(pack, f"chain.{k:03d}.pack")) if with_chain else None, md5_file(os.path.join(pack, f"tmpl.{k:03d}.bin"))
+
+
+def rebuilt_part(tp, cid, rnd, rows):
+    """R1 of one (chain, round): (n records, n bad, {key: (dtype, ndim)}); bad = atom_mask sum != A, a shape / count off the idx rows, or read_template of the rebuilt npz != TemplatePack"""
+    recs = [tp._read(r) for r in rows]
+    n_bad = sum(int(t["atom_mask"].sum()) != int(tp.col["A"][r]) for t, r in zip(recs, rows))
+    if n_bad:
+        return len(rows), n_bad, {}
+    z = rebuild(tp, cid, rnd)
+    buf = io.BytesIO()
+    np.savez(buf, **z)
+    n, sL, sA = len(rows), int(tp.col["L"][rows].sum()), int(tp.col["A"][rows].sum())
+    shapes = dict(aatype=(sL,), residue_index=(sL,), orig_idx=(sL,), atom_mask=(sL, 37), coords=(sA, 3), res_offsets=(n + 1,), atom_offsets=(n + 1,), arm=(n,), model=(n,), rewind=(n,), draw=(n,), tm_native=(n,), tm_template=(n,))
+    ok = int(z["n_templates"]) == n and int(z["res_offsets"][-1]) == sL and int(z["atom_offsets"][-1]) == sA and all(z[k].shape == v for k, v in shapes.items())
+    n_bad = n if not ok else sum(not same_tmpl(ip.read_template(io.BytesIO(buf.getvalue()), i), recs[i]) for i in range(n))
+    return n, n_bad, {k: ("str" if v.dtype.kind == "U" else str(v.dtype), v.ndim) for k, v in z.items()}   # a unicode width varies with the content
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--templates", required=True)
+    ap.add_argument("--templates", help="the loose base tree (required unless --level2-only)")
     ap.add_argument("--pack", required=True)
     ap.add_argument("--topup", help="loose top-up round trees (<topup>/<round>/templates/..); required when the pack has appended rounds")
     ap.add_argument("--final", help="final_selection.npz: run the selection gates")
@@ -88,60 +116,108 @@ def main():
     ap.add_argument("--n-bench", type=int, default=1000)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--procs", type=int, default=8)
+    ap.add_argument("--level2-only", action="store_true", help="level 1 and the loose files are removed (MANIFEST 'level1_removed'): run the gates level 2 supports, SKIP the others")
     a = ap.parse_args()
     if a.final and not a.sel_tsv:
         ap.error("--final needs --sel-tsv (gate S5)")
+    if a.level2_only and (a.templates or a.topup):
+        ap.error("--templates / --topup do not apply with --level2-only (the loose files are removed)")
+    if not a.level2_only and not a.templates:
+        ap.error("--templates is required (or --level2-only)")
+    l2 = a.level2_only
     rng = np.random.default_rng(a.seed)
     man = json.load(open(os.path.join(a.pack, "MANIFEST.json")))
-    files = sorted(f for f in glob.glob(os.path.join(a.templates, "*", "*.npz")) if not f.endswith(".tmp.npz"))
-    loose = {os.path.basename(f)[:-4]: f for f in files}
+    assert ("level1_removed" in man) == l2, "--level2-only must be given if and only if MANIFEST.json has a 'level1_removed' record"
+    l1_files = glob.glob(os.path.join(a.pack, "chain.*.pack")) + glob.glob(os.path.join(a.pack, "chain.idx.npz"))
+    assert not (l2 and l1_files), ("MANIFEST says level 1 is removed but level-1 files exist", l1_files[:3])
+    no_l1 = "level 1 removed (MANIFEST 'level1_removed')"
     rounds = [e["round"] for e in man.get("appended", [])]
-    assert a.topup or not rounds, "--topup is required: the pack has appended rounds"
-    items = {("base", c): f for c, f in loose.items()}
-    for rd in rounds:
-        items.update({(rd, os.path.basename(f)[:-4]): f for f in glob.glob(os.path.join(a.topup, rd, "templates", "*", "*.npz")) if not f.endswith(".tmp.npz")})
+    loose, items = {}, {}
+    if not l2:
+        files = sorted(f for f in glob.glob(os.path.join(a.templates, "*", "*.npz")) if not f.endswith(".tmp.npz"))
+        loose = {os.path.basename(f)[:-4]: f for f in files}
+        assert a.topup or not rounds, "--topup is required: the pack has appended rounds"
+        items = {("base", c): f for c, f in loose.items()}
+        for rd in rounds:
+            items.update({(rd, os.path.basename(f)[:-4]): f for f in glob.glob(os.path.join(a.topup, rd, "templates", "*", "*.npz")) if not f.endswith(".tmp.npz")})
     # G0
     with Pool(a.procs) as pool:
-        got = pool.map(md5_shard_files, [(a.pack, k) for k in range(man["n_shards"])])
-    bad = [k for k, m1, m2 in got if m1 != man["chain_shard_md5"][k] or m2 != man["tmpl_shard_md5"][k]]
-    check(not bad, f"G0 shard md5 vs MANIFEST: {man['n_shards'] * 2} files, {len(bad)} differ")
-    cp, tp = ChainPack(a.pack), TemplatePack(a.pack)
-    # G1
-    with Pool(a.procs) as pool:
-        res = pool.map(md5_chain_shard, [(a.pack, items, k) for k in range(man["n_shards"])])
-    n_chk, nb = sum(r[0] for r in res), sum(r[1] for r in res)
-    check(nb == 0 and n_chk == len(items) > 0, f"G1 level 1 md5 (slice == idx == loose file): {n_chk} chain npz checked of {len(items)} loose (base + top-up), {nb} differ")
-    keys = list(items)
-    sample = [keys[i] for i in rng.choice(len(keys), size=min(a.n_chains, len(keys)), replace=False)]
-    ne = 0
-    for rd, cid in sample:
-        z0, z1 = np.load(items[(rd, cid)], allow_pickle=False), cp.get_chain(cid, rd)
-        ne += not (set(z0.files) == set(z1.files) and all(np.array_equal(z0[k], z1[k]) for k in z0.files))
-    check(ne == 0 and len(sample) > 0, f"G1 level 1 arrays equal: {len(sample)} random chains, {ne} differ")
-    # G2
-    nt = nd = 0
-    for rd, cid in sample:
-        z = np.load(items[(rd, cid)], allow_pickle=False)
-        for i in range(int(z["n_templates"])):
-            nt += 1
-            nd += not same_tmpl(ip.read_template(items[(rd, cid)], i), tp.get(cid, int(z["draw"][i]), rd))
-    check(nd == 0 and nt > 0, f"G2 level 2 templates equal the loose reader (float32 bit-identical): {nt} templates of {len(sample)} random chains, {nd} differ")
-    # G3
+        got = pool.map(md5_shard_files, [(a.pack, k, not l2) for k in range(man["n_shards"])])
+    if l2:
+        bad = [k for k, _, m2 in got if m2 != man["tmpl_shard_md5"][k]]
+        check(not bad and len(got) == man["n_shards"] > 0, f"G0 tmpl shard md5 vs MANIFEST: {len(got)} files, {len(bad)} differ")
+        skip("G0 chain shards", no_l1)
+    else:
+        bad = [k for k, m1, m2 in got if m1 != man["chain_shard_md5"][k] or m2 != man["tmpl_shard_md5"][k]]
+        check(not bad, f"G0 shard md5 vs MANIFEST: {man['n_shards'] * 2} files, {len(bad)} differ")
+    cp, tp = None if l2 else ChainPack(a.pack), TemplatePack(a.pack)
     n_rows = len(tp.col["chain"])
     rcol = tp.col["round"] if tp.has_round else np.full(n_rows, "base")
-    check(set(cp.row) == {c for _, c in items} == set(tp.chain_row), f"G3 chain sets: loose {len({c for _, c in items})}, level 1 {len(cp.row)}, level 2 {len(tp.chain_row)}")
-    per_chain = {k: int(np.load(f)["n_templates"]) for k, f in items.items()}
-    n_tm_loose = sum(per_chain.values())
+    if l2:
+        skip("G1 level 1 md5 and arrays", no_l1 + ", loose files removed")
+        skip("G2 level 2 vs the loose reader", "loose files removed (R1 compares read_template of the rebuilt npz instead)")
+        parts = sorted(set(zip(tp.col["chain"].astype(str), rcol.astype(str))))
+        sample = [parts[i] for i in rng.choice(len(parts), size=min(a.n_chains, len(parts)), replace=False)]
+        nt = nb = 0
+        sig, keysets = {}, set()
+        for cid, rd in sample:
+            n, b, s = rebuilt_part(tp, cid, rd, np.array([r for r in tp.rows(cid) if tp.round_of(r) == rd]))
+            nt, nb = nt + n, nb + b
+            keysets.add(frozenset(s))
+            for k, v in s.items():
+                sig.setdefault(k, set()).add(v)
+        multi = sorted(k for k, v in sig.items() if len(v) > 1)
+        check(nb == 0 and nt > 0 and len(sample) > 0 and len(keysets) == 1 and not multi, f"R1 level-1 npz rebuilt from level 2 (mask sum == A, shapes / n_templates / offsets == tmpl.idx, read_template of the rebuilt npz == TemplatePack): "
+              f"{len(sample)} random (chain, round) of {len(parts)}, {nt} templates, {nb} differ; {len(keysets)} key sets ({len(sig)} keys), keys with > 1 dtype or ndim over the sample: {multi}")
+    else:
+        # G1
+        with Pool(a.procs) as pool:
+            res = pool.map(md5_chain_shard, [(a.pack, items, k) for k in range(man["n_shards"])])
+        n_chk, nb = sum(r[0] for r in res), sum(r[1] for r in res)
+        check(nb == 0 and n_chk == len(items) > 0, f"G1 level 1 md5 (slice == idx == loose file): {n_chk} chain npz checked of {len(items)} loose (base + top-up), {nb} differ")
+        keys = list(items)
+        sample = [keys[i] for i in rng.choice(len(keys), size=min(a.n_chains, len(keys)), replace=False)]
+        ne = 0
+        for rd, cid in sample:
+            z0, z1 = np.load(items[(rd, cid)], allow_pickle=False), cp.get_chain(cid, rd)
+            ne += not (set(z0.files) == set(z1.files) and all(np.array_equal(z0[k], z1[k]) for k in z0.files))
+        check(ne == 0 and len(sample) > 0, f"G1 level 1 arrays equal: {len(sample)} random chains, {ne} differ")
+        # G2
+        nt = nd = 0
+        for rd, cid in sample:
+            z = np.load(items[(rd, cid)], allow_pickle=False)
+            for i in range(int(z["n_templates"])):
+                nt += 1
+                nd += not same_tmpl(ip.read_template(items[(rd, cid)], i), tp.get(cid, int(z["draw"][i]), rd))
+        check(nd == 0 and nt > 0, f"G2 level 2 templates equal the loose reader (float32 bit-identical): {nt} templates of {len(sample)} random chains, {nd} differ")
+    # G3
     got = Counter(zip(rcol.astype(str), tp.col["chain"].astype(str)))
-    n_cnt_bad = sum(per_chain.get((rd, c)) != n for (rd, c), n in got.items()) + len(set(per_chain) - {(rd, c) for rd, c in got})
-    check(n_cnt_bad == 0 and len(per_chain) > 0, f"G3 templates per (round, chain) (level 2 index vs loose npz): {len(per_chain)} chain npz, {n_cnt_bad} differ")
+    if l2:
+        skip("G3 chain sets and templates per (round, chain) vs loose npz / level 1", no_l1 + ", loose files removed (level-2 index and metrics_all counts checked instead)")
+        cnt = tp.count.astype(np.int64)
+        idx_ok = len(cnt) > 0 and len(set(tp.stems.astype(str))) == len(cnt) and int(cnt.sum()) == n_rows and np.array_equal(tp.first, np.concatenate([[0], np.cumsum(cnt)[:-1]])) and np.array_equal(np.repeat(tp.stems.astype(str), cnt), tp.col["chain"].astype(str))
+        check(idx_ok, f"G3 level-2 index: {len(cnt)} chains (unique), chain_first / chain_count contiguous over {n_rows} rows and == the chain column: {idx_ok}")
+    else:
+        check(set(cp.row) == {c for _, c in items} == set(tp.chain_row), f"G3 chain sets: loose {len({c for _, c in items})}, level 1 {len(cp.row)}, level 2 {len(tp.chain_row)}")
+        per_chain = {k: int(np.load(f)["n_templates"]) for k, f in items.items()}
+        n_tm_loose = sum(per_chain.values())
+        n_cnt_bad = sum(per_chain.get((rd, c)) != n for (rd, c), n in got.items()) + len(set(per_chain) - {(rd, c) for rd, c in got})
+        check(n_cnt_bad == 0 and len(per_chain) > 0, f"G3 templates per (round, chain) (level 2 index vs loose npz): {len(per_chain)} chain npz, {n_cnt_bad} differ")
     m = pd.read_csv(os.path.join(a.pack, "metrics_all.csv.gz"))
     m["round"] = m["round"].fillna("base") if "round" in m else "base"
     resc = set(m[m.source == "rescue"].chain)
-    expect = int(m[((m.source == "main") & ~m.chain.isin(resc) | (m.source == "rescue")) & m.pass_all].shape[0])
+    stored = (m.source == "main") & ~m.chain.isin(resc) | (m.source == "rescue")
+    expect = int(m[stored & m.pass_all].shape[0])
     top = m[m.source.str.startswith("topup")]
     expect += int(top.pass_all.sum())
-    check(n_rows == n_tm_loose == expect, f"G3 template rows {n_rows} == sum n_templates {n_tm_loose} == passing rows of metrics_all {expect}")
+    if l2:
+        check(n_rows == expect > 0, f"G3 template rows {n_rows} == passing rows of metrics_all {expect}")
+        pm = m[(stored | m.source.str.startswith("topup")) & m.pass_all]
+        want = Counter(zip(pm["round"].astype(str), pm.chain.astype(str)))
+        n_grp_bad = sum(want.get(k) != v for k, v in got.items()) + len(set(want) - set(got))
+        check(n_grp_bad == 0 and len(got) > 0, f"G3 templates per (round, chain): level-2 index vs passing rows of metrics_all: {len(got)} (round, chain) in the index, {len(want)} with passing rows, {n_grp_bad} differ")
+    else:
+        check(n_rows == n_tm_loose == expect, f"G3 template rows {n_rows} == sum n_templates {n_tm_loose} == passing rows of metrics_all {expect}")
     ok_prov, n_prov = 0, 0
     sched = m.groupby(["chain", "source"]).agg(rw=("rewind", "first"), ns=("num_steps", "first")).reset_index()
     sched = {(r.chain, r.source): (int(r.rw), int(r.ns)) for r in sched.itertuples()}
@@ -198,23 +274,27 @@ def main():
             bad5 += not np.isclose(M[np.triu_indices(len(ts), 1)].max(), tsv.loc[cand[i], "max_pair"], rtol=0, atol=1e-9)
         check(bad5 == 0 and len(pick5) > 0, f"S5 proxy max pair TM of the chosen set recomputed from the pack == selection TSV max_pair: {len(pick5)} random chains, {bad5} differ")
     # G4
-    pick = [(str(c), int(rng.integers(0, per_chain[("base", str(c))]))) for c in rng.choice(list(loose), size=a.n_bench)]
     t = {}
-    t0 = time.perf_counter(); by0 = 0
-    for c, i in pick:
-        ip.read_template(loose[c], i); by0 += os.path.getsize(loose[c])
-    t["loose npz"] = (time.perf_counter() - t0, by0)
-    t0 = time.perf_counter(); by1 = 0
-    for c, i in pick:
-        cp.read_template(c, i); by1 += int(cp.lengths[cp.row[c]])
-    t["level 1"] = (time.perf_counter() - t0, by1)
+    if l2:
+        skip("G4 loose npz and level 1 timing", no_l1 + ", loose files removed")
+        pick = [(str(c), int(rng.integers(0, len(tp.rows(str(c)))))) for c in rng.choice(tp.stems, size=a.n_bench)]
+    else:
+        pick = [(str(c), int(rng.integers(0, per_chain[("base", str(c))]))) for c in rng.choice(list(loose), size=a.n_bench)]
+        t0 = time.perf_counter(); by0 = 0
+        for c, i in pick:
+            ip.read_template(loose[c], i); by0 += os.path.getsize(loose[c])
+        t["loose npz"] = (time.perf_counter() - t0, by0)
+        t0 = time.perf_counter(); by1 = 0
+        for c, i in pick:
+            cp.read_template(c, i); by1 += int(cp.lengths[cp.row[c]])
+        t["level 1"] = (time.perf_counter() - t0, by1)
     t0 = time.perf_counter(); by2 = 0
     for c, i in pick:
         r = tp.rows(c)[i]; tp._read(r); by2 += int(tp.col["nbytes"][r])
     t["level 2"] = (time.perf_counter() - t0, by2)
     for k, (sec, by) in t.items():
         print(f"G4 {k}: {1000 * sec / len(pick):.2f} ms per template, {by / len(pick) / 1e6:.3f} MB read per template ({len(pick)} random templates, warm or cold cache as found)")
-    print("RESULT:", "FAIL" if FAILS else "ALL GATES PASSED")
+    print("RESULT:", "FAIL" if FAILS else "ALL GATES PASSED" + (f" (level-2-only mode; {len(SKIPS)} SKIPPED: {'; '.join(SKIPS)})" if l2 else ""))
     raise SystemExit(1 if FAILS else 0)
 
 
