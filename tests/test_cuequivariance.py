@@ -24,10 +24,19 @@ import pickle
 import torch
 from torch.nn import functional as F
 
+from openfold.config import model_config
 from openfold.data import data_transforms
 from openfold.model.primitives import (
     lecun_normal_init_,
-    Attention
+    Attention,
+    Linear,
+)
+from openfold.model.template import TemplatePairStack
+from openfold.model.triangular_multiplicative_update import (
+    TriangleMultiplicationOutgoing,
+    TriangleMultiplicationIncoming,
+    FusedTriangleMultiplicationOutgoing,
+    FusedTriangleMultiplicationIncoming,
 )
 from openfold.utils.tensor_utils import tensor_tree_map
 
@@ -156,6 +165,72 @@ class TestCuEquivarianceKernel(unittest.TestCase):
                 out_repro_mul = out_repro_mul["sm"]["positions"][-1].squeeze(0)
 
                 compare_utils.assert_mean_abs_diff_small(out_repro_attn, out_repro_mul, eps)
+
+
+def _randomize_linears(module):
+    # The "final" and "gating" inits are zero, which would make every update vanish and the comparison vacuous
+    for m in module.modules():
+        if isinstance(m, Linear):
+            lecun_normal_init_(m.weight)
+    return module
+
+
+@compare_utils.skip_unless_cueq_installed()
+class TestCuEquivarianceInplaceContract(unittest.TestCase):
+    """
+    In inference (inplace_safe=True) callers such as TemplatePairStackBlock rely on the triangle multiplicative
+    update adding its output INTO z when _add_with_inplace=True. The cuEquivariance branch must honour that.
+    The contract lives in the OpenFold wrapper, so the small consts.n_res (cuEq's torch fallback) suffices.
+    """
+
+    def test_trimul_inplace_add_returns_z(self):
+        c_z = consts.c_t
+        c_hidden = model_config(consts.model).model.template.template_pair_stack.c_hidden_tri_mul
+        n_res = consts.n_res
+        for cls in (
+            TriangleMultiplicationOutgoing,
+            TriangleMultiplicationIncoming,
+            FusedTriangleMultiplicationOutgoing,
+            FusedTriangleMultiplicationIncoming,
+        ):
+            with self.subTest(cls=cls.__name__):
+                mod = _randomize_linears(cls(c_z, c_hidden)).cuda().eval()
+                z = torch.randn((1, n_res, n_res, c_z), device="cuda")
+                mask = torch.ones((1, n_res, n_res), device="cuda")
+                z0 = z.clone()
+                with torch.no_grad():
+                    expected = z0 + mod(z0.clone(), mask=mask, inplace_safe=False)
+                    out = mod(
+                        z,
+                        mask=mask,
+                        inplace_safe=True,
+                        use_cuequivariance_multiplicative_update=True,
+                        _add_with_inplace=True,
+                    )
+                self.assertEqual(out.data_ptr(), z.data_ptr())
+                torch.testing.assert_close(z, expected)
+
+    def test_template_pair_stack_cueq_mult_inference(self):
+        cfg = model_config(consts.model).model.template.template_pair_stack
+        n_res = consts.n_res
+        t = torch.randn((consts.n_templ, n_res, n_res, cfg.c_t), device="cuda")
+        mask = torch.ones((consts.n_templ, n_res, n_res), device="cuda")
+        # (tri_mul_first, fuse_projection_weights): monomer and multimer template stacks
+        for tri_mul_first, fuse in ((False, False), (True, True)):
+            stack = TemplatePairStack(**{**cfg, "tri_mul_first": tri_mul_first, "fuse_projection_weights": fuse})
+            stack = _randomize_linears(stack).cuda().eval()
+            with torch.no_grad():
+                reference = stack(t.clone(), mask, chunk_size=None, inplace_safe=False)
+                for inplace_safe, use_cueq in ((False, True), (True, False), (True, True)):
+                    with self.subTest(tri_mul_first=tri_mul_first, inplace_safe=inplace_safe, cueq=use_cueq):
+                        out = stack(
+                            t.clone(),
+                            mask,
+                            chunk_size=None,
+                            use_cuequivariance_multiplicative_update=use_cueq,
+                            inplace_safe=inplace_safe,
+                        )
+                        torch.testing.assert_close(out, reference)
 
 
 if __name__ == "__main__":
