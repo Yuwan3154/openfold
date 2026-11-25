@@ -511,7 +511,9 @@ class TriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
             )
             # When not inplace_safe (training), caller should have set _add_with_inplace to False
             if inplace_safe and _add_with_inplace:
-                result += z
+                # Add into z in place like the plain path; TemplatePairStackBlock relies on it
+                z += result
+                return z
             return result
 
         if inplace_safe:
@@ -685,7 +687,9 @@ class FusedTriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
             )
             # When not inplace_safe (training), caller should have set _add_with_inplace to False
             if inplace_safe and _add_with_inplace:
-                result += z
+                # Add into z in place like the plain path; TemplatePairStackBlock relies on it
+                z += result
+                return z
             return result
 
         if (inplace_safe):
